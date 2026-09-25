@@ -1,0 +1,22 @@
+# Server binds. Copy to compose.homelab.yaml (gitignored), replace the addresses, and set
+# COMPOSE_FILE=compose.yaml:compose.homelab.yaml in .env.
+# Keep the API private (e.g. a VPN/tailnet address). The MCP port can also listen on the address your
+# reverse proxy uses, for a public hostname behind Cloudflare Access.
+services:
+  icampus:
+    ports:
+      - "100.64.0.10:9013:9013"          # private address for the REST API
+  icampus-mcp:
+    ports:
+      - "192.168.1.10:8724:8724"         # address your reverse proxy reaches
+      - "100.64.0.10:8724:8724"          # private address for direct MCP clients
+    environment:
+      # Host headers MCP accepts: your public hostname (no port) and the direct addresses.
+      ICAMPUS_MCP_ALLOWED_HOSTS: ${ICAMPUS_MCP_ALLOWED_HOSTS:-mcp.example.com,192.168.1.10:8724,100.64.0.10:8724,127.0.0.1:*}
+
+# Optional: pin the compose network so Docker never picks a range that overlaps your LAN.
+# networks:
+#   default:
+#     ipam:
+#       config:
+#         - subnet: 10.201.0.0/24

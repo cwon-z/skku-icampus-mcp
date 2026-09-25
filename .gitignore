@@ -1,0 +1,17 @@
+.DS_Store
+node_modules/
+dist/
+.env
+*.log
+.venv/
+__pycache__/
+.pytest_cache/
+var/
+*.db
+*.db-*
+# personal data and host-specific config
+.env.*
+!.env.example
+data/
+private/
+compose.homelab.yaml

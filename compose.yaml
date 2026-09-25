@@ -1,0 +1,58 @@
+# Two services from one image. Ports publish on loopback only; a compose.homelab.yaml override
+# (see compose.homelab.example.yaml) adds server binds. Each service gets an explicit environment
+# list: the MCP container must never receive the SKKU password.
+name: skku-icampus
+
+services:
+  icampus:
+    build: .
+    image: skku-icampus:local
+    command: ["icampus", "serve"]
+    environment:
+      ICAMPUS_USERNAME: ${ICAMPUS_USERNAME:-}
+      ICAMPUS_PASSWORD: ${ICAMPUS_PASSWORD:-}
+      ICAMPUS_API_TOKENS: ${ICAMPUS_API_TOKENS:?set ICAMPUS_API_TOKENS in .env}
+      ICAMPUS_ADMIN_LABELS: ${ICAMPUS_ADMIN_LABELS:-admin}
+      ICAMPUS_TERM: ${ICAMPUS_TERM:-}
+      ICAMPUS_SYNC_TIMES: ${ICAMPUS_SYNC_TIMES-07:30,12:30,18:00,22:30}  # set empty to turn the schedule off
+      ICAMPUS_KUMA_PUSH_URL: ${ICAMPUS_KUMA_PUSH_URL:-}
+    volumes:
+      - icampus-data:/data
+    ports:
+      - "127.0.0.1:9013:9013"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 1g
+    memswap_limit: 1g
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9013/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+
+  icampus-mcp:
+    image: skku-icampus:local
+    command: ["icampus-mcp", "--http", "0.0.0.0:8724"]
+    depends_on: [icampus]
+    environment:
+      ICAMPUS_MCP_API_URL: http://icampus:9013
+      ICAMPUS_MCP_API_TOKEN: ${ICAMPUS_MCP_API_TOKEN:?set ICAMPUS_MCP_API_TOKEN in .env}
+      ICAMPUS_MCP_TOKENS: ${ICAMPUS_MCP_TOKENS:-}
+      ICAMPUS_MCP_ACCESS_TEAM: ${ICAMPUS_MCP_ACCESS_TEAM:-}
+      ICAMPUS_MCP_ACCESS_AUD: ${ICAMPUS_MCP_ACCESS_AUD:-}
+      ICAMPUS_MCP_ACCESS_EMAILS: ${ICAMPUS_MCP_ACCESS_EMAILS:-}
+      ICAMPUS_MCP_ALLOWED_HOSTS: ${ICAMPUS_MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*}
+    ports:
+      - "127.0.0.1:8724:8724"
+    init: true
+    restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8724/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+
+
+volumes:
+  icampus-data:

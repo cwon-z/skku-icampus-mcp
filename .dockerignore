@@ -1,0 +1,7 @@
+# allowlist: the image only needs these
+*
+!src
+!pyproject.toml
+!uv.lock
+!.python-version
+**/__pycache__

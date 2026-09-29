@@ -87,5 +87,9 @@ def test_attachments_keep_ids_and_names_never_urls():
     ]
     assert "SECRET" not in repr(got)
     assert attachments(None, None) == [] and attachments([], "<p>no files</p>") == []
+    link = "https://canvas.skku.edu/courses/1/files/9/download?verifier=abc123&wrap=1"
+    html = f'<p>Form: <a href="{link}">{link}</a></p>'
+    assert "abc123" not in html_to_text(html) and "verifier=…&wrap=1" in html_to_text(html)
+    assert attachments(None, html) == [{"id": "9", "via": "linked"}]  # a URL is no name
     assert attachments(None, '<a href="http://[broken/files/1">x</a><a href="/files/2">ok</a>') == \
         [{"id": "2", "name": "ok", "via": "linked"}]

@@ -94,3 +94,55 @@ def test_images_and_unsupported():
     assert extract_text(b"PK\x03\x04", "archive.zip", "application/zip") == ("", "unsupported: .zip")
     assert extract_text(b"not a zip", "broken.docx", None) == ("", "unsupported: .docx")
     assert extract_text(zipped({"other.xml": "<x/>"}), "empty.docx", None) == ("", "unreadable: KeyError")
+
+
+def test_docx_tab_stops_are_not_tabs():
+    doc = ('<w:body><w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr>'
+           '<w:r><w:t>a</w:t></w:r><w:r><w:tab/><w:t>b</w:t></w:r></w:p></w:body>')
+    assert extract_text(zipped({"word/document.xml": doc}), "t.docx", None) == ("a\tb", "docx")
+
+
+def test_hostile_archives_are_refused(monkeypatch):
+    import icampus.extract as extract
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_BZIP2) as zf:  # can't be unpacked with a bound
+        zf.writestr("word/document.xml", "<w:p><w:t>x</w:t></w:p>")
+    assert extract_text(buf.getvalue(), "b.docx", None) == ("", "unreadable: ValueError")
+    monkeypatch.setattr(extract, "MAX_INFLATED", 2**20)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:  # 3 MB of zeros packs to a few KB
+        zf.writestr("word/document.xml", "<w:p><w:t>" + "0" * 3 * 2**20 + "</w:t></w:p>")
+    assert len(buf.getvalue()) < 50_000
+    assert extract_text(buf.getvalue(), "bomb.docx", None) == ("", "unreadable: ValueError")
+
+
+def test_broken_markup_is_read_in_linear_time():
+    import time
+    cases = {
+        "a.docx": {"word/document.xml": "<w:t " * 200_000},
+        "b.xlsx": {"xl/sharedStrings.xml": "<si><t>x" * 100_000,
+                   "xl/worksheets/sheet1.xml": '<row r="1"/>' * 100_000 + "<row><c r=\"A1\"" * 50_000},
+        "c.pptx": {"ppt/slides/slide1.xml": "<a:p><a:t>" * 200_000},
+    }
+    for name, parts in cases.items():
+        started = time.monotonic()
+        extract_text(zipped(parts), name, None)
+        assert time.monotonic() - started < 3, name
+
+
+def test_text_is_capped(monkeypatch):
+    import icampus.extract as extract
+    monkeypatch.setattr(extract, "MAX_CHARS", 1000)
+    doc = "".join(f"<w:p><w:t>line {i}</w:t></w:p>" for i in range(5000))
+    text, how = extract_text(zipped({"word/document.xml": doc}), "long.docx", None)
+    assert how == "docx" and len(text) == 1000 and text.startswith("line 0\nline 1\n")
+
+
+def test_reader_process(tmp_path):
+    import subprocess
+    import sys
+    path = tmp_path / "notes.txt"
+    path.write_bytes("과제 안내".encode("cp949"))
+    out = subprocess.run([sys.executable, "-m", "icampus.extract", str(path), "notes.txt", ""],
+                         capture_output=True, check=True).stdout
+    assert json.loads(out) == {"text": "과제 안내", "how": "text"} and out.isascii()

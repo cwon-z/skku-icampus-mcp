@@ -223,7 +223,8 @@ def filter_tasks(tasks: list[dict], *, now: datetime, course_ids: set[str] | Non
                  status: str | None = None, due_within_days: int | None = 14, past_days: int = 0,
                  include_done: bool = False, include_inactive: bool = False) -> list[dict]:
     """Due in [now - past_days, now + due_within_days], where a late period still counts as due. Undated items are
-    kept once they are open. Done items only with include_done (or status='done')."""
+    kept once they are open (or when asking for status='upcoming'). Done items only with include_done (or
+    status='done')."""
     until = (now + timedelta(days=due_within_days)).isoformat() if due_within_days is not None else None
     since = (now - timedelta(days=past_days)).isoformat()
     out = []
@@ -244,7 +245,7 @@ def filter_tasks(tasks: list[dict], *, now: datetime, course_ids: set[str] | Non
             continue
         if until and t["due_at"] and t["due_at"] > until:
             continue
-        if not deadline and t["status"] == "upcoming":
+        if not deadline and t["status"] == "upcoming" and status != "upcoming":
             continue  # no due date and not open yet: nothing to do about it now
         out.append(t)
     return out

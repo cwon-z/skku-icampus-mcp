@@ -194,7 +194,8 @@ class Syncer:
         # partial runs keep the old data of whatever failed: say so once that is out of date
         cutoff = (datetime.now(KST) - timedelta(hours=self.settings.stale_hours)).isoformat()
         expected = self.store.get_state("expected_scopes", {})
-        behind = [d for d in DATASETS if (at := self.store.synced_at(d, expected.get(d))) is None or at < cutoff]
+        behind = [d for d in DATASETS if expected.get(d) != []  # a term without courses has nothing to sync
+                  and ((at := self.store.synced_at(d, expected.get(d))) is None or at < cutoff)]
         if behind:
             hours = self.settings.stale_hours
             return False, f"last run {last['status']}; not updated for {hours}h+: {', '.join(behind)}"

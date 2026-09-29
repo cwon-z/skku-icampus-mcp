@@ -148,13 +148,16 @@ async def read_assignment(assignment_id: str) -> dict:
     return _row(data, STATUS_NOISE)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+# Not read-only: the first read downloads the file through your account (see the docstring).
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                      open_world_hint=True))
 async def read_attachment(file_id: str, offset: int = 0) -> list[dict | str | Image]:
     """Open a file attached to an announcement or assignment (an `id` from read_announcement or read_assignment).
     PDF, Word, PowerPoint, Excel, HWPX, notebooks and text files come back as text, pictures as images;
     `extract` says why when there is no text (e.g. a scanned PDF, the binary HWP format). The first read downloads
-    the file with your iCampus login, which iCampus records as you opening it; later reads use a cached copy.
-    Lecture materials can't be opened here: opening them in iCampus marks them complete.
+    the file with your iCampus login, which iCampus records as you opening it (and if the same file also sits in a
+    course module, as viewing it there); later reads use a cached copy. Only open files the user asked about.
+    Lecture materials aren't offered here: opening them in iCampus marks them complete.
 
     Args:
         file_id: the file's numeric `id`.

@@ -119,6 +119,7 @@ def test_default_list_and_status_filter():
     assert titles(status="missed", past_days=7) == ["task 4"]
     assert titles(past_days=7) == ["task 3", "task 4", "video 6", "open, no date"]
     assert titles(status="done") == ["task 5"] and "task 5" in titles(include_done=True)
+    assert titles(status="upcoming") == ["locked, no date"]  # asked for explicitly, undated ones show too
 
 
 def test_lecture_status():

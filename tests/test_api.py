@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from icampus import files
 from icampus.api import create_app
-from icampus.browser import CanvasError, NotLoggedIn
+from icampus.browser import CanvasError, NotLoggedIn, TooLarge
 from icampus.config import KST, Settings
 from icampus.store import Record, Store
 
@@ -232,6 +232,9 @@ def test_attachment_errors(client, icampus, tmp_path, monkeypatch):
     icampus.login_error, icampus.download_error = None, CanvasError(401, "x")  # logged in, but not allowed
     r = client.get("/api/v1/files/702")
     assert r.status_code == 422 and "won't hand this file over" in r.json()["error"]
+    icampus.download_error = TooLarge("x")  # bigger than its listed size said
+    r = client.get("/api/v1/files/702")
+    assert r.status_code == 422 and "over 30 MB" in r.json()["error"]
     icampus.download_error, icampus.sizes["702"] = None, 500 * 2**20
     r = client.get("/api/v1/files/702")
     assert r.status_code == 422 and "500 MB" in r.json()["error"]

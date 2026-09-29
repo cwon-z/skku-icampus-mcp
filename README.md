@@ -23,9 +23,10 @@ university's rules when you use it.
   marks anything read.
 - **Attachments, on request only.** A sync records which files an announcement or assignment has (names,
   sizes, IDs), never the files. A file is downloaded only when someone asks for it, with the saved login,
-  and only if a synced announcement or assignment points at it: lecture materials are out of reach. iCampus
-  records a download as you opening the file. Copies are kept in `var/files` and reused while the file is
-  unchanged (for 12 hours when iCampus gives no version).
+  and only if a synced announcement or assignment points at it; lecture items are never opened. iCampus
+  records a download as you opening the file, and if a linked file also sits in a course module, as viewing
+  it there. Copies are kept in `var/files` and reused until a sync sees a new version (for 12 hours when
+  iCampus gives none). A child process with a memory cap and a time limit reads the text out of them.
 - **Careful with logins.** At most 3 password logins a day. A rejected password, a locked account
   or a password-expiry notice stops automatic logins until you retry with an admin token
   (`POST /api/v1/sync?retry_login=true`).
@@ -87,8 +88,8 @@ A few fields to read carefully:
 
 Tools: `sync_status`, `list_courses`, `list_tasks`, `list_announcements`, `read_announcement`,
 `read_assignment`, `read_attachment`, `list_lectures`, `get_grades`, `refresh`. All are read-only except
-`refresh`, which asks for a sync. `read_attachment` returns text, or the picture itself for images; its first
-read of a file downloads it from iCampus.
+`refresh`, which asks for a sync, and `read_attachment`, whose first read of a file downloads it from iCampus
+(so clients may ask before running it). It returns text, or the picture itself for images.
 
 ```bash
 # over HTTP (icampus-mcp --http), with a token from ICAMPUS_MCP_TOKENS

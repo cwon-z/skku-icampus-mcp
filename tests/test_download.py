@@ -19,6 +19,8 @@ ROUTES = {  # path -> (status, body or redirect target)
     "/files/3/download": (404, "gone"),
     "/files/4/download": (200, "x" * 2048),
     "/files/5/download": (401, "denied"),
+    "/api/cp949": (400, "<html>잘못된 요청입니다</html>".encode("cp949")),
+    "/api/json400": (400, '{"message": "token expired"}'),
 }
 
 
@@ -33,9 +35,10 @@ def serve() -> ThreadingHTTPServer:
             if status == 302:
                 self.send_header("Location", body)
                 body = ""
-            self.send_header("Content-Length", str(len(body)))
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(body.encode())
+            self.wfile.write(data)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -60,6 +63,12 @@ async def test_download(tmp_path):
                 await s.download(f"{base}/files/4/download", 1024)
             with pytest.raises(CanvasError, match="HTTP 401"):  # not allowed, which is not "signed out"
                 await s.download(f"{base}/files/5/download", 1024)
+            # an error page in any encoding is still a CanvasError (so LearningX can re-issue its token on a 400)
+            with pytest.raises(CanvasError) as error:
+                await s.get_json(f"{base}/api/cp949")
+            assert error.value.status == 400
+            with pytest.raises(CanvasError, match=r"HTTP 400 for .*/api/json400 \(token expired\)"):
+                await s.get_json(f"{base}/api/json400")
             await request.dispose()
     finally:
         server.shutdown()

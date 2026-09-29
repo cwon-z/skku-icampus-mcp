@@ -47,6 +47,13 @@ def split_course_name(raw: str) -> dict:
 
 
 _BLOCKS = ["p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "table", "ul", "ol"]
+# a file link's verifier opens the file without a login; similar values are just as private
+_SECRET_VALUE = re.compile(r"(?i)\b(verifier|access_token|token|sso\w*)=[^&\s\"'<>]+")
+
+
+def scrub(text: str) -> str:
+    """Hides token-like query values in text (link text can be a whole download URL)."""
+    return _SECRET_VALUE.sub(r"\1=…", text)
 
 
 def html_to_text(html: str | None) -> str:
@@ -59,7 +66,7 @@ def html_to_text(html: str | None) -> str:
     for block in soup.find_all(_BLOCKS):
         block.append("\n")
     lines = [" ".join(line.split()) for line in soup.get_text().splitlines()]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return scrub(re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip())
 
 
 def attachments(files: list[dict] | None, html: str | None) -> list[dict]:
@@ -82,7 +89,9 @@ def attachments(files: list[dict] | None, html: str | None) -> list[dict]:
         m = _FILE.match(parts.path)
         if m and host in (None, "canvas.skku.edu") and m.group(1) not in found:
             name = tag.get("title") or (tag.get_text(" ", strip=True) if tag.name == "a" else tag.get("alt"))
-            found[m.group(1)] = {"id": m.group(1), **({"name": name} if name else {}), "via": "linked"}
+            if name and ("://" in name or name.startswith("/")):
+                name = None  # the link text is the URL itself: the file's real name comes with the download
+            found[m.group(1)] = {"id": m.group(1), **({"name": scrub(name)} if name else {}), "via": "linked"}
     return list(found.values())
 
 

@@ -96,6 +96,10 @@ class FetchError(Exception):
     """Network-level failure (timeout, reset, DNS). The message is already sanitised."""
 
 
+class TooLarge(FetchError):
+    """A download over its size cap."""
+
+
 class CanvasError(Exception):
     def __init__(self, status: int, path: str, hint: str = ""):
         super().__init__(f"HTTP {status} for {path}" + (f" ({hint})" if hint else ""))
@@ -159,7 +163,11 @@ class Session:
         if resp.status in (301, 302, 401):
             raise NotLoggedIn(safe_path(url))
         if resp.status >= 400:
-            raise CanvasError(resp.status, safe_path(url), error_hint(await resp.text()))
+            try:  # error pages come in any encoding (resp.text() would raise on a CP949 one)
+                hint = error_hint((await resp.body()).decode("utf-8", "replace"))
+            except PlaywrightError:
+                hint = ""
+            raise CanvasError(resp.status, safe_path(url), hint)
         text = await resp.text()
         return json.loads(text.removeprefix("while(1);")), resp.headers
 
@@ -175,7 +183,7 @@ class Session:
             raise CanvasError(resp.status, safe_path(url))
         body = await resp.body()
         if len(body) > max_bytes:
-            raise FetchError(f"file larger than {max_bytes // 2**20} MB ({safe_path(url)})")
+            raise TooLarge(f"file larger than {max_bytes // 2**20} MB ({safe_path(url)})")
         return body
 
     async def canvas(self, path: str, params: dict | None = None) -> Any:

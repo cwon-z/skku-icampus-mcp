@@ -3,25 +3,28 @@
 Only files attached to or linked from an announcement or an assignment description can be fetched, never lecture
 items (opening those marks them complete). A download counts as you opening the file in iCampus: course access
 reports show it. Download URLs carry a verifier token, so they are looked up fresh each time, used once and never
-stored or logged. Downloads go to var/files (0600) and are reused for CACHE_HOURS.
+stored or logged. Downloads go to var/files (0600) and are reused until a sync sees a new version of the file
+(for CACHE_HOURS when it saw none). Text is read out of them by a child process (see extract.py).
 """
 
 import asyncio
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .browser import CanvasError, NotLoggedIn, Session, exclusive, open_session
+from .browser import CanvasError, NotLoggedIn, Session, TooLarge, exclusive, open_session
 from .config import KST, Settings
 from .dates import from_canvas, iso
-from .extract import extract_text
 from .store import Store
 
 MAX_BYTES = 30 * 2**20
 CACHE_HOURS = 12
 LOCK_WAIT_S = 45  # a sync takes seconds; wait for it rather than fail
+EXTRACT_TIMEOUT_S = 90
+READER = [sys.executable, "-m", "icampus.extract"]  # a child process, capped in memory by extract.main
 
 
 class Busy(Exception):
@@ -58,9 +61,12 @@ def _dir(settings: Settings) -> Path:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Written beside the target and renamed over it, so a reader never sees half a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+    os.replace(tmp, path)
 
 
 def _cached(settings: Settings, ref: dict) -> Fetched | None:
@@ -72,11 +78,30 @@ def _cached(settings: Settings, ref: dict) -> Fetched | None:
         return None
     if not base.with_suffix(".bin").exists():
         return None
-    if ref.get("updated_at"):  # the sync saw the file's version: reuse the download while it matches
-        fresh = meta.get("updated_at") == ref["updated_at"]
+    if ref.get("updated_at"):  # the sync saw a version: keep the download until the sync sees another one
+        fresh = meta.get("synced_updated_at") == ref["updated_at"]
     else:
         fresh = datetime.fromisoformat(meta["fetched_at"]) > datetime.now(KST) - timedelta(hours=CACHE_HOURS)
     return Fetched(meta, text, base.with_suffix(".bin")) if fresh else None
+
+
+async def _extract(path: Path, name: str | None, content_type: str | None) -> tuple[str, str]:
+    """(text, how) from the reader child process: a hostile or broken file can only take that process down."""
+    args = [str(path), (name or "").replace("\0", ""), (content_type or "").replace("\0", "")]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ICAMPUS_")}  # it needs no password or token
+    proc = await asyncio.create_subprocess_exec(*READER, *args, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.DEVNULL, env=env)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), EXTRACT_TIMEOUT_S)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "", f"unreadable: gave up after {EXTRACT_TIMEOUT_S}s"
+    try:
+        result = json.loads(out)
+        return result["text"], result["how"]
+    except (ValueError, KeyError, TypeError):
+        return "", "unreadable: the reader stopped (out of memory?)"
 
 
 async def _download(s: Session, ref: dict) -> tuple[dict, bytes]:
@@ -109,6 +134,8 @@ async def _download(s: Session, ref: dict) -> tuple[dict, bytes]:
                           f"{MAX_BYTES // 2**20} MB are downloaded")
     try:
         data = await s.download(info["url"], MAX_BYTES)
+    except TooLarge:
+        raise Unavailable(f"the file is over {MAX_BYTES // 2**20} MB; bigger files aren't downloaded") from None
     except CanvasError as exc:
         if exc.status in (401, 403, 404):
             raise refused from None
@@ -120,7 +147,9 @@ async def _download(s: Session, ref: dict) -> tuple[dict, bytes]:
 
 
 async def get(settings: Settings, store: Store, ref: dict) -> Fetched:
-    """The file and its text: from the cache, or downloaded now with the saved login (never a password login)."""
+    """The file and its text: from the cache, or downloaded now with the saved login (never a password login).
+    Downloading, reading and caching all happen under the lock, so a second request for the same file waits
+    for the cache instead of downloading it again."""
     if (hit := _cached(settings, ref)) is not None:
         return hit
     async with exclusive(settings.data_dir, LOCK_WAIT_S) as held:
@@ -131,9 +160,11 @@ async def get(settings: Settings, store: Store, ref: dict) -> Fetched:
         async with open_session(settings, store) as s:
             await s.ensure_login(allow_credentials=False)
             meta, data = await _download(s, ref)
-    text, meta["extract"] = await asyncio.to_thread(extract_text, data, meta["name"], meta["content_type"])
-    base = _dir(settings) / ref["id"]
-    _write_private(base.with_suffix(".bin"), data)
-    _write_private(base.with_suffix(".txt"), text.encode())
-    _write_private(base.with_suffix(".json"), json.dumps(meta, ensure_ascii=False).encode())
+        base = _dir(settings) / ref["id"]
+        base.with_suffix(".json").unlink(missing_ok=True)  # written last: without it the entry is incomplete
+        _write_private(base.with_suffix(".bin"), data)
+        text, meta["extract"] = await _extract(base.with_suffix(".bin"), meta["name"], meta["content_type"])
+        meta["synced_updated_at"] = ref.get("updated_at")
+        _write_private(base.with_suffix(".txt"), text.encode())
+        _write_private(base.with_suffix(".json"), json.dumps(meta, ensure_ascii=False).encode())
     return Fetched(meta, text, base.with_suffix(".bin"))

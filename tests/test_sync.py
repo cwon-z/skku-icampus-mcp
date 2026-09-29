@@ -64,6 +64,17 @@ def test_health_names_datasets_left_behind(tmp_path):
     assert syncer.health() == (True, "last run partial")
 
 
+def test_health_for_a_term_without_courses(tmp_path):
+    from icampus.sync import PER_COURSE, PER_TERM
+    store = Store(tmp_path / "t.db")
+    now = datetime.now(KST)
+    for d in PER_TERM:
+        store.replace_scope(d, "term:x", [], now)
+    store.set_state("expected_scopes", {**{d: ["term:x"] for d in PER_TERM}, **{d: [] for d in PER_COURSE}})
+    store.finish_run(store.start_run("schedule", now), "ok", {}, now)
+    assert Syncer(Settings(_env_file=None), store).health() == (True, "last run ok")
+
+
 async def test_scheduler_skips_slot_already_run_before_restart(tmp_path, monkeypatch):
     """A restart shortly before a slot must not repeat a run the old process already did early."""
     import asyncio

@@ -44,9 +44,25 @@ async def test_read_attachment_image(monkeypatch):
     assert "open it in iCampus" in info["note"]
 
 
+async def test_only_read_attachment_touches_icampus():
+    tools = {t.name: t.annotations for t in await server.mcp.list_tools()}
+    assert tools["read_attachment"].read_only_hint is False  # its first read opens the file in iCampus
+    assert tools["list_tasks"].read_only_hint and tools["read_assignment"].read_only_hint
+
+
 async def test_read_attachment_checks_its_input():
     for bad in ("../x", "70 1", ""):
         with pytest.raises(ToolError):
             await server.read_attachment(bad)
     with pytest.raises(ToolError):
         await server.read_attachment("701", offset=-1)
+
+
+async def test_through_the_mcp_protocol(monkeypatch):
+    fake_api(monkeypatch, {"id": "702", "name": "diagram.png", "content_type": "image/png", "size": 8,
+                           "extract": "image", "text": ""}, b"\x89PNG\r\n\x1a\n")
+    result = await server.mcp.call_tool("read_attachment", {"file_id": "702"})
+    assert [c.type for c in result.content] == ["text", "image"] and result.content[1].mime_type == "image/png"
+    fake_api(monkeypatch, {"id": "701", "name": "notice.txt", "extract": "text", "text": "시험 안내"})
+    result = await server.mcp.call_tool("read_attachment", {"file_id": "701"})
+    assert [c.type for c in result.content] == ["text", "text"] and result.content[1].text == "시험 안내"

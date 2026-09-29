@@ -2,7 +2,7 @@
 
 Keeps a copy of your own SKKU iCampus data and serves it to other programs over a REST API, and to AI
 assistants over MCP. That covers tasks and deadlines, assignment submission status, announcements,
-lectures and attendance, and grades.
+lectures and attendance, grades, and the files attached to announcements and assignments.
 
 ```
 icampus      (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite
@@ -21,6 +21,12 @@ university's rules when you use it.
 - **Read-only.** The browser works from an allowlist of pages and never loads item pages, because
   opening a lecture item in iCampus marks it complete. It never submits anything, starts quizzes or
   marks anything read.
+- **Attachments, on request only.** A sync records which files an announcement or assignment has (names,
+  sizes, IDs), never the files. A file is downloaded only when someone asks for it, with the saved login,
+  and only if a synced announcement or assignment points at it; lecture items are never opened. iCampus
+  records a download as you opening the file, and if a linked file also sits in a course module, as viewing
+  it there. Copies are kept in `var/files` and reused until a sync sees a new version (for 12 hours when
+  iCampus gives none). A child process with a memory cap and a time limit reads the text out of them.
 - **Careful with logins.** At most 3 password logins a day. A rejected password, a locked account
   or a password-expiry notice stops automatic logins until you retry with an admin token
   (`POST /api/v1/sync?retry_login=true`).
@@ -28,8 +34,9 @@ university's rules when you use it.
   They show up as normal account activity in Canvas.
 - **Failures.** If part of a sync fails, the old data for that part is kept and its `synced_at`
   stays at the last good sync. `stale` turns true once that is older than 12 hours
-  (`ICAMPUS_STALE_HOURS`), and `/api/v1/status` shows per-run errors. An item that drops off the
-  iCampus to-do list is not marked "done".
+  (`ICAMPUS_STALE_HOURS`); from then on `/api/v1/status` (and the Uptime Kuma push) reports unhealthy
+  and names the datasets left behind, and a task status resting on that data says it is outdated.
+  `/api/v1/status` shows per-run errors. An item that drops off the iCampus to-do list is not marked "done".
 
 ## Run it locally
 
@@ -57,22 +64,32 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/status` | last runs, freshness per dataset, login state, next run |
 | `POST /api/v1/sync` | Returns 202 started, 409 running, 429 cooldown or 423 blocked. `?retry_login=true` needs an `admin` token |
 | `GET /api/v1/courses` | codes, instructors, current grade |
-| `GET /api/v1/tasks` | merged to-do list: `course, kind, due_within_days=14, past_days=0, include_done, include_inactive, limit` |
-| `GET /api/v1/assignments` | `course, unsubmitted_only` |
+| `GET /api/v1/tasks` | merged to-do list: `course, kind, status, due_within_days=14, past_days=0, include_done, include_inactive, limit` |
+| `GET /api/v1/assignments` | `course, unsubmitted_only`. `/{id}` adds the description and task status |
 | `GET /api/v1/announcements` | `course, since_days=30, unread_only, limit`. `/{id}` gives the full text |
+| `GET /api/v1/files/{id}` | an announcement or assignment attachment and its text: `offset, max_chars=20000`. Downloads it on first use |
+| `GET /api/v1/files/{id}/content` | the file itself |
 | `GET /api/v1/lectures` | `course, week, kind, incomplete_only, available_only, upcoming_only, include_attendance, limit` |
 | `GET /api/v1/grades` | `course` |
 | `GET /api/v1/export` | everything as one JSON document |
 
 A few fields to read carefully:
+- `status` sums up a task or lecture item: `todo`, `done`, `missed` (deadline and any late period passed),
+  `upcoming` (not open yet) or `unknown` (iCampus can't tell, e.g. handed in on paper or through an external
+  tool). Canvas decides for what you hand in, LearningX for what you watch or read. `status_reason` says
+  which, and `status_checked_at` when that source last confirmed it.
 - `in_remaining_list` is what My Page shows. It does not mean you haven't submitted.
 - `completed` and `submission` are only filled in when iCampus reported them. `null` means unknown.
 - `attendance` is one of `attendance` (present), `late`, `absent` or `none` (not decided yet).
+- Attachment text comes out of PDF, Word, PowerPoint, Excel, HWPX, notebooks and text files. `extract` says
+  when there is none: a picture, a scanned PDF, or the binary HWP format.
 
 ## MCP
 
 Tools: `sync_status`, `list_courses`, `list_tasks`, `list_announcements`, `read_announcement`,
-`list_lectures`, `get_grades`, `refresh`. All are read-only except `refresh`, which asks for a sync.
+`read_assignment`, `read_attachment`, `list_lectures`, `get_grades`, `refresh`. All are read-only except
+`refresh`, which asks for a sync, and `read_attachment`, whose first read of a file downloads it from iCampus
+(so clients may ask before running it). It returns text, or the picture itself for images.
 
 ```bash
 # over HTTP (icampus-mcp --http), with a token from ICAMPUS_MCP_TOKENS
@@ -114,9 +131,9 @@ MIT — see [LICENSE](LICENSE).
 
 | Path | What |
 |---|---|
-| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `api.py`, `mcp_server.py`) |
+| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `api.py`, `mcp_server.py`) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |
-| `tests/` | offline tests; one runs a local Chromium against a fake login page |
+| `tests/` | offline tests; one runs a local Chromium against a fake login page, one downloads from a local server |
 
-`var/` (the database, saved session, probe output), `.env` and `private/` hold personal data and are
-gitignored.
+`var/` (the database, saved session, downloaded attachments, probe output), `.env` and `private/` hold
+personal data and are gitignored.

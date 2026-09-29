@@ -5,13 +5,14 @@ import hmac
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import views
+from . import files, views
+from .browser import NotLoggedIn, clean_error
 from .config import KST, Settings, parse_tokens
 from .dates import term_year
 from .store import Store
@@ -20,6 +21,8 @@ from .sync import DATASETS, Syncer
 log = logging.getLogger(__name__)
 VERSION = "0.1.0"
 Kind = Literal["video", "material", "embedded_resource", "quiz", "assignment", "exam", "unknown"]
+Status = Literal["todo", "done", "missed", "upcoming", "unknown"]
+FileId = Annotated[str, Path(pattern=r"^\d+$")]
 
 
 def create_app(settings: Settings | None = None, *, store: Store | None = None, background: bool = True) -> FastAPI:
@@ -84,6 +87,14 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
             message, candidates = exc.args
             raise HTTPException(400, {"error": message, "candidates": candidates})
 
+    def outdated_before(now: datetime) -> str:
+        return (now - timedelta(hours=settings.stale_hours)).isoformat()
+
+    def all_tasks(now: datetime, include_inactive: bool = False) -> list[dict]:
+        return views.build_tasks(store.records("todos", include_inactive=include_inactive),
+                                 store.records("assignments"), store.records("lectures"), courses(),
+                                 now, term_year(store.get_state("term")), outdated_before=outdated_before(now))
+
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException):
         body = exc.detail if isinstance(exc.detail, dict) else {"error": exc.detail}
@@ -132,25 +143,37 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         return envelope(("courses",), courses())
 
     @app.get("/api/v1/tasks", dependencies=api, tags=["data"])
-    async def tasks(course: str | None = None, kind: Kind | None = None,
+    async def tasks(course: str | None = None, kind: Kind | None = None, status: Status | None = None,
                     due_within_days: int = Query(14, ge=0), past_days: int = Query(0, ge=0),
                     include_done: bool = False, include_inactive: bool = False,
                     limit: int = Query(200, ge=1, le=1000)) -> dict:
+        """Each task has a status (todo, done, missed, upcoming, unknown) with status_reason and
+        status_checked_at. Missed items lie in the past: combine status=missed with past_days."""
         ids = course_ids(course)
         now = datetime.now(KST)
-        merged = views.build_tasks(store.records("todos", include_inactive=include_inactive),
-                                   store.records("assignments"), store.records("lectures"), courses(),
-                                   now, term_year(store.get_state("term")))
-        items = views.filter_tasks(merged, now=now, course_ids=ids, kind=kind, due_within_days=due_within_days,
-                                   past_days=past_days, include_done=include_done, include_inactive=include_inactive)
+        items = views.filter_tasks(all_tasks(now, include_inactive), now=now, course_ids=ids, kind=kind,
+                                   status=status, due_within_days=due_within_days, past_days=past_days,
+                                   include_done=include_done, include_inactive=include_inactive)
         return envelope(("todos", "assignments", "lectures"), items, limit)
 
     @app.get("/api/v1/assignments", dependencies=api, tags=["data"])
     async def assignments(course: str | None = None, unsubmitted_only: bool = False) -> dict:
-        items = store.records("assignments", course_ids=course_ids(course))
+        """The description is left out here: /assignments/{id} has it."""
+        items = [{k: v for k, v in a.items() if k != "description"}
+                 for a in store.records("assignments", course_ids=course_ids(course))]
         if unsubmitted_only:
             items = [a for a in items if (a.get("submission") or {}).get("state") not in views.DONE_STATES]
         return envelope(("assignments",), with_course(items))
+
+    @app.get("/api/v1/assignments/{assignment_id}", dependencies=api, tags=["data"])
+    async def assignment(assignment_id: str) -> dict:
+        """One assignment or quiz: description, attached files, submission and its task status."""
+        for a in store.records("assignments", include_inactive=True):
+            if a["id"] == assignment_id:
+                task = next((t for t in all_tasks(datetime.now(KST)) if t["key"] == a["key"]), {})
+                return {**with_course([a])[0],
+                        **{k: task[k] for k in ("status", "status_reason", "status_checked_at") if k in task}}
+        raise HTTPException(404, "no such assignment")
 
     @app.get("/api/v1/announcements", dependencies=api, tags=["data"])
     async def announcements(course: str | None = None, since_days: int = Query(30, ge=0),
@@ -177,7 +200,8 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         available_only drops items that have not opened yet; upcoming_only drops items whose deadline
         (late period included) has passed. Soonest deadline first, undated last."""
         ids = course_ids(course)
-        now = datetime.now(KST).isoformat()
+        moment = datetime.now(KST)
+        now = moment.isoformat()
 
         def deadline(x: dict) -> str | None:
             return max(filter(None, (x.get("due_at"), x.get("late_until"))), default=None)
@@ -188,10 +212,49 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
                  and (not available_only or not x.get("available_from") or x["available_from"] <= now)
                  and (not upcoming_only or not deadline(x) or deadline(x) >= now)]
         items.sort(key=lambda x: (x.get("due_at") is None, x.get("due_at") or "", x["course_id"], x.get("week_no") or 0))
+        items = views.lecture_status(items, moment, outdated_before(moment))
         body = envelope(("lectures",), with_course(items), limit)
         if include_attendance:
             body["attendance"] = with_course(store.records("attendance", course_ids=ids))
         return body
+
+    def attachment(file_id: str) -> dict:
+        ref = files.find(store, file_id)
+        if ref is None:
+            raise HTTPException(404, "no synced announcement or assignment has this file")
+        return ref
+
+    async def fetch(ref: dict) -> files.Fetched:
+        try:
+            return await files.get(settings, store, ref)
+        except files.Busy as exc:
+            raise HTTPException(409, str(exc)) from None
+        except files.Unavailable as exc:
+            raise HTTPException(422, str(exc)) from None
+        except NotLoggedIn:
+            raise HTTPException(503, "the saved iCampus login has expired; the next sync signs in again") from None
+        except Exception as exc:  # Playwright errors carry request headers: only the cleaned message leaves here
+            log.warning("file %s: %s", ref["id"], clean_error(exc))
+            raise HTTPException(502, f"iCampus: {clean_error(exc)}") from None
+
+    @app.get("/api/v1/files/{file_id}", dependencies=api, tags=["data"])
+    async def file_text(file_id: FileId, offset: int = Query(0, ge=0),
+                        max_chars: int = Query(20000, ge=1, le=100000)) -> dict:
+        """A file attached to or linked from an announcement or assignment: its details and text, max_chars at a
+        time from offset. The first request downloads it from iCampus, which records that as you opening it."""
+        ref = attachment(file_id)
+        got = await fetch(ref)
+        text = got.text[offset:offset + max_chars]
+        end = offset + len(text)
+        return {**got.meta, "parent": ref["parent"], "total_chars": len(got.text), "offset": offset,
+                "next_offset": end if end < len(got.text) else None, "text": text}
+
+    @app.get("/api/v1/files/{file_id}/content", dependencies=api, tags=["data"])
+    async def file_content(file_id: FileId) -> FileResponse:
+        """The file itself (downloaded from iCampus on first use, like /files/{file_id})."""
+        got = await fetch(attachment(file_id))
+        return FileResponse(got.path, media_type=got.meta.get("content_type") or "application/octet-stream",
+                            filename=got.meta.get("name") or file_id)
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])
     async def grades(course: str | None = None) -> dict:

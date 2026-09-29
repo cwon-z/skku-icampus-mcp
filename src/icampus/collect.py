@@ -70,6 +70,8 @@ async def assignments(s: Session, course_id: str) -> list[Record]:
                 "lock_at": iso(from_canvas(a.get("lock_at"))), "points_possible": a.get("points_possible"),
                 "submission_types": a.get("submission_types"),
                 "quiz_id": str(a["quiz_id"]) if a.get("quiz_id") else None,
+                "description": parse.html_to_text(a.get("description")),
+                "attachments": parse.attachments(None, a.get("description")),
                 "submission": {
                     "state": sub.get("workflow_state"), "submitted_at": iso(from_canvas(sub.get("submitted_at"))),
                     "late": sub.get("late"), "missing": sub.get("missing"), "excused": sub.get("excused"),
@@ -93,7 +95,7 @@ async def announcements(s: Session, course_ids: list[str], since: date) -> list[
             "key": key, "course_id": course_id, "id": str(a["id"]), "title": a.get("title"),
             "posted_at": iso(from_canvas(a.get("posted_at"))), "author": (a.get("author") or {}).get("display_name"),
             "read_state": a.get("read_state"), "url": a.get("html_url"), "text": parse.html_to_text(a.get("message")),
-            "attachments": [f.get("display_name") for f in a.get("attachments") or []],
+            "attachments": parse.attachments(a.get("attachments"), a.get("message")),
         }))
     return records
 

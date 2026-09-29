@@ -15,14 +15,64 @@ def test_next_slot_never_repeats(tmp_path):
     assert Syncer(Settings(sync_times="", _env_file=None), Store(tmp_path / "u.db"))._next_slot(first) is None
 
 
-async def test_skipped_run_is_recorded_finished(tmp_path):
+async def test_skipped_run_is_recorded_finished(tmp_path, monkeypatch):
     import fcntl
+
+    import icampus.sync as sync_mod
+    monkeypatch.setattr(sync_mod, "LOCK_WAIT_S", 0)
     settings = Settings(data_dir=tmp_path, _env_file=None)
     store = Store(tmp_path / "t.db")
     held = open(tmp_path / "sync.lock", "w")
     fcntl.flock(held, fcntl.LOCK_EX)
-    run_id = await Syncer(settings, store).run("manual")
+    syncer = Syncer(settings, store)
+    run_id = await syncer.run("manual")
     assert store.recent_runs(1)[0]["id"] == run_id and store.recent_runs(1)[0]["status"] == "skipped"
+    assert not syncer.running
+
+
+async def test_lock_waits_for_the_holder(tmp_path):
+    import asyncio
+
+    from icampus.browser import exclusive
+
+    async def hold(seconds):
+        async with exclusive(tmp_path) as got:
+            assert got
+            await asyncio.sleep(seconds)
+
+    holder = asyncio.create_task(hold(0.3))
+    await asyncio.sleep(0.05)
+    async with exclusive(tmp_path) as busy:
+        assert not busy
+    async with exclusive(tmp_path, wait_s=5) as waited:
+        assert waited and holder.done()
+
+
+def test_health_names_datasets_left_behind(tmp_path):
+    from datetime import timedelta
+
+    from icampus.sync import DATASETS
+    store = Store(tmp_path / "t.db")
+    syncer = Syncer(Settings(stale_hours=12, _env_file=None), store)
+    now = datetime.now(KST)
+    for d in DATASETS:  # LearningX failing for days while Canvas keeps syncing
+        store.replace_scope(d, "s", [], now - timedelta(hours=72 if d in ("todos", "lectures") else 1))
+    store.finish_run(store.start_run("schedule", now), "partial", {}, now)
+    assert syncer.health() == (False, "last run partial; not updated for 12h+: todos, lectures")
+    for d in ("todos", "lectures"):
+        store.replace_scope(d, "s", [], now)
+    assert syncer.health() == (True, "last run partial")
+
+
+def test_health_for_a_term_without_courses(tmp_path):
+    from icampus.sync import PER_COURSE, PER_TERM
+    store = Store(tmp_path / "t.db")
+    now = datetime.now(KST)
+    for d in PER_TERM:
+        store.replace_scope(d, "term:x", [], now)
+    store.set_state("expected_scopes", {**{d: ["term:x"] for d in PER_TERM}, **{d: [] for d in PER_COURSE}})
+    store.finish_run(store.start_run("schedule", now), "ok", {}, now)
+    assert Syncer(Settings(_env_file=None), store).health() == (True, "last run ok")
 
 
 async def test_scheduler_skips_slot_already_run_before_restart(tmp_path, monkeypatch):

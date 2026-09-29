@@ -1,6 +1,7 @@
 """Parsers against synthetic fixtures shaped like LearningX/Canvas JSON."""
 
-from icampus.parse import html_to_text, kind_of, lectures, lesson_attendance, source_key, split_course_name, todo
+from icampus.parse import (attachments, html_to_text, kind_of, lectures, lesson_attendance, source_key,
+                           split_course_name, todo)
 
 
 def test_source_key_and_kind():
@@ -66,3 +67,29 @@ def test_lesson_attendance_and_text():
     assert [x["status"] for x in summary["lessons"]] == ["attendance", "none"]
     assert html_to_text("<p>Submit by <b>Oct 2</b>,<br>23:59</p><p>&nbsp;</p><p>Thanks</p>") == \
         "Submit by Oct 2,\n23:59\n\nThanks"
+
+
+def test_attachments_keep_ids_and_names_never_urls():
+    files = [{"id": 501, "display_name": "OMR form.pdf", "content-type": "application/pdf", "size": 1234,
+              "updated_at": "2026-09-18T02:00:00Z", "url": "https://canvas.skku.edu/files/501/download?verifier=SECRET"}]
+    html = ('<p>See <a title="HW1.pdf" href="https://canvas.skku.edu/courses/1001/files/502?verifier=SECRET&wrap=1">'
+            'Homework 1</a>, <a href="/courses/1001/files/501/download">the form again</a>, '
+            '<img src="/courses/1001/files/503/preview" alt="diagram">, <a href="/files/504/download">plain</a>, '
+            '<a href="/courses/1001/modules/items/7001">a lecture item</a>, <a href="https://evil.example/files/9">x</a>'
+            ' and <a href="/courses/1001/files/folder/week1">a folder</a></p>')
+    got = attachments(files, html)
+    assert got == [
+        {"id": "501", "name": "OMR form.pdf", "content_type": "application/pdf", "size": 1234,
+         "updated_at": "2026-09-18T11:00:00+09:00", "via": "attached"},
+        {"id": "502", "name": "HW1.pdf", "via": "linked"},
+        {"id": "503", "name": "diagram", "via": "linked"},
+        {"id": "504", "name": "plain", "via": "linked"},
+    ]
+    assert "SECRET" not in repr(got)
+    assert attachments(None, None) == [] and attachments([], "<p>no files</p>") == []
+    link = "https://canvas.skku.edu/courses/1/files/9/download?verifier=abc123&wrap=1"
+    html = f'<p>Form: <a href="{link}">{link}</a></p>'
+    assert "abc123" not in html_to_text(html) and "verifier=…&wrap=1" in html_to_text(html)
+    assert attachments(None, html) == [{"id": "9", "via": "linked"}]  # a URL is no name
+    assert attachments(None, '<a href="http://[broken/files/1">x</a><a href="/files/2">ok</a>') == \
+        [{"id": "2", "name": "ok", "via": "linked"}]

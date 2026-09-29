@@ -18,6 +18,7 @@ KIND = {
     "offline_exam": "exam",
 }
 _SOURCE = re.compile(r"^/courses/(\d+)/(modules/items|assignments|quizzes|discussion_topics)/(\d+)/?$")
+_FILE = re.compile(r"^(?:/courses/\d+)?/files/(\d+)(?:/(?:download|preview))?/?$")
 _WEEK = re.compile(r"(\d+)")
 _COURSE = re.compile(r"^(?P<name>.+)_(?P<code>[A-Z]{3,4}\d{3,4})_(?P<section>[A-Z0-9]+)\((?P<teacher>[^)]*)\)$")
 
@@ -59,6 +60,30 @@ def html_to_text(html: str | None) -> str:
         block.append("\n")
     lines = [" ".join(line.split()) for line in soup.get_text().splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def attachments(files: list[dict] | None, html: str | None) -> list[dict]:
+    """Files attached to an announcement (Canvas `attachments`) plus files linked or embedded in HTML, which is
+    how assignment descriptions carry them (/courses/<id>/files/<id> links). IDs, names and sizes only:
+    download URLs carry a verifier token and are never kept."""
+    found: dict[str, dict] = {}
+    for f in files or []:
+        if f.get("id") is not None:
+            found[str(f["id"])] = {k: v for k, v in {
+                "id": str(f["id"]), "name": f.get("display_name") or f.get("filename"),
+                "content_type": f.get("content-type"), "size": f.get("size"),
+                "updated_at": iso(from_canvas(f.get("updated_at"))), "via": "attached"}.items() if v is not None}
+    for tag in BeautifulSoup(html or "", "html.parser").find_all(["a", "img"]):
+        try:
+            parts = urlsplit(tag.get("href" if tag.name == "a" else "src") or "")
+            host = parts.hostname
+        except ValueError:  # a malformed link (e.g. a broken IPv6 host) is just not a file link
+            continue
+        m = _FILE.match(parts.path)
+        if m and host in (None, "canvas.skku.edu") and m.group(1) not in found:
+            name = tag.get("title") or (tag.get_text(" ", strip=True) if tag.name == "a" else tag.get("alt"))
+            found[m.group(1)] = {"id": m.group(1), **({"name": name} if name else {}), "via": "linked"}
+    return list(found.values())
 
 
 def todo(item: dict, course_id: str, year: int | None) -> dict | None:

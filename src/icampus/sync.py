@@ -1,7 +1,6 @@
 """One sync run, the daily schedule, and the optional Uptime Kuma heartbeat."""
 
 import asyncio
-import fcntl
 import logging
 import random
 import traceback
@@ -11,7 +10,7 @@ from typing import Any, Literal
 import httpx
 
 from . import collect
-from .browser import LoginRejected, NeedsAttention, NotLoggedIn, clean_error, open_session
+from .browser import LoginRejected, NeedsAttention, NotLoggedIn, clean_error, exclusive, open_session
 from .config import KST, Settings
 from .dates import term_year
 from .store import Store
@@ -21,6 +20,7 @@ RequestResult = Literal["started", "running", "cooldown", "login_blocked"]
 PER_TERM = ("courses", "todos", "announcements")
 PER_COURSE = ("assignments", "lectures", "attendance")
 DATASETS = PER_TERM + PER_COURSE
+LOCK_WAIT_S = 180  # a file download holds the session for seconds: wait for it rather than skip a sync
 
 
 def _where(exc: BaseException) -> str:
@@ -56,41 +56,38 @@ class Syncer:
     # --- a run -------------------------------------------------------------
 
     async def run(self, trigger: str, *, retry_login: bool = False) -> int:
-        self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        lock = open(self.settings.data_dir / "sync.lock", "w")
+        self.running = True  # also while it waits for the lock, so the schedule and refresh don't pile up
         try:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                log.info("another sync is running; skipping")
+            async with exclusive(self.settings.data_dir, LOCK_WAIT_S) as held:
+                if not held:
+                    log.info("another sync is running; skipping")
+                    run_id = self.store.start_run(trigger, datetime.now(KST))
+                    self.store.finish_run(run_id, "skipped", {"reason": "another sync held the lock"},
+                                          datetime.now(KST))
+                    return run_id
                 run_id = self.store.start_run(trigger, datetime.now(KST))
-                self.store.finish_run(run_id, "skipped", {"reason": "another sync held the lock"}, datetime.now(KST))
-                return run_id
-            self.running = True
-            run_id = self.store.start_run(trigger, datetime.now(KST))
-            detail: dict[str, Any] = {"datasets": {}}
-            status = "failed"
-            try:
-                if retry_login:
-                    self.store.set_state("login_block", None)
-                    self.store.set_state("login_attempts", [])
-                async with asyncio.timeout(self.settings.sync_timeout_s):
-                    status = await self._run(detail)
-            except TimeoutError:
-                detail["error"] = f"run exceeded {self.settings.sync_timeout_s}s"
-            except Exception as exc:  # keep the service alive; the run record says what broke
-                detail["error"] = clean_error(exc)
-                log.error("sync failed at %s: %s", _where(exc), detail["error"])
-            finally:
+                detail: dict[str, Any] = {"datasets": {}}
+                status = "failed"
                 try:
-                    self.store.finish_run(run_id, status, detail, datetime.now(KST))
-                except Exception as exc:
-                    log.error("could not record run %s: %s", run_id, clean_error(exc))
-            log.info("sync %s: %s", run_id, status)
-            return run_id
+                    if retry_login:
+                        self.store.set_state("login_block", None)
+                        self.store.set_state("login_attempts", [])
+                    async with asyncio.timeout(self.settings.sync_timeout_s):
+                        status = await self._run(detail)
+                except TimeoutError:
+                    detail["error"] = f"run exceeded {self.settings.sync_timeout_s}s"
+                except Exception as exc:  # keep the service alive; the run record says what broke
+                    detail["error"] = clean_error(exc)
+                    log.error("sync failed at %s: %s", _where(exc), detail["error"])
+                finally:
+                    try:
+                        self.store.finish_run(run_id, status, detail, datetime.now(KST))
+                    except Exception as exc:
+                        log.error("could not record run %s: %s", run_id, clean_error(exc))
+                log.info("sync %s: %s", run_id, status)
+                return run_id
         finally:
             self.running = False
-            lock.close()
 
     async def _run(self, detail: dict[str, Any]) -> str:
         s_ = self.settings
@@ -194,6 +191,13 @@ class Syncer:
         age = datetime.now(KST) - datetime.fromisoformat(last["started_at"])
         if age > timedelta(hours=self.settings.stale_hours):
             return False, f"last run {age.total_seconds() / 3600:.0f}h ago"
+        # partial runs keep the old data of whatever failed: say so once that is out of date
+        cutoff = (datetime.now(KST) - timedelta(hours=self.settings.stale_hours)).isoformat()
+        expected = self.store.get_state("expected_scopes", {})
+        behind = [d for d in DATASETS if (at := self.store.synced_at(d, expected.get(d))) is None or at < cutoff]
+        if behind:
+            hours = self.settings.stale_hours
+            return False, f"last run {last['status']}; not updated for {hours}h+: {', '.join(behind)}"
         return last["status"] != "failed", f"last run {last['status']}"
 
     async def kuma_pusher(self) -> None:

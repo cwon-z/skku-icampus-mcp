@@ -6,12 +6,15 @@ the LearningX list panels. Everything else is aborted and logged.
 """
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlencode, urljoin, urlsplit
 
@@ -94,9 +97,28 @@ class FetchError(Exception):
 
 
 class CanvasError(Exception):
-    def __init__(self, status: int, path: str):
-        super().__init__(f"HTTP {status} for {path}")
+    def __init__(self, status: int, path: str, hint: str = ""):
+        super().__init__(f"HTTP {status} for {path}" + (f" ({hint})" if hint else ""))
         self.status = status
+
+
+_TOKENISH = re.compile(r"[A-Za-z0-9._~+/=-]{24,}")
+
+
+def error_hint(body: str) -> str:
+    """The message of a JSON error body ('invalid token'), short and with anything token-like cut out."""
+    try:
+        data = json.loads(body.removeprefix("while(1);"))
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    errors = data.get("errors")
+    first = errors[0] if isinstance(errors, list) and errors else errors
+    message = next((m for m in (data.get("message"), data.get("error_description"), data.get("error"),
+                                first.get("message") if isinstance(first, dict) else first)
+                    if isinstance(m, str) and m.strip()), "")
+    return _TOKENISH.sub("…", " ".join(message.split()))[:120]
 
 
 class Session:
@@ -137,9 +159,24 @@ class Session:
         if resp.status in (301, 302, 401):
             raise NotLoggedIn(safe_path(url))
         if resp.status >= 400:
-            raise CanvasError(resp.status, safe_path(url))
+            raise CanvasError(resp.status, safe_path(url), error_hint(await resp.text()))
         text = await resp.text()
         return json.loads(text.removeprefix("while(1);")), resp.headers
+
+    async def download(self, url: str, max_bytes: int) -> bytes:
+        """GET a file; Canvas redirects to its file store. The URL can carry a verifier token: never log it."""
+        try:
+            resp = await self.context.request.get(url, max_redirects=5, timeout=90_000)
+        except PlaywrightError as exc:
+            raise FetchError(f"{clean_error(exc)} ({safe_path(url)})") from None
+        if urlsplit(resp.url).path.startswith(("/login", "/xn-sso")):
+            raise NotLoggedIn(safe_path(url))  # sent to a login page instead of the file
+        if resp.status >= 400:  # 401 here means not allowed (hidden, locked), not signed out
+            raise CanvasError(resp.status, safe_path(url))
+        body = await resp.body()
+        if len(body) > max_bytes:
+            raise FetchError(f"file larger than {max_bytes // 2**20} MB ({safe_path(url)})")
+        return body
 
     async def canvas(self, path: str, params: dict | None = None) -> Any:
         """GET a Canvas API path, following Link rel=next pagination for lists."""
@@ -269,18 +306,29 @@ class Session:
 
     async def learningx(self, path: str, params: dict | None = None) -> Any:
         """LearningX answers with Authorization: Bearer <xn_api_token cookie>, set at SSO login.
-        On 401 the token is re-issued by opening the My Page panel, at most once per session."""
+        A missing or refused token is re-issued by opening the My Page panel, at most once per session.
+        Refused means 401, or 400/403: in September 2026 every LearningX call answered 400 for days while
+        the Canvas session itself stayed valid."""
         while True:
             token = next((c["value"] for c in await self.context.cookies(CANVAS) if c["name"] == "xn_api_token"), "")
+            if not token and not self._learningx_refreshed:
+                await self._reissue_learningx_token("no token cookie")
+                continue
             try:
                 data, _ = await self.get_json(urljoin(CANVAS, "/learningx/api/v1" + path), params,
                                               {"Authorization": f"Bearer {token}"})
                 return data
-            except NotLoggedIn:
-                if self._learningx_refreshed:
+            except (NotLoggedIn, CanvasError) as exc:
+                refused = isinstance(exc, NotLoggedIn) or exc.status in (400, 403)
+                if not refused or self._learningx_refreshed:
                     raise
-                self._learningx_refreshed = True
-                await self.launch(self.settings.mypage_path, "/learningx/lti/dashboard_v2")
+                await self._reissue_learningx_token(type(exc).__name__ if isinstance(exc, NotLoggedIn)
+                                                    else f"HTTP {exc.status}")
+
+    async def _reissue_learningx_token(self, reason: str) -> None:
+        self._learningx_refreshed = True
+        log.info("re-issuing the LearningX token (%s)", reason)
+        await self.launch(self.settings.mypage_path, "/learningx/lti/dashboard_v2")
 
     # --- LearningX panels --------------------------------------------------
 
@@ -312,6 +360,28 @@ def _next_link(link_header: str) -> str | None:
         if 'rel="next"' in part:
             return part[part.find("<") + 1:part.find(">")]
     return None
+
+
+@asynccontextmanager
+async def exclusive(data_dir: Path, wait_s: float = 0) -> AsyncIterator[bool]:
+    """Holds var/sync.lock so one browser session runs at a time (a sync, a file download): they share the
+    saved login. Yields False if someone else still held it after wait_s seconds."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock = open(data_dir / "sync.lock", "w")
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+            except BlockingIOError:
+                held = False
+            if held or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+        yield held
+    finally:
+        lock.close()
 
 
 @asynccontextmanager

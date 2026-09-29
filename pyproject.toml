@@ -19,6 +19,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "pyjwt[crypto]>=2.10.1",
     "tzdata",
+    "pypdf>=5",
 ]
 
 [dependency-groups]

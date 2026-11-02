@@ -82,3 +82,7 @@ changes over time, so re-check with `icampus probe` when something breaks.
 - None of this moved `read_cnt`, and no LearningX progress or attendance is involved (that comes from the
   player inside the LearningX viewer). The bare player page `/em/<id>` answers 404 without LearningX's parameters.
 - A movie's original is an mp4. An everlec original has no extension: its format is not checked yet.
+  `videos.py` checks the first bytes of each download (`ftyp` at offset 4 means mp4) and labels anything else
+  "not mp4" with a `.bin` or described extension.
+- The descriptions carry `exists_caption`, `exists_script` and `caption_track_list` (null in the two videos checked).
+  `icampus video-check --captions` counts them across all hosted videos.

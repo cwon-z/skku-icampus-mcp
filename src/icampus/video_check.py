@@ -147,8 +147,37 @@ def _result(meta: Any) -> dict:
     return meta.get("result") or {} if isinstance(meta, dict) else {}
 
 
+async def _captions(assets: list[tuple[dict, tuple[str, str]]], lines: list[str]) -> None:
+    """What every hosted video's Commons description says about captions and scripts (values are flags only)."""
+    hosted = [(v, a) for v, a in assets if v.get("content_type") in HOSTED]
+    flags: Counter = Counter()
+    tracks: Counter = Counter()
+    track_urls: Counter = Counter()
+    shapes: dict[str, Any] = {}
+    failed = 0
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for v, (host, aid) in hosted:
+            status, meta = await _describe(client, host, aid)
+            res = _result(meta)
+            if not res:
+                failed += 1
+                continue
+            flags[(res.get("exists_caption"), res.get("exists_script"))] += 1
+            track_list = res.get("caption_track_list")
+            tracks[type(track_list).__name__] += 1
+            if track_list:
+                shapes.setdefault(v.get("content_type"), shape(track_list))
+                track_urls.update(mask(u) for u in urls_in(track_list))
+    lines.append(f"\nCaptions, from {len(hosted)} Commons descriptions (no cookies; {failed} failed):")
+    lines.append(f"  (exists_caption, exists_script): {dict(flags)}")
+    lines.append(f"  caption_track_list types: {dict(tracks)}")
+    for kind, sh in shapes.items():
+        lines.append(f"  caption_track_list shape ({kind}): {sh}")
+    lines.append(f"  URL patterns in caption tracks: {dict(track_urls)}")
+
+
 async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False,
-                embed: bool = False) -> str:
+                embed: bool = False, captions: bool = False) -> str:
     store = Store(settings.db_path)
     async with exclusive(settings.data_dir, 45) as held:
         if not held:
@@ -225,4 +254,6 @@ async def check(settings: Settings, course: str | None, head: int, manual_login:
                     _, after = await _describe(client, host, aid)
                     lines.append(f"    read_cnt before/after: {res.get('read_cnt')!r} -> "
                                  f"{_result(after).get('read_cnt')!r}")
+    if captions:
+        await _captions(assets, lines)
     return "\n".join(lines)

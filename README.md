@@ -2,7 +2,7 @@
 
 Keeps a copy of your own SKKU iCampus data and serves it to other programs over a REST API, and to AI
 assistants over MCP. That covers tasks and deadlines, assignment submission status, announcements,
-lectures and attendance, grades, and the files attached to announcements and assignments.
+lectures and attendance, grades, the files attached to announcements and assignments, and lecture videos.
 
 ```
 icampus      (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite
@@ -27,6 +27,12 @@ university's rules when you use it.
   records a download as you opening the file, and if a linked file also sits in a course module, as viewing
   it there. Copies are kept in `var/files` and reused until a sync sees a new version (for 12 hours when
   iCampus gives none). A child process with a memory cap and a time limit reads the text out of them.
+- **Lecture videos, on request only.** A video hosted on SKKU's content server (`lcms.skku.edu`) is
+  downloaded when someone exports it, without your login: the content server serves it to any request that
+  comes from iCampus, so nothing ties the download to your account, and no viewer, progress or attendance is
+  involved. Videos stay in `var/videos` (up to `ICAMPUS_VIDEO_CACHE_GB`, 30 by default; the least recently
+  used go first) and are reused until a sync sees a new version. YouTube and Zoom lectures aren't covered.
+  Lecture videos are copyrighted: keep them for your own study.
 - **Careful with logins.** At most 3 password logins a day. A rejected password, a locked account
   or a password-expiry notice stops automatic logins until you retry with an admin token
   (`POST /api/v1/sync?retry_login=true`).
@@ -70,6 +76,10 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/files/{id}` | an announcement or assignment attachment and its text: `offset, max_chars=20000`. Downloads it on first use |
 | `GET /api/v1/files/{id}/content` | the file itself |
 | `GET /api/v1/lectures` | `course, week, kind, incomplete_only, available_only, upcoming_only, include_attendance, limit` |
+| `GET /api/v1/videos` | lecture videos kept on the server, and how full the cache is |
+| `POST /api/v1/videos/{item_id}` | download a lecture video to the server unless it's cached (202 while it downloads, 200 when ready) |
+| `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued, downloading (with `downloaded_mb`), ready, outdated or failed |
+| `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy |
 | `GET /api/v1/grades` | `course` |
 | `GET /api/v1/export` | everything as one JSON document |
 
@@ -87,9 +97,13 @@ A few fields to read carefully:
 ## MCP
 
 Tools: `sync_status`, `list_courses`, `list_tasks`, `list_announcements`, `read_announcement`,
-`read_assignment`, `read_attachment`, `list_lectures`, `get_grades`, `refresh`. All are read-only except
-`refresh`, which asks for a sync, and `read_attachment`, whose first read of a file downloads it from iCampus
-(so clients may ask before running it). It returns text, or the picture itself for images.
+`read_assignment`, `read_attachment`, `list_lectures`, `export_video`, `get_grades`, `refresh`. All are read-only
+except `refresh`, which asks for a sync; `read_attachment`, whose first read of a file downloads it from iCampus
+(so clients may ask before running it) and which returns text, or the picture itself for images; and
+`export_video`, which saves a lecture video (`exportable` in `list_lectures`) to the server. Call it again to follow
+the download; when it is ready it returns a link, `<ICAMPUS_MCP_PUBLIC_URL>/videos/<item_id>`. The MCP server streams
+the file from the API behind the same auth as `/mcp`, so over Cloudflare Access the link opens in a signed-in
+browser. Without `ICAMPUS_MCP_PUBLIC_URL` the link is the API address (bearer token needed).
 
 ```bash
 # over HTTP (icampus-mcp --http), with a token from ICAMPUS_MCP_TOKENS
@@ -131,9 +145,9 @@ MIT — see [LICENSE](LICENSE).
 
 | Path | What |
 |---|---|
-| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `api.py`, `mcp_server.py`) |
+| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |
 | `tests/` | offline tests; one runs a local Chromium against a fake login page, one downloads from a local server |
 
-`var/` (the database, saved session, downloaded attachments, probe output), `.env` and `private/` hold
+`var/` (the database, saved session, downloaded attachments and videos, probe output), `.env` and `private/` hold
 personal data and are gitignored.

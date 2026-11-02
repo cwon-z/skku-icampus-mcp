@@ -14,8 +14,9 @@ import httpx
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from starlette.background import BackgroundTask
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from .config import McpSettings, parse_tokens
 from .extract import image_format
@@ -58,7 +59,7 @@ def _slim(body: dict, drop: set[str] = NOISE) -> dict:
     return out
 
 
-def _client(timeout: float) -> httpx.AsyncClient:
+def _client(timeout: float | None) -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=settings.api_url, timeout=timeout,
                              headers={"Authorization": f"Bearer {settings.api_token}"})
 
@@ -182,6 +183,16 @@ async def read_attachment(file_id: str, offset: int = 0) -> list[dict | str | Im
     return [info, text] if text else [info]
 
 
+def _lecture(row: dict) -> dict:
+    """A lecture row for the model: the Commons details become a size, and a flag that export_video works."""
+    row = _row(row, STATUS_NOISE)
+    if video := row.pop("video", None):
+        row["exportable"] = True
+        if video.get("listed_size"):
+            row["video_mb"] = round(video["listed_size"] / 2**20)
+    return row
+
+
 @mcp.tool(annotations=READ)
 async def list_lectures(course: str | None = None, week: int | None = None, kind: Kind | None = None,
                         incomplete_only: bool = True, include_upcoming: bool = False, include_overdue: bool = False,
@@ -200,10 +211,40 @@ async def list_lectures(course: str | None = None, week: int | None = None, kind
         include_attendance: add each course's official per-lesson attendance summary.
         limit: maximum items returned.
     """
-    return _slim(await _call("GET", "/api/v1/lectures", course=course, week=week, kind=kind,
+    body = _slim(await _call("GET", "/api/v1/lectures", course=course, week=week, kind=kind,
                              incomplete_only=incomplete_only, available_only=not include_upcoming,
                              upcoming_only=not include_overdue,
                              include_attendance=include_attendance, limit=limit), STATUS_NOISE)
+    body["items"] = [_lecture(r) for r in body["items"]]
+    return body
+
+
+def _video_link(item_id: str) -> str:
+    base = settings.public_url.rstrip("/")
+    return f"{base}/videos/{item_id}" if base else f"GET {settings.api_url}/api/v1/videos/{item_id}/content (API token)"
+
+
+# Not read-only: it downloads a file to the server (from SKKU's content server, without your login).
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                      open_world_hint=True))
+async def export_video(item_id: str) -> dict:
+    """Save a lecture video to the server and get a link to it (an `item_id` from list_lectures with `exportable`).
+    The first call starts the download, which takes a few minutes for a typical 100-700 MB lecture; call again to
+    see `downloaded_mb`. Once `state` is ready, `link` opens the file. The server keeps it, so later exports of the
+    same video are instant, until a sync sees a newer version (`outdated`; exporting again refreshes it) or the
+    cache needs the room. The download goes to SKKU's content server without your iCampus login, so it records no
+    viewing, progress or attendance. YouTube and Zoom lectures can't be exported. The video is for the user's own
+    use; don't offer to send it to anyone.
+
+    Args:
+        item_id: the lecture's numeric `item_id`.
+    """
+    if not item_id.isdigit():
+        raise ToolError("item_id must be the numeric item_id from list_lectures")
+    body = await _call("POST", f"/api/v1/videos/{item_id}", timeout=30)
+    if body.get("state") == "ready":
+        body["link"] = _video_link(item_id)
+    return body
 
 
 @mcp.tool(annotations=READ)
@@ -217,6 +258,37 @@ async def refresh() -> dict:
     """Ask the collector to sync from iCampus now. Returns immediately; a sync takes about a minute.
     Limited to once every few minutes. Check sync_status afterwards."""
     return await _call("POST", "/api/v1/sync")
+
+
+@mcp.custom_route("/videos/{item_id}", methods=["GET"])
+async def video_file(request: Request):
+    """Streams a cached video from the API (export_video's link). Behind the same auth as /mcp; nothing is kept
+    here. Range requests pass through, so a browser can seek."""
+    item_id = request.path_params["item_id"]
+    if not item_id.isdigit():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    client = _client(None)
+    headers = {k: v for k, v in request.headers.items() if k in ("range", "if-range")}
+    try:
+        upstream = await client.send(client.build_request("GET", f"/api/v1/videos/{item_id}/content",
+                                                          headers=headers), stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        return JSONResponse({"error": f"icampus API unreachable ({type(exc).__name__})"}, status_code=502)
+    if upstream.status_code >= 400:
+        body = await upstream.aread()
+        await upstream.aclose()
+        await client.aclose()
+        return JSONResponse({"error": body.decode("utf-8", "replace")[:300]}, status_code=upstream.status_code)
+    passed = {k: v for k, v in upstream.headers.items() if k in (
+        "content-type", "content-length", "content-range", "accept-ranges", "content-disposition", "last-modified",
+        "etag")}
+
+    async def close() -> None:
+        await upstream.aclose()
+        await client.aclose()
+    return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=passed,
+                             background=BackgroundTask(close))
 
 
 @mcp.custom_route("/health", methods=["GET"])

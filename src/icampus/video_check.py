@@ -6,14 +6,16 @@ video items' `item_content_data` (key names, types, URL patterns with IDs masked
 With --head N it also asks SKKU's content server (Commons, lcms.skku.edu) about N videos the way other SKKU tools
 do: a GET of the content's description (`/CommonsCore2/v2/contents/<id>`), then a GET of only the first byte of
 each download address it names (HEAD answers 500 there). All of it goes without cookies, so the content server
-can't tie it to your account. No item page, viewer or player is opened, so no watch progress is reported. It
+can't tie it to your account. No item page, viewer or player is opened, so no watch progress is reported.
+With --embed it also reads the public player page (lcms.skku.edu/em/<id>) as plain HTML, again without cookies
+or the course parameters LearningX adds, so it can't know who you are, and follows the media addresses it names. It
 prints status codes, types, sizes and masked URL patterns only.
 """
 
 import re
 from collections import Counter
 from typing import Any, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -24,6 +26,7 @@ from .probe import shape
 from .store import Store
 
 _ID = re.compile(r"(?i)[0-9a-f]{12,}|[0-9a-f-]{32,}|\d{3,}")
+_LONG_ID = re.compile(r"(?i)[0-9a-f-]{12,}|\d{6,}")  # in error text: keeps status codes, hides IDs
 _THUMB = re.compile(r"^/CommonsCore2/v2/contents/([^/.]+)\.[A-Za-z0-9]+$")
 HOSTED = {"movie", "everlec", "screenlecture"}  # youtube and zoom live elsewhere
 
@@ -63,16 +66,73 @@ def _named(meta: Any, field: str) -> str | None:
     return url if isinstance(url, str) and url.startswith("https://") else None
 
 
-async def _first_byte(client: httpx.AsyncClient, url: str) -> str:
-    """A GET for byte 0 only (HEAD answers 500 here), following redirects; the body is never read."""
+def error_hint(body: bytes) -> str:
+    """A short, masked line from an error page: its <title>, else its first text."""
+    text = body.decode("utf-8", "replace")
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    words = " ".join((m.group(1) if m and m.group(1).strip() else re.sub(r"(?s)<[^>]+>", " ", text)).split())
+    return _LONG_ID.sub("<id>", parse.scrub(re.sub(r"https?://\S+", lambda u: mask(u.group()) or "", words)))[:160]
+
+
+async def _first_byte(client: httpx.AsyncClient, url: str, headers: dict | None = None) -> str:
+    """A GET for byte 0 only (HEAD answers 500 here), following redirects. Only an error page's first 4 KB
+    are read, for its message; a file's body is never read."""
     try:
-        async with client.stream("GET", url, headers={"Range": "bytes=0-0"}, follow_redirects=True) as r:
+        async with client.stream("GET", url, headers={"Range": "bytes=0-0", **(headers or {})},
+                                 follow_redirects=True) as r:
             total = (r.headers.get("content-range") or "").rpartition("/")[2] or r.headers.get("content-length") or "0"
             hops = f" via {len(r.history)} redirect(s) to {mask(str(r.url))}" if r.history else ""
             size = f"{int(total) / 2**20:.0f} MB" if total.isdigit() else total
-            return f"{r.status_code} {r.headers.get('content-type', '')} {size}{hops}"
+            hint = ""
+            if r.status_code >= 400:
+                body = b""
+                async for chunk in r.aiter_bytes():
+                    body += chunk
+                    if len(body) >= 4096:
+                        break
+                hint = f' "{error_hint(body[:4096])}"'
+            return f"{r.status_code} {r.headers.get('content-type', '')} {size}{hops}{hint}"
     except httpx.HTTPError as exc:
         return type(exc).__name__
+
+
+_MEDIA = re.compile(r"""[^\s"'()<>]+?\.(?:mp4|m3u8|mpd|xml)(?:\?[^\s"'()<>]*)?|[^\s"'()<>]*content\.php[^\s"'()<>]*""",
+                    re.I)
+
+
+def media_refs(page: str, base: str) -> list[str]:
+    """Absolute URLs of media files, manifests and content XML a player page refers to."""
+    found = []
+    for raw in _MEDIA.findall(page.replace("\\/", "/")):
+        url = urljoin(base, raw.strip("\\"))
+        if url.startswith("https://") and url not in found:
+            found.append(url)
+    return found
+
+
+async def _embed(client: httpx.AsyncClient, host: str, aid: str, lines: list[str]) -> None:
+    """The public player page, fetched as plain HTML without cookies or course parameters (no JavaScript runs),
+    and the media it names."""
+    page_url = f"https://{host}/em/{aid}"
+    try:
+        r = await client.get(page_url, follow_redirects=True)
+    except httpx.HTTPError as exc:
+        lines.append(f"    GET em/<id>: {type(exc).__name__}")
+        return
+    refs = media_refs(r.text, str(r.url))
+    lines.append(f"    GET em/<id>: {r.status_code} {r.headers.get('content-type', '')}, "
+                 f"{len(r.text) // 1024} KB, media refs: {[mask(u) for u in refs][:12]}")
+    for url in refs:
+        if ".xml" in url.lower() or "content.php" in url.lower():
+            try:
+                x = await client.get(url, headers={"Referer": page_url})
+                inner = media_refs(x.text, url)
+                lines.append(f"    GET {mask(url)}: {x.status_code}, media in it: {[mask(u) for u in inner][:12]}")
+                refs += [u for u in inner if u not in refs]
+            except httpx.HTTPError as exc:
+                lines.append(f"    GET {mask(url)}: {type(exc).__name__}")
+    for url in [u for u in refs if re.search(r"(?i)\.(mp4|m3u8|mpd)(\?|$)", u)][:4]:
+        lines.append(f"    first byte of {mask(url)}: {await _first_byte(client, url, {'Referer': page_url})}")
 
 
 async def _describe(client: httpx.AsyncClient, host: str, aid: str) -> tuple[str, Any]:
@@ -87,7 +147,8 @@ def _result(meta: Any) -> dict:
     return meta.get("result") or {} if isinstance(meta, dict) else {}
 
 
-async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False) -> str:
+async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False,
+                embed: bool = False) -> str:
     store = Store(settings.db_path)
     async with exclusive(settings.data_dir, 45) as held:
         if not held:
@@ -155,6 +216,11 @@ async def check(settings: Settings, course: str | None, head: int, manual_login:
                 for field in ("mp4_download_url", "download_url"):
                     if url := _named(meta, field):
                         lines.append(f"    first byte of {field} ({mask(url)}): {await _first_byte(client, url)}")
+                        for referer in ("https://canvas.skku.edu/", f"https://{host}/em/{aid}"):
+                            lines.append(f"      with Referer {mask(referer)}: "
+                                         f"{await _first_byte(client, url, {'Referer': referer})}")
+                if embed:
+                    await _embed(client, host, aid, lines)
                 if meta is not None:
                     _, after = await _describe(client, host, aid)
                     lines.append(f"    read_cnt before/after: {res.get('read_cnt')!r} -> "

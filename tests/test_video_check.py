@@ -44,3 +44,21 @@ async def test_first_byte_asks_for_one_byte_and_reads_the_total():
     async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
         out = await _first_byte(client, "https://lcms.test/start")
     assert out == "206 video/mp4 100 MB via 1 redirect(s) to https://files.test/v/<id>.mp4 (+query)"
+
+
+def test_error_hint_is_short_and_masked():
+    from icampus.video_check import error_hint
+    page = b"<html><head><title>500 Internal Server Error</title></head><body>secret</body></html>"
+    assert error_hint(page) == "500 Internal Server Error"
+    body = b"<p>Failed for https://lcms.test/x/0123456789abcdef?verifier=abc and user 2026123456</p>"
+    out = error_hint(body)
+    assert "abc" not in out and "2026123456" not in out and "0123456789abcdef" not in out
+
+
+def test_media_refs_resolve_relative_and_escaped_urls():
+    from icampus.video_check import media_refs
+    page = ('var a = "https:\\/\\/cdn.test\\/v\\/main.mp4"; <source src="/media/sub.m3u8?t=1">'
+            ' load("./content.php?content_id=abc"); img("logo.png")')
+    assert media_refs(page, "https://lcms.test/em/abc") == [
+        "https://cdn.test/v/main.mp4", "https://lcms.test/media/sub.m3u8?t=1",
+        "https://lcms.test/em/content.php?content_id=abc"]

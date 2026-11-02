@@ -20,6 +20,8 @@ def main() -> None:
     video.add_argument("--course", help="course ID (default: all current courses)")
     video.add_argument("--head", type=int, default=0, metavar="N",
                        help="also send HEAD requests for the media files of N videos (no cookies, no download)")
+    video.add_argument("--login", choices=["saved", "manual"], default="saved",
+                       help="manual: sign in yourself in a browser window if the saved login has expired")
     args = parser.parse_args()
 
     settings = Settings()
@@ -48,7 +50,7 @@ def main() -> None:
         print(f"report: {out / 'report.md'}")
     elif args.cmd == "video-check":
         from .video_check import check
-        print(asyncio.run(check(settings, args.course, args.head)))
+        print(asyncio.run(check(settings, args.course, args.head, args.login == "manual")))
 
 
 if __name__ == "__main__":

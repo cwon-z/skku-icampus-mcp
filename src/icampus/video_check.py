@@ -42,17 +42,20 @@ def content_base(icd: dict) -> str | None:
     return f"https://{parts.hostname}{parts.path.split(cid)[0]}{cid}/contents/"
 
 
-async def check(settings: Settings, course: str | None, head: int) -> str:
+async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False) -> str:
     store = Store(settings.db_path)
     async with exclusive(settings.data_dir, 45) as held:
         if not held:
             return "a sync or download holds the session; try again in a minute"
-        async with open_session(settings, store) as s:
+        async with open_session(settings, store, headless=False if manual_login else None) as s:
+            if manual_login and not await s.logged_in():
+                from .probe import wait_manual_login
+                await wait_manual_login(s)  # you sign in yourself in the window; the session is saved for later
             try:
                 await s.ensure_login(allow_credentials=False)
             except NotLoggedIn:
-                return ("the saved iCampus login has expired: run `uv run icampus sync` once (it signs in again), "
-                        "then run this check again")
+                return ("the saved iCampus login has expired: run this again with --login manual to sign in "
+                        "in a browser window, or `uv run icampus sync` if your .env has your login")
             _, _, raw = await collect.courses(s, settings.term)
             ids = [str(c["id"]) for c in raw if not course or str(c["id"]) == course]
             videos = []

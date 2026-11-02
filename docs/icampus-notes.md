@@ -65,3 +65,12 @@ changes over time, so re-check with `icampus probe` when something breaks.
   on request, only when a synced announcement or assignment points at them, and never from lecture items
   (LearningX materials): not yet observed live, but that is how Canvas treats file downloads.
 - **Everything here counts as account activity.** Canvas and LearningX record page views and API use.
+
+## Lecture videos (not yet confirmed)
+
+- Public SKKU browser extensions fetch videos from the Commons content server (`lcms.skku.edu`) at
+  `<content folder>/<content_id>/contents/media_files/{screen,main,sub,mobile/ssmovie}.mp4`, with the folder taken
+  from the thumbnail URL. Another reads `content_id`, `thumbnail_url` and `view_url` from the LearningX `modules`
+  list that the sync already fetches, so no viewer would need to open. Watch progress appears to be reported by
+  the player itself (`use_content_progress=true` in the viewer URL), so a plain request for the file likely
+  records none. `icampus video-check [--head N]` checks all of this against a real account without downloading.

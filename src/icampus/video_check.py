@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import collect, parse
-from .browser import exclusive, open_session
+from .browser import NotLoggedIn, exclusive, open_session
 from .config import Settings
 from .store import Store
 
@@ -48,7 +48,11 @@ async def check(settings: Settings, course: str | None, head: int) -> str:
         if not held:
             return "a sync or download holds the session; try again in a minute"
         async with open_session(settings, store) as s:
-            await s.ensure_login(allow_credentials=False)
+            try:
+                await s.ensure_login(allow_credentials=False)
+            except NotLoggedIn:
+                return ("the saved iCampus login has expired: run `uv run icampus sync` once (it signs in again), "
+                        "then run this check again")
             _, _, raw = await collect.courses(s, settings.term)
             ids = [str(c["id"]) for c in raw if not course or str(c["id"]) == course]
             videos = []

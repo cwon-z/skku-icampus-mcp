@@ -4,10 +4,10 @@ Reads the same LearningX `modules?include_detail=true` list the sync reads, and 
 video items' `item_content_data` (key names, types, URL patterns with IDs masked), never their values.
 
 With --head N it also asks SKKU's content server (Commons, lcms.skku.edu) about N videos the way other SKKU tools
-do: a GET of the content's description (`/CommonsCore2/v2/contents/<id>`), then a HEAD of any download address it
-names. All of it goes without cookies, so the content server can't tie it to your account, and a HEAD downloads
-nothing. No item page, viewer or player is opened, so no watch progress is reported. It prints status codes,
-types, sizes and masked URL patterns only.
+do: a GET of the content's description (`/CommonsCore2/v2/contents/<id>`), then a GET of only the first byte of
+each download address it names (HEAD answers 500 there). All of it goes without cookies, so the content server
+can't tie it to your account. No item page, viewer or player is opened, so no watch progress is reported. It
+prints status codes, types, sizes and masked URL patterns only.
 """
 
 import re
@@ -57,20 +57,34 @@ def urls_in(value: Any) -> Iterator[str]:
         yield value
 
 
-def _named_download(meta: Any) -> str | None:
+def _named(meta: Any, field: str) -> str | None:
     result = meta.get("result") if isinstance(meta, dict) else None
-    url = result.get("download_url") if isinstance(result, dict) else None
+    url = result.get(field) if isinstance(result, dict) else None
     return url if isinstance(url, str) and url.startswith("https://") else None
 
 
-async def _head(client: httpx.AsyncClient, url: str) -> str:
+async def _first_byte(client: httpx.AsyncClient, url: str) -> str:
+    """A GET for byte 0 only (HEAD answers 500 here), following redirects; the body is never read."""
     try:
-        r = await client.head(url)
+        async with client.stream("GET", url, headers={"Range": "bytes=0-0"}, follow_redirects=True) as r:
+            total = (r.headers.get("content-range") or "").rpartition("/")[2] or r.headers.get("content-length") or "0"
+            hops = f" via {len(r.history)} redirect(s) to {mask(str(r.url))}" if r.history else ""
+            size = f"{int(total) / 2**20:.0f} MB" if total.isdigit() else total
+            return f"{r.status_code} {r.headers.get('content-type', '')} {size}{hops}"
     except httpx.HTTPError as exc:
         return type(exc).__name__
-    size = int(r.headers.get("content-length") or 0)
-    where = f" -> {mask(r.headers['location'])}" if "location" in r.headers else ""
-    return f"{r.status_code} {r.headers.get('content-type', '')} {size / 2**20:.0f} MB{where}"
+
+
+async def _describe(client: httpx.AsyncClient, host: str, aid: str) -> tuple[str, Any]:
+    try:
+        r = await client.get(f"https://{host}/CommonsCore2/v2/contents/{aid}")
+        return f"{r.status_code} {r.headers.get('content-type', '')}", r.json() if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        return type(exc).__name__, None
+
+
+def _result(meta: Any) -> dict:
+    return meta.get("result") or {} if isinstance(meta, dict) else {}
 
 
 async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False) -> str:
@@ -128,18 +142,21 @@ async def check(settings: Settings, course: str | None, head: int, manual_login:
             for n, (v, (host, aid)) in enumerate(picks[:head], 1):
                 lines.append(f"  video {n} ({v.get('content_type')}, "
                              f"{(v.get('total_file_size') or 0) / 2**20:.0f} MB listed):")
-                meta = None
-                try:
-                    r = await client.get(f"https://{host}/CommonsCore2/v2/contents/{aid}")
-                    lines.append(f"    GET contents/<id>: {r.status_code} {r.headers.get('content-type', '')}")
-                    if r.status_code == 200:
-                        meta = r.json()
-                        lines.append(f"    its shape: {shape(meta)}")
-                        lines.append(f"    URL patterns in it: {dict(Counter(mask(u) for u in urls_in(meta)))}")
-                except (httpx.HTTPError, ValueError) as exc:
-                    lines.append(f"    GET contents/<id>: {type(exc).__name__}")
-                if named := _named_download(meta):
-                    lines.append(f"    HEAD its download_url ({mask(named)}): {await _head(client, named)}")
-                fallback = f"https://{host}/CommonsCore2/v2/services/download/{aid}"
-                lines.append(f"    HEAD services/download/<id>: {await _head(client, fallback)}")
+                status, meta = await _describe(client, host, aid)
+                res = _result(meta)
+                lines.append(f"    GET contents/<id>: {status}")
+                # enumerations and counts only (the description also names the uploader: never printed)
+                lines.append("    " + ", ".join(f"{k}={res.get(k)!r}" for k in (
+                    "type", "subtype", "extension", "convert_state", "status", "privacy",
+                    "is_original_file_deleted", "read_cnt")))
+                lines.append(f"    sizes: original {(res.get('original_file_length') or 0) / 2**20:.0f} MB, "
+                             f"total {(res.get('total_file_size') or 0) / 2**20:.0f} MB, "
+                             f"mobile {(res.get('mobile_file_size') or 0) / 2**20:.0f} MB")
+                for field in ("mp4_download_url", "download_url"):
+                    if url := _named(meta, field):
+                        lines.append(f"    first byte of {field} ({mask(url)}): {await _first_byte(client, url)}")
+                if meta is not None:
+                    _, after = await _describe(client, host, aid)
+                    lines.append(f"    read_cnt before/after: {res.get('read_cnt')!r} -> "
+                                 f"{_result(after).get('read_cnt')!r}")
     return "\n".join(lines)

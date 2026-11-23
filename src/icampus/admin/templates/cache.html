@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% from "_ui.html" import badge, meter, post with context %}
+{% block title %}Cache{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><h1 class="t-title-2">Cache</h1><p>Everything the server has on disk. This page reads the index only: opening it, or anything on it, never asks iCampus for a file. Past a cap the least recently used entries go first, except pinned ones, ones a job still needs, and transcripts.</p></div>
+  <div class="meter-cell"><span class="mono">{{ totals.all.bytes | size }} / {{ totals.all.cap_bytes | size }}</span>{{ meter(totals.all.bytes, totals.all.cap_bytes, label="Storage used") }}</div>
+</header>
+
+<section class="grid grid--4">
+  {% for kind in kinds if kind != "frames" or totals[kind].count %}{% set t = totals[kind] %}
+  <a class="nc-card nc-card--pad-md nc-stat is-interactive" href="/admin/cache?kind={{ kind }}">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">{{ kind | capitalize }}</h2></div><span class="mono faint">{{ t.count }}</span></div>
+    <div class="nc-card__body">
+      <div class="nc-stat__value-row"><span class="nc-stat__value nc-num">{{ t.bytes | size }}</span><span class="nc-stat__secondary">{% if t.cap_bytes is not none %}/ {{ t.cap_bytes | size }}{% else %}never evicted{% endif %}</span></div>
+      {% if t.cap_bytes %}{{ meter(t.bytes, t.cap_bytes, label=kind ~ " used") }}{% endif %}
+      <span class="nc-stat__footnote">{{ t.pinned_bytes | size }} pinned · {{ t.in_use_bytes | size }} in use</span>
+    </div>
+  </a>
+  {% endfor %}
+</section>
+
+<form class="row" method="get" action="/admin/cache">
+  <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="kind" aria-label="Kind"><option value="">Every kind</option>{% for k in kinds %}<option value="{{ k }}"{% if q.kind == k %} selected{% endif %}>{{ k }}</option>{% endfor %}</select></span></label>
+  <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="course" aria-label="Course"><option value="">Every course</option>{% for c in courses %}<option value="{{ c.id }}"{% if q.course == c.id %} selected{% endif %}>{{ c.name }}</option>{% endfor %}</select></span></label>
+  <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="sort" aria-label="Sort by">{% for v, l in (("last_used", "Last used"), ("size", "Size"), ("kind", "Kind"), ("title", "Title"), ("course", "Course")) %}<option value="{{ v }}"{% if q.sort == v %} selected{% endif %}>Sort by {{ l | lower }}</option>{% endfor %}</select></span></label>
+  <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="order" aria-label="Order"><option value="desc"{% if q.order == "desc" %} selected{% endif %}>Descending</option><option value="asc"{% if q.order == "asc" %} selected{% endif %}>Ascending</option></select></span></label>
+  <label class="nc-check"><input class="nc-check__input" type="checkbox" name="pinned" value="1"{% if q.pinned %} checked{% endif %}><span class="nc-check__box"></span><span class="nc-check__label">Pinned only</span></label>
+  <button class="nc-btn nc-btn--secondary nc-btn--sm" type="submit">Apply</button>
+</form>
+
+<div class="nc-table-wrap"><table class="nc-table nc-table--dense">
+  <thead><tr><th>Kind</th><th>Course</th><th>Title</th><th class="is-num">Size</th><th>Last used</th><th>State</th><th></th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+  {% set open = ("/admin/attachment/" ~ r.key) if r.kind == "attachment" else ("/admin/lecture/" ~ r.item_id ~ ("?transcript=" ~ r.key if r.kind == "transcript" else "")) if r.item_id else "" %}
+  <tr>
+    <td>{{ badge("queued", r.kind) }}</td>
+    <td class="muted">{{ r.course or "–" }}</td>
+    <td class="wrap">{% if open %}<a href="{{ open }}">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}<div class="t-caption faint"><span class="mono">{{ r.key }}</span>{% if r.detail %} · {{ r.detail }}{% endif %}</div></td>
+    <td class="is-num mono nowrap">{{ r.size | size }}</td>
+    <td class="mono nowrap">{{ r.last_used | when }}</td>
+    <td>{% if r.state %}{{ badge(r.state) }}{% endif %}</td>
+    <td><div class="table-actions">
+      {% set base = "/admin/cache/" ~ r.kind ~ "/" ~ r.key %}
+      {% if open %}<a class="nc-btn nc-btn--secondary nc-btn--sm" href="{{ open }}">Open</a>{% endif %}
+      {% if r.kind in capped %}{{ post(base ~ ("/unpin" if r.pinned else "/pin"), "Unpin" if r.pinned else "Pin", fields={"back": here}) }}{% endif %}
+      {% if r.kind in ("video", "audio") and r.item_id %}{{ post(base ~ "/transcribe", "Transcribe", fields={"back": here}) }}{% endif %}
+      {% if r.kind == "video" and r.item_id %}{{ post(base ~ "/redownload", "Re-download", confirm="Delete this copy and download the video again from the content server?", fields={"back": here}) }}{% endif %}
+      {{ post(base ~ "/delete", "Delete", "nc-btn nc-btn--danger nc-btn--sm", "Delete " ~ r.title ~ " from the server?" ~ (" Reading it again downloads it from iCampus, which records that as opening it." if r.kind == "attachment" else ""), {"back": here}) }}
+    </div></td>
+  </tr>
+  {% else %}<tr><td colspan="7" class="empty">Nothing on disk matches. Exported videos, extracted audio, attachments that were read and transcripts appear here.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

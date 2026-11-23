@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% from "_ui.html" import badge, meter, post, field, select with context %}
+{% block title %}STT models{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><h1 class="t-title-2">STT models</h1><p>The speech-to-text providers a lecture can be sent to. A request names one, or the routing below picks one and falls back to the next when it fails.</p></div>
+  <a class="nc-btn nc-btn--primary" href="/admin/stt/new">Add provider</a>
+</header>
+
+<div class="nc-table-wrap"><table class="nc-table">
+  <thead><tr><th>Provider</th><th>Model</th><th class="is-num">Cost / h</th><th>Timestamps</th><th>Key</th><th>Health</th><th>This period</th><th></th></tr></thead>
+  <tbody>
+  {% for p in providers %}
+  <tr>
+    <td class="wrap"><div class="row"><span class="mono">{{ p.id }}</span>{% if p.default %}{{ badge("pinned", "default") }}{% endif %}{% if not p.enabled %}{{ badge("canceled", "disabled") }}{% endif %}</div>
+      <div class="t-body-sm muted">{{ p.name }}{% if p.description %} · {{ p.description }}{% endif %}</div>
+      {% if p.not_ready and p.enabled %}<div class="t-caption faint">Not ready: {{ p.not_ready }}</div>{% endif %}</td>
+    <td><span class="mono">{{ p.model or "–" }}</span><div class="t-caption faint">{{ p.type }}{% if p.config.base_url %} · {{ p.config.base_url }}{% endif %}</div></td>
+    <td class="is-num mono">${{ "%.3f" | format(p.cost_per_hour_usd) }}</td>
+    <td>{{ p.timestamps }}<div class="t-caption faint">{{ p.languages if p.languages == "any" else p.languages | join(", ") }}</div></td>
+    <td class="nowrap">{% if p.key_status.set %}<span class="mono">set · {{ p.key_status.hint or "…" }}</span><div class="t-caption faint">{{ "from " ~ p.key_status.env if p.key_status.source == "env" else "stored on the server" }}</div>
+      {% elif p.key_status.needed %}{{ badge("failed", "missing") }}{% else %}<span class="faint">not needed</span>{% endif %}</td>
+    <td id="health-{{ p.id }}">{% include "_stt_health.html" %}</td>
+    <td><div class="meter-cell"><span class="mono">{{ p.month.used_hours }} h{% if p.month.cap_hours is not none %} / {{ p.month.cap_hours }} h{% endif %}</span>
+      {% if p.month.cap_hours %}{{ meter(p.month.used_hours, p.month.cap_hours, label="Hours used") }}{% endif %}
+      <span class="t-caption faint">${{ "%.2f" | format(p.month.used_usd) }}{% if p.month.cap_usd is not none %} / ${{ p.month.cap_usd }}{% endif %} · resets {{ p.month.resets }}</span></div></td>
+    <td><div class="table-actions">
+      <form class="inline" method="post" action="/admin/stt/{{ p.id }}/test" hx-post="/admin/stt/{{ p.id }}/test" hx-target="#health-{{ p.id }}" hx-swap="innerHTML"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="nc-btn nc-btn--secondary nc-btn--sm" type="submit" title="Sends a five-second clip of synthesized speech: a real, tiny paid call">Test</button></form>
+      <a class="nc-btn nc-btn--secondary nc-btn--sm" href="/admin/stt/{{ p.id }}/edit">Edit</a>
+      {{ post("/admin/stt/" ~ p.id ~ "/" ~ ("disable" if p.enabled else "enable"), "Disable" if p.enabled else "Enable") }}
+      {{ post("/admin/stt/" ~ p.id ~ "/delete", "Delete", "nc-btn nc-btn--danger nc-btn--sm", "Delete " ~ p.id ~ "? Its transcripts stay.") }}
+    </div></td>
+  </tr>
+  {% else %}<tr><td colspan="8" class="empty">No provider is registered yet. Add one to transcribe lectures.</td></tr>{% endfor %}
+  </tbody>
+</table></div>
+
+<section class="nc-card nc-card--pad-lg">
+  <div class="nc-card__header"><div class="nc-card__titles"><h2 class="t-title-3">Automatic routing</h2><p class="nc-card__subtitle">Used when a request names no model: the first rule that matches, then the default, then the fallbacks in order, then the rest by priority. Providers that are disabled, failing, over budget or unable to give the timestamps required are skipped.</p></div></div>
+  <form class="stack stack--lg" method="post" action="/admin/stt/routing">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="form-grid">
+      {% set ids = providers | map(attribute="id") | list %}
+      <label class="nc-field nc-select"><span class="nc-field__label">Default provider</span><span class="nc-field__control"><select class="nc-field__input" name="default"><option value="">Lowest priority number</option>{% for i in ids %}<option value="{{ i }}"{% if i == default %} selected{% endif %}>{{ i }}</option>{% endfor %}</select></span></label>
+      {{ field("fallback", "Fallback order", fallback, "Provider ids, separated by commas") }}
+      <label class="nc-field nc-select"><span class="nc-field__label">Timestamps a transcript must have</span><span class="nc-field__control"><select class="nc-field__input" name="min_timestamps">{% for c in ("word", "segment", "none") %}<option value="{{ c }}"{% if c == min_timestamps %} selected{% endif %}>{{ c }}</option>{% endfor %}</select></span><span class="nc-field__hint">"none" accepts plain text from models without timestamps</span></label>
+    </div>
+    <div class="nc-table-wrap"><table class="nc-table nc-table--dense">
+      <thead><tr><th>Course</th><th>Language</th><th>Provider</th></tr></thead>
+      <tbody>
+      {% for rule in rules %}
+      <tr>
+        <td><label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="rule_course_{{ loop.index0 }}" aria-label="Course"><option value="">Any course</option>{% for c in courses %}<option value="{{ c.code or c.id }}"{% if rule.course and rule.course | lower in ((c.code or "") | lower, c.id) %} selected{% endif %}>{{ c.name }}{% if c.code %} ({{ c.code }}){% endif %}</option>{% endfor %}</select></span></label></td>
+        <td><label class="nc-field nc-field--sm"><span class="nc-field__control"><input class="nc-field__input" name="rule_language_{{ loop.index0 }}" value="{{ rule.language or "" }}" placeholder="any" aria-label="Language" maxlength="3"></span></label></td>
+        <td><label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="rule_provider_{{ loop.index0 }}" aria-label="Provider"><option value="">No rule</option>{% for i in ids %}<option value="{{ i }}"{% if i == rule.provider %} selected{% endif %}>{{ i }}</option>{% endfor %}</select></span></label></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    <p class="t-caption faint">A rule needs a provider and a course, a language (ISO 639-1, such as ko) or both. Rows without a provider are dropped; save to get two more empty rows.</p>
+    <div class="row row--end"><button class="nc-btn nc-btn--primary" type="submit">Save routing</button></div>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block body %}
+<main class="auth">
+  <section class="nc-card nc-card--pad-lg auth__panel">
+    <div>
+      <h1 class="t-title-2">Sign in</h1>
+      <p class="muted">Paste an admin API token. It is checked once and replaced by a session cookie; the token itself is not kept in the browser.</p>
+    </div>
+    {% if error %}<div class="notice notice--danger" role="alert">{{ error }}</div>{% endif %}
+    {% if not configured %}<div class="notice notice--warning">No admin token is configured. Set ICAMPUS_API_TOKENS with a token whose label is in ICAMPUS_ADMIN_LABELS.</div>{% endif %}
+    {% if plain_http %}<div class="notice notice--warning">This page came over plain HTTP, and the session cookie is only sent over HTTPS, so signing in won't stick. Serve it over HTTPS (for example with <span class="mono">tailscale serve</span>), or set <span class="mono">ICAMPUS_ADMIN_COOKIE_SECURE=false</span> on a private address.</div>{% endif %}
+    <form class="stack" method="post" action="/admin/login">
+      <input type="hidden" name="login_token" value="{{ login_token }}">
+      <label class="nc-field">
+        <span class="nc-field__label">Admin token</span>
+        <span class="nc-field__control"><input class="nc-field__input" type="password" name="token" autocomplete="off" autofocus required></span>
+      </label>
+      <div class="row row--end"><button class="nc-btn nc-btn--primary" type="submit">Sign in</button></div>
+    </form>
+  </section>
+</main>
+{% endblock %}

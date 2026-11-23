@@ -222,7 +222,6 @@ async def test_a_lecture_of_unknown_length_is_checked_against_the_cap_once_its_a
 
 async def test_the_prefetch_limit_keeps_downloads_from_running_ahead(rig):
     gate = asyncio.Event()
-    running = {"now": 0, "peak": 0}
 
     class SlowStt(Stt):
         async def __call__(self, request):

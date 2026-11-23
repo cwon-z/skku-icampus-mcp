@@ -143,6 +143,8 @@ class ProviderConfig(BaseModel):
         if self.type == "openai_compatible" and not (self.base_url and self.model):
             raise ValueError("an OpenAI-compatible provider needs a base URL (ending in /v1 for most servers) "
                              "and a model")
+        if self.type == "elevenlabs" and not self.model:
+            self.model = elevenlabs.DEFAULT_MODEL  # spelled out, so the list shows what is actually used
         base = elevenlabs.LIMITS if self.type == "elevenlabs" else openai_compatible.LIMITS
         base.merged(self.capabilities)  # raises ValueError for an unknown or malformed override
         return self

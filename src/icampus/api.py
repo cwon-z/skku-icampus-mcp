@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from types import SimpleNamespace
 
+from . import admin as admin_ui
 from . import api_transcripts, files, videos, views
 from .browser import NotLoggedIn, clean_error
 from .cache import CAPS, GB, Cache
@@ -435,6 +436,7 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
                           synced=synced, courses=courses)
     app.state.ctx = ctx
     api_transcripts.register(app, ctx)
+    admin_ui.register(app, ctx)  # the web UI at /admin, unless ICAMPUS_ADMIN_UI=false
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])
     async def grades(course: str | None = None) -> dict:

@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% from "_ui.html" import field, area, switch with context %}
+{% block title %}{{ "Add provider" if new else c.id }}{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <nav class="nc-breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/admin/stt">STT models</a><span class="nc-breadcrumb__sep">/</span></li><li aria-current="page">{{ "Add provider" if new else c.id }}</li></ol></nav>
+    <h1 class="t-title-2">{{ "Add provider" if new else "Edit " ~ c.id }}</h1>
+    <p>Examples for ElevenLabs, OpenAI, Groq and a self-hosted Whisper server are in <span class="mono">docs/stt-providers.md</span>.</p>
+  </div>
+</header>
+{% if errors.config %}<div class="notice notice--danger" role="alert">{{ errors.config }}</div>{% endif %}
+<form class="stack stack--lg" method="post" action="{{ '/admin/stt' if new else '/admin/stt/' ~ c.id }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <section class="nc-card nc-card--pad-lg">
+    <h2 class="t-title-3">Identity</h2>
+    <div class="form-grid">
+      {% if new %}{{ field("id", "Id", c.id, "What requests pass as model=. Lowercase letters, digits and hyphens, e.g. homelab-whisper", errors.id) }}
+      {% else %}<div class="nc-field"><span class="nc-field__label">Id</span><span class="mono">{{ c.id }}</span></div>{% endif %}
+      <label class="nc-field nc-select{% if errors.type %} is-invalid{% endif %}"><span class="nc-field__label">Type</span><span class="nc-field__control"><select class="nc-field__input" name="type"><option value="elevenlabs"{% if c.type == "elevenlabs" %} selected{% endif %}>ElevenLabs Scribe</option><option value="openai_compatible"{% if c.type == "openai_compatible" %} selected{% endif %}>OpenAI-compatible (/audio/transcriptions)</option></select></span>{% if errors.type %}<span class="nc-field__hint">{{ errors.type }}</span>{% endif %}</label>
+      {{ field("name", "Display name", c.name, "", errors.name) }}
+      {{ field("model", "Model", c.model, "scribe_v3, whisper-large-v3, Systran/faster-whisper-large-v3 …", errors.model) }}
+      <div class="span-2">{{ field("description", "Description", c.description, "Shown to the assistant so it can choose: what this one is good for", errors.description) }}</div>
+      <div class="span-2">{{ field("base_url", "Base URL", c.base_url, "Required for OpenAI-compatible servers, usually ending in /v1. Empty for ElevenLabs.", errors.base_url, placeholder="http://gpu-box.tailnet.ts.net:8000/v1") }}</div>
+    </div>
+  </section>
+
+  <section class="nc-card nc-card--pad-lg">
+    <h2 class="t-title-3">API key</h2>
+    <p class="muted">The key is never shown again. It comes from the environment variable named here, and only when that is empty from the key stored on the server.{% if key_status %} Now: <span class="mono">{% if key_status.set %}set · {{ key_status.hint or "…" }} ({{ "from " ~ key_status.env if key_status.source == "env" else "stored" }}){% else %}not set{% endif %}</span>.{% endif %}</p>
+    <div class="form-grid">
+      {{ field("api_key_env", "Environment variable", c.api_key_env, "e.g. ELEVENLABS_API_KEY. Not an ICAMPUS_* variable.", errors.api_key_env) }}
+      {{ field("key", "Store a key on the server", "", "Write-only. Leave empty to keep what is there.", "", type="password") }}
+    </div>
+  </section>
+
+  <section class="nc-card nc-card--pad-lg">
+    <h2 class="t-title-3">Cost and budget</h2>
+    <div class="form-grid">
+      {{ field("cost_per_hour", "Cost per audio hour", c.cost_per_hour, "0 for a self-hosted server", errors.cost_per_hour, type="number", unit="USD") }}
+      {{ field("included_hours", "Hours included in a plan", c.included_hours, "These cost nothing more each period", errors.included_hours, type="number", unit="h") }}
+      {{ field("monthly_hours_cap", "Monthly hour cap", c.monthly_hours_cap, "Empty for none. Jobs beyond it wait for the next period.", errors.monthly_hours_cap, type="number", unit="h") }}
+      {{ field("monthly_usd_cap", "Monthly spending cap", c.monthly_usd_cap, "Empty for none", errors.monthly_usd_cap, type="number", unit="USD") }}
+      {{ field("reset_day", "Budget period starts on day", c.reset_day, "Empty: the day set under Settings", errors.reset_day, type="number") }}
+    </div>
+  </section>
+
+  <section class="nc-card nc-card--pad-lg">
+    <h2 class="t-title-3">Use</h2>
+    <div class="form-grid">
+      {{ field("priority", "Priority", c.priority, "Lower numbers are tried earlier", errors.priority, type="number") }}
+      {{ field("concurrency", "Requests at once", c.concurrency, "", errors.concurrency, type="number") }}
+      {{ field("timeout_s", "Timeout", c.timeout_s, "", errors.timeout_s, type="number", unit="s") }}
+      {{ field("languages", "Languages", c.languages | join(", "), "ISO 639-1 codes it should be used for. Empty for any.", errors.languages) }}
+      <label class="nc-field nc-select{% if errors.audio_format %} is-invalid{% endif %}"><span class="nc-field__label">Audio format sent</span><span class="nc-field__control"><select class="nc-field__input" name="audio_format">{% for f in formats %}<option value="{{ f }}"{% if f == c.audio_format %} selected{% endif %}>{{ f }}</option>{% endfor %}</select></span></label>
+      {{ field("audio_bitrate_kbps", "Audio bitrate", c.audio_bitrate_kbps, "Empty: the default under Settings", errors.audio_bitrate_kbps, type="number", unit="kbps") }}
+      {{ switch("enabled", "Enabled", c.enabled, "Disabled providers are never chosen") }}
+      {{ switch("keyterms", "Send the course's key terms", c.keyterms, "ElevenLabs bills this extra; Whisper servers get them as a prompt") }}
+    </div>
+  </section>
+
+  <section class="nc-card nc-card--pad-lg">
+    <h2 class="t-title-3">Advanced</h2>
+    <div class="form-grid">
+      {{ area("capabilities", "Capability overrides (JSON)", c.capabilities_text if c.capabilities_text is defined else (c.capabilities | tojson_pretty if c.capabilities else ""), 'timestamps (word, segment, none), max_upload_mb, max_duration_s, audio_formats. null lifts a limit.', errors.capabilities) }}
+      {{ area("params", "Extra request fields (JSON)", c.params_text if c.params_text is defined else (c.params | tojson_pretty if c.params else ""), 'Sent with every request as they are, e.g. {"temperature": 0}', errors.params) }}
+    </div>
+  </section>
+
+  <div class="row row--between">
+    <div>{% if not new and key_status and key_status.source == "stored" %}<button class="nc-btn nc-btn--danger" type="submit" form="forget-key">Forget the stored key</button>{% endif %}</div>
+    <div class="row"><a class="nc-btn nc-btn--ghost" href="/admin/stt">Cancel</a><button class="nc-btn nc-btn--primary" type="submit">{{ "Add provider" if new else "Save" }}</button></div>
+  </div>
+</form>
+{% if not new %}<form method="post" action="/admin/stt/{{ c.id }}/forget-key" id="forget-key" data-confirm="Forget the key stored for {{ c.id }}?"><input type="hidden" name="csrf" value="{{ csrf }}"></form>{% endif %}
+{% endblock %}

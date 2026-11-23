@@ -120,6 +120,9 @@ ENV_ONLY: list[tuple[str, str, bool]] = [
     ("port", "Port the API listens on", False),
     ("data_dir", "Where everything is stored", False),
     ("kuma_push_url", "Uptime Kuma heartbeat address", True),
+    ("admin_ui", "Whether this admin UI is served", False),
+    ("admin_cookie_secure", "Session cookie only over HTTPS", False),
+    ("admin_session_hours", "How long a sign-in lasts", False),
 ]
 
 

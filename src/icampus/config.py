@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     kuma_push_url: str = ""
     log_level: str = "INFO"
 
+    # The admin UI at /admin (admin/). It is served where the API is, so keep the API on a private address.
+    admin_ui: bool = True
+    admin_cookie_secure: bool = True  # False only to use it over plain HTTP on a private (tailnet) address
+    admin_session_hours: int = 12
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "icampus.db"

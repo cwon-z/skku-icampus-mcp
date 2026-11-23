@@ -7,15 +7,14 @@ With --head N it also asks SKKU's content server (Commons, lcms.skku.edu) about 
 do: a GET of the content's description (`/CommonsCore2/v2/contents/<id>`), then a GET of only the first byte of
 each download address it names (HEAD answers 500 there). All of it goes without cookies, so the content server
 can't tie it to your account. No item page, viewer or player is opened, so no watch progress is reported.
-With --embed it also reads the public player page (lcms.skku.edu/em/<id>) as plain HTML, again without cookies
-or the course parameters LearningX adds, so it can't know who you are, and follows the media addresses it names. It
-prints status codes, types, sizes and masked URL patterns only.
+It prints status codes, types, sizes and masked URL patterns only. --captions reads every hosted video's description
+for its caption and script flags. videos.py relies on what this found; rerun it if exports start failing.
 """
 
 import re
 from collections import Counter
 from typing import Any, Iterator
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -96,57 +95,6 @@ async def _first_byte(client: httpx.AsyncClient, url: str, headers: dict | None 
         return type(exc).__name__
 
 
-_MEDIA = re.compile(r"""[^\s"'()<>]+?\.(?:mp4|m3u8|mpd|xml)(?:\?[^\s"'()<>]*)?|[^\s"'()<>]*content\.php[^\s"'()<>]*""",
-                    re.I)
-
-
-def media_refs(page: str, base: str) -> list[str]:
-    """Absolute URLs of media files, manifests and content XML a player page refers to."""
-    found = []
-    for raw in _MEDIA.findall(page.replace("\\/", "/")):
-        url = urljoin(base, raw.strip("\\"))
-        if url.startswith("https://") and url not in found:
-            found.append(url)
-    return found
-
-
-async def _embed(client: httpx.AsyncClient, host: str, aid: str, lines: list[str]) -> None:
-    """The public player page, fetched as plain HTML without cookies or course parameters (no JavaScript runs),
-    and the media it names."""
-    page_url = f"https://{host}/em/{aid}"
-    try:
-        r = await client.get(page_url, follow_redirects=True)
-    except httpx.HTTPError as exc:
-        lines.append(f"    GET em/<id>: {type(exc).__name__}")
-        return
-    refs = media_refs(r.text, str(r.url))
-    lines.append(f"    GET em/<id>: {r.status_code} {r.headers.get('content-type', '')}, "
-                 f"{len(r.text) // 1024} KB, media refs: {[mask(u) for u in refs][:12]}")
-    for url in refs:
-        if ".xml" in url.lower() or "content.php" in url.lower():
-            try:
-                x = await client.get(url, headers={"Referer": page_url})
-                inner = media_refs(x.text, url)
-                lines.append(f"    GET {mask(url)}: {x.status_code}, media in it: {[mask(u) for u in inner][:12]}")
-                refs += [u for u in inner if u not in refs]
-            except httpx.HTTPError as exc:
-                lines.append(f"    GET {mask(url)}: {type(exc).__name__}")
-    for url in [u for u in refs if re.search(r"(?i)\.(mp4|m3u8|mpd)(\?|$)", u)][:4]:
-        lines.append(f"    first byte of {mask(url)}: {await _first_byte(client, url, {'Referer': page_url})}")
-
-
-async def _describe(client: httpx.AsyncClient, host: str, aid: str) -> tuple[str, Any]:
-    try:
-        r = await client.get(f"https://{host}/CommonsCore2/v2/contents/{aid}")
-        return f"{r.status_code} {r.headers.get('content-type', '')}", r.json() if r.status_code == 200 else None
-    except (httpx.HTTPError, ValueError) as exc:
-        return type(exc).__name__, None
-
-
-def _result(meta: Any) -> dict:
-    return meta.get("result") or {} if isinstance(meta, dict) else {}
-
-
 async def _captions(assets: list[tuple[dict, tuple[str, str]]], lines: list[str]) -> None:
     """What every hosted video's Commons description says about captions and scripts (values are flags only)."""
     hosted = [(v, a) for v, a in assets if v.get("content_type") in HOSTED]
@@ -177,7 +125,7 @@ async def _captions(assets: list[tuple[dict, tuple[str, str]]], lines: list[str]
 
 
 async def check(settings: Settings, course: str | None, head: int, manual_login: bool = False,
-                embed: bool = False, captions: bool = False) -> str:
+                captions: bool = False) -> str:
     store = Store(settings.db_path)
     async with exclusive(settings.data_dir, 45) as held:
         if not held:
@@ -242,14 +190,10 @@ async def check(settings: Settings, course: str | None, head: int, manual_login:
                 lines.append(f"    sizes: original {(res.get('original_file_length') or 0) / 2**20:.0f} MB, "
                              f"total {(res.get('total_file_size') or 0) / 2**20:.0f} MB, "
                              f"mobile {(res.get('mobile_file_size') or 0) / 2**20:.0f} MB")
-                for field in ("mp4_download_url", "download_url"):
-                    if url := _named(meta, field):
-                        lines.append(f"    first byte of {field} ({mask(url)}): {await _first_byte(client, url)}")
-                        for referer in ("https://canvas.skku.edu/", f"https://{host}/em/{aid}"):
-                            lines.append(f"      with Referer {mask(referer)}: "
-                                         f"{await _first_byte(client, url, {'Referer': referer})}")
-                if embed:
-                    await _embed(client, host, aid, lines)
+                if url := _named(meta, "download_url"):  # the export needs it to answer with a Referer
+                    lines.append(f"    first byte of download_url ({mask(url)}): {await _first_byte(client, url)}")
+                    lines.append(f"      with Referer https://canvas.skku.edu/: "
+                                 f"{await _first_byte(client, url, {'Referer': 'https://canvas.skku.edu/'})}")
                 if meta is not None:
                     _, after = await _describe(client, host, aid)
                     lines.append(f"    read_cnt before/after: {res.get('read_cnt')!r} -> "

@@ -66,7 +66,7 @@ changes over time, so re-check with `icampus probe` when something breaks.
   (LearningX materials): not yet observed live, but that is how Canvas treats file downloads.
 - **Everything here counts as account activity.** Canvas and LearningX record page views and API use.
 
-## Lecture videos (checked with `icampus video-check`, November 2026)
+## Lecture videos (checked with `icampus video-check` and a real export, November 2026)
 
 - The LearningX `modules` list (the sync already reads it) gives every video item a `thumbnail_url` of
   `https://lcms.skku.edu/CommonsCore2/v2/contents/<asset id>.jpg`, plus `content_type`, `duration` and usually
@@ -81,8 +81,8 @@ changes over time, so re-check with `icampus probe` when something breaks.
   Referer leads to an HTML page instead.
 - None of this moved `read_cnt`, and no LearningX progress or attendance is involved (that comes from the
   player inside the LearningX viewer). The bare player page `/em/<id>` answers 404 without LearningX's parameters.
-- A movie's original is an mp4. An everlec original has no extension: its format is not checked yet.
-  `videos.py` checks the first bytes of each download (`ftyp` at offset 4 means mp4) and labels anything else
-  "not mp4" with a `.bin` or described extension.
-- The descriptions carry `exists_caption`, `exists_script` and `caption_track_list` (null in the two videos checked).
-  `icampus video-check --captions` counts them across all hosted videos.
+- Originals are mp4 files: movie ones say so, and an everlec original (no extension in its description) also
+  turned out to be a plain MP4 when exported. `videos.py` still checks the first bytes of each download (`ftyp` at
+  offset 4) and labels anything else "not mp4".
+- No captions or scripts: all 127 hosted videos checked in November 2026 had `exists_caption` and `exists_script`
+  "N" and no `caption_track_list` (`icampus video-check --captions` checks again).

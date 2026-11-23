@@ -287,7 +287,12 @@ def main() -> None:
     files.py runs this as a child process; the memory cap is set before the file is read."""
     import resource
 
-    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+    except (ValueError, OSError):
+        if sys.platform != "darwin":  # the server (Linux) must have the cap
+            raise
+        # macOS can't cap address space (local runs only); files.py's time limit still applies
     path, name, content_type = sys.argv[1:4]
     text, how = extract_text(Path(path).read_bytes(), name or None, content_type or None)
     sys.stdout.write(json.dumps({"text": text, "how": how}))

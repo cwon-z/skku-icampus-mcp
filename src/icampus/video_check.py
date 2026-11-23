@@ -95,6 +95,19 @@ async def _first_byte(client: httpx.AsyncClient, url: str, headers: dict | None 
         return type(exc).__name__
 
 
+async def _describe(client: httpx.AsyncClient, host: str, aid: str) -> tuple[str, Any]:
+    """(status line, the description) of a Commons asset: a plain GET, no cookies. Nothing is downloaded."""
+    try:
+        r = await client.get(f"https://{host}/CommonsCore2/v2/contents/{aid}")
+        return f"{r.status_code} {r.headers.get('content-type', '')}", r.json() if r.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        return type(exc).__name__, None
+
+
+def _result(meta: Any) -> dict:
+    return meta.get("result") or {} if isinstance(meta, dict) else {}
+
+
 async def _captions(assets: list[tuple[dict, tuple[str, str]]], lines: list[str]) -> None:
     """What every hosted video's Commons description says about captions and scripts (values are flags only)."""
     hosted = [(v, a) for v, a in assets if v.get("content_type") in HOSTED]
@@ -200,4 +213,94 @@ async def check(settings: Settings, course: str | None, head: int, manual_login:
                                  f"{_result(after).get('read_cnt')!r}")
     if captions:
         await _captions(assets, lines)
+    return "\n".join(lines)
+
+
+# --- lecture materials (slide PDFs): are they on Commons too? ------------------------------------
+
+MATERIAL_FIELDS = ("type", "subtype", "extension", "convert_state", "status", "privacy", "is_original_file_deleted",
+                   "read_cnt")
+
+
+def material_report(items: list[dict]) -> tuple[list[str], list[tuple[dict, tuple[str, str]]]]:
+    """(report lines, the items that name a Commons asset) for lecture material items' item_content_data.
+    Shapes, counts and masked URL patterns only: no titles, no ids, no values."""
+    lines = [f"material items: {len(items)}", f"types: {dict(Counter(v.get('content_type') for v in items))}"]
+    keys = Counter(k for v in items for k in v)
+    lines.append("item_content_data keys (how many materials have each): "
+                 + ", ".join(f"{k}={n}" for k, n in sorted(keys.items())))
+    for field in ("thumbnail_url", "view_url"):
+        lines.append(f"{field} patterns: {dict(Counter(mask(v.get(field)) for v in items))}")
+    assets = [(v, a) for v in items if (a := asset(v))]
+    lines.append(f"materials with a Commons asset id in the thumbnail: {len(assets)}/{len(items)}")
+    seen = set()
+    for v in items:
+        if "content" in v and v.get("content_type") not in seen:
+            seen.add(v.get("content_type"))
+            lines.append(f"`content` shape for a {v.get('content_type')} item: {shape(v['content'])}")
+    lines.append(f"URL patterns inside `content`: {dict(Counter(mask(u) for v in items for u in urls_in(v.get('content'))))}")
+    return lines, assets
+
+
+async def describe_materials(client: httpx.AsyncClient, picks: list[tuple[dict, tuple[str, str]]]) -> list[str]:
+    """What Commons says about these material assets: the description only. No download address is requested,
+    because fetching a material may count as opening it; the addresses the description names are shown masked."""
+    lines = [f"\nCommons descriptions, no cookies sent, nothing downloaded ({len(picks)} materials):"]
+    for n, (v, (host, aid)) in enumerate(picks, 1):
+        status, meta = await _describe(client, host, aid)
+        res = _result(meta)
+        lines.append(f"  material {n} ({v.get('content_type')}): GET contents/<id>: {status}")
+        if not res:
+            continue
+        lines.append("    " + ", ".join(f"{k}={res.get(k)!r}" for k in MATERIAL_FIELDS))
+        lines.append(f"    sizes: original {(res.get('original_file_length') or 0) / 2**20:.1f} MB, "
+                     f"total {(res.get('total_file_size') or 0) / 2**20:.1f} MB")
+        named = sorted(k for k, value in res.items() if isinstance(value, str) and value.startswith("https://"))
+        lines.append(f"    addresses it names (not requested): "
+                     f"{ {k: mask(res[k]) for k in named} or 'none'}")
+        _, after = await _describe(client, host, aid)
+        lines.append(f"    read_cnt before/after a second description: {res.get('read_cnt')!r} -> "
+                     f"{_result(after).get('read_cnt')!r}")
+    return lines
+
+
+async def check_materials(settings: Settings, course: str | None, head: int, manual_login: bool = False) -> str:
+    """Reads the same LearningX modules list the sync reads and reports the shape of the lecture material items.
+    With --head N it also asks Commons to describe N of them (no cookies). It never opens an item and never
+    requests a file: whether materials may be fetched at all is a decision for after this report."""
+    store = Store(settings.db_path)
+    async with exclusive(settings.data_dir, 45) as held:
+        if not held:
+            return "a sync or download holds the session; try again in a minute"
+        async with open_session(settings, store, headless=False if manual_login else None) as s:
+            if manual_login and not await s.logged_in():
+                from .probe import wait_manual_login
+                await wait_manual_login(s)
+            try:
+                await s.ensure_login(allow_credentials=False)
+            except NotLoggedIn:
+                return ("the saved iCampus login has expired: run this again with --login manual to sign in "
+                        "in a browser window, or `uv run icampus sync` if your .env has your login")
+            _, _, raw = await collect.courses(s, settings.term)
+            ids = [str(c["id"]) for c in raw if not course or str(c["id"]) == course]
+            items = []
+            for cid in ids:
+                for module in await s.learningx(f"/courses/{cid}/modules", {"include_detail": "true"}):
+                    for it in module.get("module_items") or []:
+                        icd = (it.get("content_data") or {}).get("item_content_data") or {}
+                        if parse.kind_of(icd.get("content_type"), it.get("content_type")) == "material":
+                            items.append(icd)
+    lines, assets = material_report(items)
+    lines.insert(0, f"courses checked: {len(ids)}")
+    if head and assets:
+        picks: list[tuple[dict, tuple[str, str]]] = []
+        for kind in sorted({v.get("content_type") for v, _ in assets}, key=str):  # one of each type first
+            picks += [x for x in assets if x[0].get("content_type") == kind][:1]
+        picks += [x for x in assets if x not in picks]
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            lines += await describe_materials(client, picks[:head])
+    elif head:
+        lines.append("\nno material names a Commons asset, so there is nothing to describe")
+    lines.append("\nNo item was opened and no file was requested.")
     return "\n".join(lines)

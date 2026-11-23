@@ -33,6 +33,21 @@
       {% if exportable and video_state not in ("queued", "downloading") %}<div class="row">{{ post("/admin/lecture/" ~ item_id ~ "/download", "Download the video", "nc-btn nc-btn--secondary") }}</div>{% endif %}
     </div>
     {% endif %}
+    {% set slide_state, slide_list = slides %}
+    {% if slide_list %}
+    <div class="nc-card nc-card--pad-sm">
+      <div class="row row--between"><h2 class="nc-card__title">Slides <span class="mono faint">{{ slide_list | length }}</span></h2>{% if slide_state == "outdated" %}{{ badge("outdated") }}{% endif %}</div>
+      <div class="slides">
+        {% for sl in slide_list %}<button class="slide" type="button" data-seek="{{ sl.start }}" title="Slide {{ sl.n }}"><img src="/admin/media/slide/{{ item_id }}/{{ sl.n }}.jpg" alt="Slide {{ sl.n }}" loading="lazy"><span class="mono">{{ sl.start | stamp(hours) }}</span></button>{% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% if exportable and slide_state != "ready" %}
+    <div class="row">
+      <span class="t-caption faint">{% if slide_state == "extracting" %}Slide frames are being cut.{% elif slide_state == "failed" %}Slides failed: {{ slide_error }}{% elif slide_state == "outdated" %}These slides are from an older version of the video.{% else %}No slide frames yet.{% endif %}</span>
+      {% if slide_state != "extracting" %}{{ post("/admin/lecture/" ~ item_id ~ "/slides", "Extract slides") }}{% endif %}
+    </div>
+    {% endif %}
   </section>
 
   <section class="nc-card nc-card--pad-sm">

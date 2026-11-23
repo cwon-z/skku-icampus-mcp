@@ -215,6 +215,17 @@ class Transcripts:
             sql, args = sql + " AND start_s<=?", [*args, end_s]
         return [(r["start_s"], r["end_s"], r["text"]) for r in self.store.query(sql + " ORDER BY idx", args)]
 
+    def by_slide(self, row: dict | None, slides: list[dict]) -> list[str]:
+        """What was said while each slide was on screen: every segment goes to the slide showing when it began
+        (anything before the first slide's start goes to the first)."""
+        said: list[list[str]] = [[] for _ in slides]
+        current = 0
+        for start, _, text in self.segments(row) if row and slides else []:
+            while current + 1 < len(slides) and start >= slides[current + 1]["start"]:
+                current += 1
+            said[current].append(text)
+        return [" ".join(parts) for parts in said]
+
     def text(self, row: dict, start_s: float | None = None, end_s: float | None = None) -> str:
         """Plain text in paragraphs, each starting with a [mm:ss] marker ([h:mm:ss] for lectures over an hour)."""
         hours = (row.get("duration_s") or 0) >= 3600

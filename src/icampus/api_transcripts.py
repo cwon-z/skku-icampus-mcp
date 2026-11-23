@@ -9,11 +9,12 @@ from types import SimpleNamespace
 from typing import Annotated, Any, Literal
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from . import videos
+from . import audio, videos
 from .pipeline import ACTIVE
 from .stt.registry import Unavailable
+from .transcripts import stamp
 
 ItemId = Annotated[str, Path(pattern=r"^\d+$", description="the lecture's item_id")]
 ProviderId = Annotated[str, Path(pattern=r"^[a-z0-9][a-z0-9._-]{1,62}$")]
@@ -258,6 +259,70 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         if row is None or not transcripts.prefer(row["id"]):
             raise HTTPException(404, "this lecture has no transcript" + (f" by {model}" if model else ""))
         return {"item_id": item_id, "preferred": transcripts.summary(transcripts.get(row["id"]))}
+
+    # --- slides ------------------------------------------------------------
+
+    def slide_rows(found: list[dict]) -> list[dict]:
+        return [{"n": s["n"], "start_s": s["start"], "end_s": s["end"], "at": stamp(s["start"])} for s in found]
+
+    @app.get("/api/v1/slides/{item_id}", dependencies=api, tags=["transcripts"])
+    async def slides_status(item_id: ItemId) -> dict:
+        """The slide frames cut from a lecture video: `state` (none, extracting, ready, outdated, failed) and
+        each slide's number and the time it was on screen. Reads the disk only."""
+        lecture = lecture_video(item_id)
+        state, found = pipeline.slides(lecture)
+        body = {"item_id": item_id, "title": lecture.get("title"), "state": state, "count": len(found),
+                "slides": slide_rows(found)}
+        if state == "failed":
+            body["error"] = pipeline.slide_error(lecture)
+        return body
+
+    @app.post("/api/v1/slides/{item_id}", dependencies=api, tags=["transcripts"])
+    async def slides_extract(item_id: ItemId) -> JSONResponse:
+        """Cut the slide frames of a lecture video now, downloading the video first unless it is cached (as an
+        export does). 202 while it runs, 200 when they exist. A transcription does this by itself when
+        `slides_enabled` is on; this is for lectures transcribed before, or without."""
+        lecture = lecture_video(item_id)
+        try:
+            state = pipeline.request_slides(lecture)
+        except audio.AudioError as exc:
+            raise HTTPException(503, str(exc)) from None
+        return JSONResponse({"item_id": item_id, "state": state}, status_code=200 if state == "ready" else 202)
+
+    @app.get("/api/v1/slides/{item_id}/{n}.jpg", dependencies=api, tags=["transcripts"])
+    async def slide_image(item_id: ItemId, n: int) -> FileResponse:
+        """One slide frame (JPEG). Lecture content: private, for the account owner's own study."""
+        path = pipeline.slide_file(lecture_video(item_id), n)
+        if path is None:
+            raise HTTPException(404, "this lecture has no such slide frame")
+        return FileResponse(path, media_type="image/jpeg")
+
+    @app.get("/api/v1/lectures/{item_id}/segments", dependencies=api, tags=["transcripts"])
+    async def lecture_segments(item_id: ItemId, model: ModelParam = None, offset: int = Query(0, ge=0),
+                               limit: int = Query(4, ge=1, le=20),
+                               max_chars: int = Query(12000, ge=200, le=200000)) -> dict:
+        """A lecture slide by slide: each slide's frame (`image`, a path on this API) with what was said while it
+        was on screen, `limit` slides at a time from `offset`. A page ends early once its text passes
+        `max_chars`, but a slide's text is never cut. Without a transcript the slides come with empty text."""
+        lecture = lecture_video(item_id)
+        state, found = pipeline.slides(lecture)
+        if not found:
+            raise HTTPException(404, {"error": "this lecture has no slide frames yet", "state": state,
+                                      "hint": "POST /api/v1/slides/{item_id} extracts them"})
+        row = transcripts.preferred(item_id, model)
+        said = transcripts.by_slide(row, found)
+        items, chars = [], 0
+        for slide, text in list(zip(slide_rows(found), said))[offset:offset + limit]:
+            if items and chars + len(text) > max_chars:
+                break
+            items.append({**slide, "image": f"/api/v1/slides/{item_id}/{slide['n']}.jpg", "text": text})
+            chars += len(text)
+        end = offset + len(items)
+        return {"item_id": item_id, "title": lecture.get("title"),
+                **ctx.with_course([{"course_id": lecture.get("course_id")}])[0], "week": lecture.get("week"),
+                "slides": state, "transcript": row["status"] if row else "none",
+                "model": row["provider_id"] if row else None, "total": len(found), "offset": offset,
+                "next_offset": end if end < len(found) else None, "items": items}
 
     # --- jobs --------------------------------------------------------------
 

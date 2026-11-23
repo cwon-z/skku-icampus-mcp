@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from icampus import audio
+from icampus import audio, frames
 from icampus.config import KST, Settings
 from icampus.store import Record, Store
 
@@ -116,7 +116,7 @@ class Stt:
 def fake_audio(monkeypatch, tmp_path: Path, *, quiet_every: float = 60.0) -> dict:
     """Stands in for ffmpeg: "extracting" writes a file whose size follows the bitrate, and remembers how long the
     lecture was said to be. Returns the record of what was asked."""
-    seen: dict = {"extract": [], "cut": [], "silences": 0, "durations": {}}
+    seen: dict = {"extract": [], "cut": [], "silences": 0, "durations": {}, "slides": []}
 
     async def extract(src, dst, *, fmt="opus", kbps=24, threads=1, duration=None, on_progress=None):
         seconds = float(duration or 600)
@@ -137,6 +137,19 @@ def fake_audio(monkeypatch, tmp_path: Path, *, quiet_every: float = 60.0) -> dic
         dst.write_bytes(b"c" * 10)
         seen["cut"].append((round(start, 1), round(end, 1)))
 
+    async def slides(video, out_dir, *, duration, threshold=0.1, width=960, threads=1, about=None):
+        """Two "slides": the first for the first minute, the second for the rest."""
+        import json
+        out_dir.mkdir(parents=True, exist_ok=True)
+        found = [{"n": 1, "start": 0.0, "end": 60.0, "file": "001.jpg"},
+                 {"n": 2, "start": 60.0, "end": float(duration), "file": "002.jpg"}]
+        for slide in found:
+            (out_dir / slide["file"]).write_bytes(b"\xff\xd8\xff\xe0 a jpeg, slide %d" % slide["n"])
+        (out_dir / "index.json").write_text(json.dumps({**(about or {}), "duration": duration, "slides": found}))
+        seen["slides"].append((Path(video).name, out_dir.name, threshold, width))
+        return found
+
+    monkeypatch.setattr(frames, "extract", slides)
     monkeypatch.setattr(audio, "available", lambda: True)
     monkeypatch.setattr(audio, "extract", extract)
     monkeypatch.setattr(audio, "silences", silences)

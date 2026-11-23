@@ -668,6 +668,8 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
                       progress=pipeline.status(lecture) if lecture else None, rows=rows, row=row,
                       hours=bool(row and (row["duration_s"] or 0) >= 3600),
                       segments=transcripts.segments(row) if row else [], exportable=lecture is not None,
+                      slides=pipeline.slides(lecture) if lecture else ("none", []),
+                      slide_error=pipeline.slide_error(lecture) if lecture else None,
                       providers=[c.id for c in registry.all() if c.enabled])
 
     @app.post("/admin/lecture/{item_id}/{action}", include_in_schema=False)
@@ -684,6 +686,12 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         if action == "download":  # an explicit request to the content server
             ctx.videos.start(lecture)
             return back(here, session, "success", "The video is being downloaded.")
+        if action == "slides":  # explicit too: downloads the video first when it isn't here
+            try:
+                state = pipeline.request_slides(lecture)
+            except audio.AudioError as exc:
+                return back(here, session, "danger", str(exc))
+            return back(here, session, "success", f"Slides: {state}.")
         if action == "transcribe":
             try:
                 status = pipeline.request(lecture, model=text_field(form, "model") or None, trigger="ui",
@@ -704,6 +712,15 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             raise _Refused(404, "The video isn't on this server.")
         cache.touch("video", entry.key)
         return FileResponse(cache.path(entry), media_type=entry.meta.get("content_type") or "video/mp4",
+                            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"})
+
+    @app.get("/admin/media/slide/{item_id}/{n}.jpg", include_in_schema=False)
+    async def media_slide(item_id: str, n: int, session: dict = Depends(signed_in)) -> Response:
+        lecture = videos.find(store, item_id) if item_id.isdigit() else None
+        path = pipeline.slide_file(lecture, n) if lecture else None
+        if path is None:
+            raise _Refused(404, "That slide isn't on this server.")
+        return FileResponse(path, media_type="image/jpeg",
                             headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store"})
 
     @app.get("/admin/media/audio/{key}", include_in_schema=False)

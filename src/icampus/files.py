@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .browser import CanvasError, NotLoggedIn, Session, TooLarge, exclusive, open_session
 from .cache import Cache
-from .config import KST, Settings
+from .config import KST, Settings, child_env
 from .dates import from_canvas, iso
 from .store import Store
 
@@ -122,7 +122,7 @@ def adopt(cache: Cache, settings: Settings, store: Store) -> None:
 async def _extract(path: Path, name: str | None, content_type: str | None) -> tuple[str, str]:
     """(text, how) from the reader child process: a hostile or broken file can only take that process down."""
     args = [str(path), (name or "").replace("\0", ""), (content_type or "").replace("\0", "")]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ICAMPUS_")}  # it needs no password or token
+    env = child_env()  # it needs no password, token or provider key
     proc = await asyncio.create_subprocess_exec(*READER, *args, stdout=asyncio.subprocess.PIPE,
                                                 stderr=asyncio.subprocess.DEVNULL, env=env)
     try:

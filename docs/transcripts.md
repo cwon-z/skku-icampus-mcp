@@ -85,7 +85,11 @@ unclear. Provider setup has its own page: [stt-providers.md](stt-providers.md). 
   included in a plan, monthly hour and USD caps, reset day, concurrency, timeout, priority, enabled, audio format
   and bitrate, extra request params. Keys come from the environment variable the config names, else from
   `var/stt_keys.json` (0600, written from the UI, never read back out). The environment wins. A config may not
-  name an `ICAMPUS_*` variable as its key, so a typo can't send the SKKU password to a provider.
+  name an `ICAMPUS_*` variable as its key, so a typo can't send the SKKU password to a provider. A stored key
+  is dropped when its provider's host or type changes, and an ElevenLabs provider only accepts an
+  `elevenlabs.io` address: otherwise whoever can edit a provider could read a "write-only" key by pointing it
+  at a server of their own. What remains is that an admin chooses which environment variable goes to which
+  OpenAI-compatible address; the admin token is as sensitive as the keys.
 - **First boot.** With an empty table the registry is seeded from `ICAMPUS_STT_SEED_FILE` (a JSON file) or
   `ICAMPUS_STT_SEED` (inline JSON); without either it creates one ElevenLabs provider that reads
   `ELEVENLABS_API_KEY`, with a 100 h monthly cap.
@@ -113,6 +117,8 @@ unclear. Provider setup has its own page: [stt-providers.md](stt-providers.md). 
   a job downloads anything.
 - **Idempotent.** A unique index allows one active job per (asset, video version, requested model). Asking again
   returns that job, or the transcript if one exists for this version (from any provider when no model is named).
+  `force` makes a new transcript once: a forced request repeated within 15 minutes of that transcript gets it
+  back, so following a forced job by asking again can't pay for it a second time.
 - **Outdated.** A transcript stores the video's synced `updated_at`. After a sync, transcripts whose video has a
   newer one are marked `outdated`; they are re-run on request, or automatically with `stt_auto_retranscribe`.
 - **Storage and search.** `var/transcripts/t<id>.json` holds the normalized transcript; `transcripts` and
@@ -135,8 +141,9 @@ Served by the API at `/admin`, because that service owns the data and the settin
 - **Sign-in.** An admin-labelled API token, pasted once. The answer is a cookie holding a random session id and
   its HMAC (key in `var/admin.key`, 0600): `HttpOnly`, `SameSite=Strict`, `Secure` unless
   `ICAMPUS_ADMIN_COOKIE_SECURE=false`, scoped to `/admin`, valid for `ICAMPUS_ADMIN_SESSION_HOURS`. Sessions are
-  also recorded in the database, so signing out (or expiry) ends one for every copy of the cookie. Five failed
-  sign-ins from an address block it for ten minutes. The cookie opens the UI only; `/api/v1` still wants a bearer
+  also recorded in the database, so signing out (or expiry) ends one for every copy of the cookie. A session
+  remembers a fingerprint of the token that opened it and ends when that token is rotated out or its label
+  stops being an admin one. Five failed sign-ins from an address block it for ten minutes. The cookie opens the UI only; `/api/v1` still wants a bearer
   token, and a bearer token is not a session.
 - **CSRF.** Every form carries a token derived from the session (the sign-in form has a signed, 30-minute one of
   its own), htmx sends it as a header, and every route that changes something checks it. The same routes refuse
@@ -248,7 +255,14 @@ request, so it waits out the cooldown and does nothing while logins are blocked.
     when the browser sends it, and the pages use `Referrer-Policy: same-origin`.
 22. **A chunked provider and retries.** Pieces already transcribed are remembered while the server runs, so a
     retry after a failure in piece 5 doesn't pay for pieces 1 to 4 again. After a restart they are sent again.
-23. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
+23. **An independent review of this branch found 15 defects, all fixed** before merge, each with a test. The
+    serious one: a forced transcription that was followed by asking again (as the tool told the assistant to)
+    started, and paid for, a new transcription every time the last one finished. The others: a course filter
+    applied after the search's row limit; the all-providers cap not counting running jobs; a used-up cap still
+    letting lectures of unknown length download; an error message shortened before the key was cut out of it;
+    sessions outliving their token; child processes (ffmpeg, the attachment reader) inheriting provider keys
+    from the environment; and smaller ones.
+24. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
     key (a ~10-minute and a ~130-minute lecture through ElevenLabs and a second provider) were not run: this was
     built without access to the deployment or any provider key. The Docker image was not built either (no
     Docker daemon in the build environment), so the ffmpeg layer is untested as an image. Everything else is

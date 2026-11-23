@@ -173,3 +173,18 @@ async def test_attachments_past_their_cap_go_least_recently_used_first(tmp_path,
     assert {e.key for e in cache.entries("attachment")} == {"1", "3"}
     assert not (tmp_path / "files" / "2.bin").exists() and files.peek(settings, "2") is None
     assert fake.downloads == 3
+
+
+async def test_the_reader_process_gets_none_of_the_servers_secrets(tmp_path, monkeypatch):
+    """It parses files written by other people, so it must not hold a password, a token or a provider key."""
+    monkeypatch.setenv("ICAMPUS_PASSWORD", "hunter2")
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "sk-not-for-the-reader")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-nor-this")
+    monkeypatch.setattr(files, "READER", [sys.executable, "-c",
+                                          "import json, os; print(json.dumps({'text': ' '.join(sorted(os.environ)), "
+                                          "'how': 'env'}))"])
+    path = tmp_path / "x.txt"
+    path.write_text("hi")
+    names, how = await files._extract(path, "x.txt", None)
+    assert how == "env" and "PATH" in names.split()
+    assert not any(n.startswith("ICAMPUS_") or n.endswith("_KEY") for n in names.split())

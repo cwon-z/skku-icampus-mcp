@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .config import child_env
+
 EXTRACT_TIMEOUT_S = 3600
 PROBE_TIMEOUT_S = 60
 SILENCE_DB = -35  # quieter than this counts as silence
@@ -56,7 +58,7 @@ def available() -> bool:
 
 
 def _env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.startswith("ICAMPUS_")}  # it needs no password or key
+    return child_env()  # ffmpeg needs no password, token or provider key
 
 
 async def _run(args: list[str], timeout: float, on_line: Callable[[str], None] | None = None) -> tuple[int, str, str]:

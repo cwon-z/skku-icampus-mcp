@@ -519,3 +519,45 @@ async def test_end_to_end_with_real_ffmpeg(tmp_path, monkeypatch):
     assert job_of(rig, "7001")["stages"]["extract"]["audio_s"] == 60
     assert rig.registry.usage(rig.registry.get("whisper"))["hours"] == pytest.approx(60 / 3600, abs=1e-4)
     assert not list((tmp_path / "data" / "audio").glob(".chunks-*"))
+
+
+async def test_following_a_forced_request_does_not_pay_for_it_again(rig):
+    lec = find(rig, "7001")
+    rig.pipeline.request(lec)
+    await rig.pipeline.drain()
+    rig.store.execute("UPDATE transcripts SET created_at=?", ((datetime.now(KST) - timedelta(hours=1)).isoformat(),))
+    assert rig.pipeline.request(lec, force=True)["state"] == "queued"  # an hour later, on request: once more
+    for _ in range(4):  # the caller follows the job by asking again with the same arguments
+        await rig.pipeline.drain()
+        status = rig.pipeline.request(lec, force=True)
+        assert status["state"] == "ready" and "force starts a new one after that" in status["note"]
+    assert len(rig.transcripts.rows("7001")) == 2 and len(rig.stt.calls) == 2 and len(rig.pipeline.jobs()) == 2
+    assert rig.registry.usage(rig.registry.get("el"))["hours"] == pytest.approx(2 / 6)
+
+    by_name = rig.pipeline.request(lec, model="whisper", force=True)  # another model has no transcript yet: it runs
+    assert by_name["state"] == "queued"
+    await rig.pipeline.drain()
+    assert rig.pipeline.request(lec, model="whisper", force=True)["state"] == "ready" and len(rig.stt.calls) == 3
+
+
+async def test_a_paused_job_of_unknown_length_is_not_let_back_in_just_to_pause_again(rig):
+    rig.registry.save({**rig.registry.get("el").model_dump(), "monthly_hours_cap": 0.1})  # 6 minutes
+    rig.registry.save({**WHISPER, "enabled": False})
+    rig.pipeline.request(find(rig, "7001"))  # 10 minutes: over the cap
+    job = job_of(rig, "7001")
+    assert job["state"] == "paused_budget"
+    rig.store.execute("UPDATE jobs SET hours=NULL WHERE id=?", (job["id"],))  # queued before the sync knew its length
+    seen = []
+    for _ in range(4):
+        rig.pipeline.tick()
+        seen.append(job_of(rig, "7001")["state"])
+        await rig.pipeline.drain()
+    assert seen == ["paused_budget"] * 4 and rig.commons.downloads == []
+
+    rig.registry.record_usage(rig.registry.get("el"), 0.1 * 3600)  # the cap is used up entirely
+    unknown = lecture("7002", minutes=0)
+    seed(rig.store, [LECTURES[0], unknown, *LECTURES[2:]])
+    with pytest.raises(Unavailable, match="is used up") as failure:  # nothing can be estimated, and nothing fits
+        rig.pipeline.request(find(rig, "7002"), model="el")
+    assert failure.value.budget and rig.commons.downloads == []
+    assert rig.pipeline.request(find(rig, "7002"))["state"] == "paused_budget" and rig.commons.downloads == []

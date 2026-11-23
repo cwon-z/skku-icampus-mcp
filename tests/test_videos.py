@@ -177,3 +177,23 @@ def test_api_endpoints(tmp_path):
             "deleted": True}
         assert c.get("/api/v1/videos/7002").json()["state"] == "not_downloaded"
         assert c.get("/api/v1/videos/7002", headers={"Authorization": ""}).status_code == 401
+
+
+async def test_a_refresh_keeps_the_copy_and_its_pin_until_the_new_one_has_arrived(tmp_path):
+    commons = Commons()
+    v = videos(tmp_path, commons)
+    lec = lecture()
+    await finish(v, lec)
+    v.cache.pin("video", "a1b2c3")
+    assert v.start(lec)["state"] == "ready" and commons.downloads == 1  # current: nothing to do
+    commons.content_type = "text/html; charset=utf-8"  # the content server is having a bad day
+    status = v.start(lec, refresh=True)
+    assert status["state"] == "queued"
+    await v.jobs["a1b2c3"].task
+    again = v.status(lec)
+    assert again["state"] == "ready" and "web page instead" in again["last_error"]  # the old copy is still here
+    assert v.path("a1b2c3").read_bytes() == MP4 and v.cache.get("video", "a1b2c3").pinned
+    commons.content_type = "application/octet-stream"
+    v.start(lec, refresh=True)
+    await v.jobs["a1b2c3"].task
+    assert commons.downloads == 3 and v.status(lec)["state"] == "ready" and v.cache.get("video", "a1b2c3").pinned

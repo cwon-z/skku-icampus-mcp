@@ -46,7 +46,7 @@
       {% if open %}<a class="nc-btn nc-btn--secondary nc-btn--sm" href="{{ open }}">Open</a>{% endif %}
       {% if r.kind in capped %}{{ post(base ~ ("/unpin" if r.pinned else "/pin"), "Unpin" if r.pinned else "Pin", fields={"back": here}) }}{% endif %}
       {% if r.kind in ("video", "audio") and r.item_id %}{{ post(base ~ "/transcribe", "Transcribe", fields={"back": here}) }}{% endif %}
-      {% if r.kind == "video" and r.item_id %}{{ post(base ~ "/redownload", "Re-download", confirm="Delete this copy and download the video again from the content server?", fields={"back": here}) }}{% endif %}
+      {% if r.kind == "video" and r.item_id %}{{ post(base ~ "/redownload", "Re-download", confirm="Download this video again from the content server? The copy here stays until the new one has arrived.", fields={"back": here}) }}{% endif %}
       {{ post(base ~ "/delete", "Delete", "nc-btn nc-btn--danger nc-btn--sm", "Delete " ~ r.title ~ " from the server?" ~ (" Reading it again downloads it from iCampus, which records that as opening it." if r.kind == "attachment" else ""), {"back": here}) }}
     </div></td>
   </tr>

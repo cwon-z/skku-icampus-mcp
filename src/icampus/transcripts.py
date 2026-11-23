@@ -277,14 +277,15 @@ class Transcripts:
         for term in like_terms:
             where.append("s.text LIKE ? ESCAPE '\\'")
             args.append(_like(term))
+        if item_ids is not None:  # in the query, not after it: the row limit below must count matching rows only
+            where.append("t.item_id IN (SELECT value FROM json_each(?))")
+            args.append(json.dumps(sorted(item_ids)))
         order = "f.rank, " if long_terms else ""
         rows = self.store.query(f"{sql} WHERE {' AND '.join(where)} ORDER BY {order}t.created_at DESC, s.idx "
                                 f"LIMIT ?", [*args, max(200, limit * 20)])
         best = {item: row["id"] for item, row in self.preferred_by_item().items()}
         hits: list[dict] = []
         for row in rows:
-            if item_ids is not None and row["item_id"] not in item_ids:
-                continue
             same = next((h for h in hits if h["item_id"] == row["item_id"]
                          and abs(h["start_s"] - row["start_s"]) < SAME_MOMENT_S), None)
             if same is None:

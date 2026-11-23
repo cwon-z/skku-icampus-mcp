@@ -63,7 +63,7 @@ async def test_transcribe_lecture_passes_its_arguments_and_says_what_comes_next(
     body = await server.transcribe_lecture("7002", language="ko")
     assert calls == [("POST", "/api/v1/transcripts/7002", {"language": "ko", "force": False, "estimate_only": False})]
     assert body["job"] == {"id": 3, "item_id": "7002", "state": "queued", "model": "automatic"}
-    assert "call transcribe_lecture again" in body["next"]
+    assert body["next"] == "transcription_status(item_id='7002') follows it"  # a read-only way to follow it
 
     answering(monkeypatch, {"item_id": "7002", "state": "ready", "model": "el"})
     assert (await server.transcribe_lecture("7002"))["next"] == "get_transcript reads it"

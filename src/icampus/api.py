@@ -53,12 +53,26 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     syncer.after_run.append(lambda status: pipeline.after_sync())
     loops: dict[str, asyncio.Task] = {}  # the background loops, by name
 
+    reschedule = {"wanted": False}
+
+    def restart_schedule() -> None:
+        """The schedule loop sleeps towards a slot worked out from the old times: start it over. Never while a
+        sync is running (cancelling the loop would cancel that sync half-way); then it is done right after."""
+        if not reschedule["wanted"] or "scheduler" not in loops:
+            return
+        if syncer.running:
+            return  # syncer.when_idle calls this again
+        reschedule["wanted"] = False
+        loops.pop("scheduler").cancel()
+        loops["scheduler"] = asyncio.get_running_loop().create_task(syncer.scheduler())
+    syncer.when_idle.append(restart_schedule)
+
     def setting_changed(key: str) -> None:
         if key in CAPS.values() or key == "cache_total_gb":
             cache.enforce()  # a lowered cap applies now
-        if key in ("sync_times", "sync_jitter_min") and "scheduler" in loops:
-            loops.pop("scheduler").cancel()  # the running schedule sleeps towards a slot from the old times
-            loops["scheduler"] = asyncio.get_running_loop().create_task(syncer.scheduler())
+        if key in ("sync_times", "sync_jitter_min"):
+            reschedule["wanted"] = True
+            restart_schedule()
     settings.on_change(setting_changed)
 
     @asynccontextmanager

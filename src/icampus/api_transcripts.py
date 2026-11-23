@@ -209,8 +209,9 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         """Transcribe a lecture video: 200 when a transcript of the current video already exists, 202 with the
         job while it runs (ask again to follow it). Downloads the video unless it is cached, extracts the audio
         and sends it to the provider, which may cost money within that provider's cap. `model` names a provider;
-        without it the routing rules and defaults choose. `force` makes a new transcript even though one exists.
-        `estimate_only` only says what would happen and what it would cost."""
+        without it the routing rules and defaults choose. `force` makes a new transcript even though one exists;
+        it does so once, and a forced request repeated within 15 minutes of that transcript answers with it
+        instead of paying again. `estimate_only` only says what would happen and what it would cost."""
         lecture = lecture_video(item_id)
         if estimate_only:
             return JSONResponse(pipeline.estimate(lecture, model=model, language=language))

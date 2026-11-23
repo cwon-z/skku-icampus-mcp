@@ -41,6 +41,7 @@ PAUSED_CHECK_S = 30.0  # how often paused jobs are checked against their budget 
 BACKOFF_MIN = (2, 10, 30, 60, 120)  # pause before the nth retry
 PROVIDER_WAITS = 6  # how often a job waits for a provider to come back before it fails
 BATCH_PRIORITY = 10  # single requests (0) go before batches
+FORCE_AGAIN_MIN = 15  # `force` makes a new transcript once: asking again within this time gets that one
 
 
 class _Retry(Exception):
@@ -258,8 +259,17 @@ class Pipeline:
         With strict (a single request), a provider that can't take it now raises Unavailable instead of leaving a
         job that waits; batches queue anyway and the job pauses or retries when its turn comes."""
         asset_id, version = lecture["video"]["asset_id"], self.version(lecture)
-        if not force and self.transcripts.for_version(asset_id, version, model):
-            return self.status(lecture, model)
+        if self.transcripts.for_version(asset_id, version, model):
+            if not force:
+                return self.status(lecture, model)
+            # A forced request is followed by asking again with the same arguments. Once its job is done that
+            # second request must find the new transcript, not start (and pay for) another one.
+            newest = self.store.one(
+                "SELECT MAX(created_at) AS at FROM transcripts WHERE asset_id=? AND video_version=?"
+                + (" AND provider_id=?" if model else ""), (asset_id, version, *([model] if model else [])))["at"]
+            if newest and datetime.fromisoformat(newest) > datetime.now(KST) - timedelta(minutes=FORCE_AGAIN_MIN):
+                return {**self.status(lecture, model),
+                        "note": f"made less than {FORCE_AGAIN_MIN} minutes ago; force starts a new one after that"}
         active = self.store.one(
             f"SELECT id FROM jobs WHERE asset_id=? AND video_version=? AND model=? AND state IN "
             f"({','.join('?' * len(ACTIVE))})", (asset_id, version, model or "", *ACTIVE))
@@ -439,10 +449,17 @@ class Pipeline:
         now = _now()
         if recheck_paused or time.monotonic() - self._paused_checked >= PAUSED_CHECK_S:
             self._paused_checked = time.monotonic()
+            lectures: dict[str, dict] | None = None
             for job in self.store.query("SELECT * FROM jobs WHERE state='paused_budget' ORDER BY priority, id"):
                 course = self._course(job["course_id"])
+                hours = job["hours"]
+                if not hours:  # the same estimate the job itself will make, or it would be let in and pause again
+                    if lectures is None:
+                        lectures = {x["item_id"]: x for x in self.store.records("lectures", include_inactive=True)
+                                    if x.get("item_id")}
+                    hours = self.hours(lectures.get(job["item_id"]) or {})
                 try:
-                    self.registry.choose(model=job["model"] or None, course=course, hours=job["hours"] or 0.0,
+                    self.registry.choose(model=job["model"] or None, course=course, hours=hours or 0.0,
                                          language=job["language"] or self.language_for(course))
                     self._set(job["id"], state="queued", error=None)
                 except Unavailable as exc:

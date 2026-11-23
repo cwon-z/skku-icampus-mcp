@@ -142,7 +142,7 @@ def http_failure(name: str, response: httpx.Response, *secrets: str | None) -> S
     try:
         body = response.json()
     except ValueError:
-        body = response.text[:300]
+        body = response.text  # whole: redact cuts the key out first and shortens after, never the other way round
     if isinstance(body, dict):
         inner = body.get("detail", body.get("error", body.get("message")))
         if isinstance(inner, dict):

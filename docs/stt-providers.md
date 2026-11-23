@@ -23,7 +23,11 @@ registered at once. There are three ways to add one, and they all store the same
 store a key from the UI or the key route; it lands in `var/stt_keys.json` (mode 0600) and nothing returns it. The
 environment wins when both exist. A config can't name an `ICAMPUS_*` variable, so a typo can't send this server's
 own secrets to a provider. In Docker, pass the variable to the `icampus` service only (`compose.yaml` already
-passes `ELEVENLABS_API_KEY`, `OPENAI_API_KEY` and `GROQ_API_KEY`); the MCP container gets none.
+passes `ELEVENLABS_API_KEY`, `OPENAI_API_KEY` and `GROQ_API_KEY`); the MCP container gets none. A local
+`icampus serve` also picks such variables up from `.env`.
+
+A stored key belongs to the address it was entered for: changing a provider's host or type removes it, and you
+enter it again. ffmpeg and the attachment reader run without any of these variables.
 
 ### Config fields
 

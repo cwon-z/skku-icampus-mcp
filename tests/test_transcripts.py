@@ -166,3 +166,14 @@ def test_an_index_entry_lost_with_the_file_still_there_is_restored(tmp_path):
 def test_sqlite_here_has_the_trigram_tokenizer():
     """The image's SQLite (3.40) and any recent one do. The LIKE fallback above covers the rest."""
     assert sqlite3.sqlite_version_info >= (3, 34), sqlite3.sqlite_version
+
+
+def test_a_course_filter_counts_its_own_rows_not_everyone_elses(tmp_path):
+    """One sentence in one lecture, three hundred newer ones elsewhere: the filter must not be applied after
+    the row limit."""
+    t = make(tmp_path)
+    save(t, "7001", [(5.0, 9.0, "행렬 이야기 하나")], duration=60.0)
+    save(t, "8001", [(n * 20.0, n * 20.0 + 5, f"행렬 {n} 번째 이야기") for n in range(300)], duration=7000.0, course="1002")
+    assert found(t, "행렬", item_ids={"7001"}) == [("7001", "00:05")]
+    assert found(t, "이야기 하나", item_ids={"7001"}) == [("7001", "00:05")]  # through the trigram index too
+    assert found(t, "행렬", item_ids=set()) == [] and len(t.search("행렬", limit=5)) == 5

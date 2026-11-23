@@ -96,17 +96,23 @@ class Sessions:
         now = time.time()
         return {sid: s for sid, s in (self.store.get_state("admin_sessions") or {}).items() if s["exp"] > now}
 
-    def create(self, label: str) -> str:
+    def fingerprint(self, token: str) -> str:
+        """What a session remembers of the token that opened it: enough to see later that the token still
+        exists, never the token."""
+        return self._sign("token", token)
+
+    def create(self, label: str, token: str) -> str:
         """A new session; returns the cookie value."""
         sessions = self._all()
         sid = secrets.token_urlsafe(24)
-        sessions[sid] = {"label": label, "exp": time.time() + self.hours * 3600, "flash": []}
+        sessions[sid] = {"label": label, "exp": time.time() + self.hours * 3600, "flash": [],
+                         "token": self.fingerprint(token)}
         self.store.set_state("admin_sessions", sessions)
         return f"{sid}.{self._sign('session', sid)}"
 
     def get(self, cookie: str | None) -> dict | None:
         sid, _, signature = (cookie or "").partition(".")
-        if not sid or not hmac.compare_digest(signature, self._sign("session", sid)):
+        if not sid or not same(signature, self._sign("session", sid)):
             return None
         record = self._all().get(sid)
         return {**record, "sid": sid, "csrf": self._sign("csrf", sid)} if record else None
@@ -138,9 +144,15 @@ class Sessions:
 
     def login_token_ok(self, token: str | None) -> bool:
         stamp_, _, signature = (token or "").partition(".")
-        if not stamp_.isdigit() or not hmac.compare_digest(signature, self._sign("login", stamp_)):
+        if not stamp_.isdigit() or not same(signature, self._sign("login", stamp_)):
             return False
         return 0 <= time.time() - int(stamp_) <= LOGIN_FORM_MINUTES * 60
+
+
+def same(given: Any, expected: str) -> bool:
+    """Constant-time comparison of something a browser sent with a value of ours. Bytes, because
+    hmac.compare_digest refuses strings with non-ASCII characters, and a browser can send anything."""
+    return hmac.compare_digest(str(given).encode("utf-8", "replace"), expected.encode())
 
 
 def same_origin(request: Request) -> bool:
@@ -208,6 +220,14 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         session = sessions.get(request.cookies.get(COOKIE))
         if session is None:
             raise _Login()
+        # The session is only as good as the token that opened it: a token that was rotated out, or whose label
+        # is no longer an admin one, ends its sessions at the next request.
+        still_admin = session["label"] in ctx.admins and any(
+            label == session["label"] and same(session.get("token", ""), sessions.fingerprint(token))
+            for token, label in ctx.tokens.items())
+        if not still_admin:
+            sessions.end(session["sid"])
+            raise _Login()
         return session
 
     async def changing(request: Request) -> dict:
@@ -217,7 +237,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             raise _Refused(403, "This request came from another site and was refused.")
         form = await request.form()
         token = request.headers.get("x-csrf-token") or form.get("csrf") or ""
-        if not hmac.compare_digest(str(token), session["csrf"]):
+        if not same(token, session["csrf"]):
             raise _Refused(403, "The form's security token is missing or old. Reload the page and try again.")
         return session
 
@@ -253,8 +273,11 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
 
     @app.get("/admin/login", include_in_schema=False)
     async def login_page(request: Request) -> Response:
-        if sessions.get(request.cookies.get(COOKIE)):
+        try:
+            signed_in(request)
             return RedirectResponse("/admin/", status_code=303)
+        except _Login:
+            pass
         return render("login.html", request, None, login_token=sessions.login_token(), error=None,
                       plain_http=plain_http(request), configured=bool(ctx.tokens and ctx.admins))
 
@@ -271,7 +294,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             return again(429, "Too many failed sign-ins from this address. Wait ten minutes and try again.")
         if not same_origin(request) or not sessions.login_token_ok(form.get("login_token")):
             return again(403, "The sign-in form expired. Try again.")
-        given = text_field(form, "token").encode()
+        given = text_field(form, "token").encode("utf-8", "replace")
         label = next((label for token, label in ctx.tokens.items()
                       if given and hmac.compare_digest(given, token.encode())), None)
         if label is None or label not in ctx.admins:
@@ -282,7 +305,8 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         recent.clear()
         log.info("admin UI: %s signed in from %s", label, client)
         response = RedirectResponse("/admin/", status_code=303, headers=HEADERS)
-        response.set_cookie(COOKIE, sessions.create(label), max_age=env.admin_session_hours * 3600, path="/admin",
+        response.set_cookie(COOKIE, sessions.create(label, given.decode()), max_age=env.admin_session_hours * 3600,
+                            path="/admin",
                             httponly=True, samesite="strict", secure=env.admin_cookie_secure)
         return response
 
@@ -435,6 +459,8 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         new = provider_id is None
         config, errors = config_from(form, provider_id)
         shown = {**config, "capabilities_text": text_field(form, "capabilities"), "params_text": text_field(form, "params")}
+        before = registry.get(provider_id) if provider_id else None
+        had_stored = bool(before and registry.key_status(before)["source"] == "stored")
         if not errors:
             try:
                 cfg = registry.save(config, create=new)
@@ -445,13 +471,17 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         if key := text_field(form, "key"):  # write-only: stored, never shown again
             registry.set_key(cfg.id, key)
         log.info("admin UI: %s %s STT provider %s", session["label"], "added" if new else "changed", cfg.id)
+        if had_stored and not key and registry.key_status(cfg)["source"] != "stored":
+            return back("/admin/stt", session, "warning",
+                        f"{cfg.id} saved. Its stored key was removed, because a key is only ever sent to the "
+                        f"address it was entered for: enter it again for the new one.")
         return back("/admin/stt", session, "success", f"{cfg.id} saved.")
 
     @app.post("/admin/stt", include_in_schema=False)
     async def stt_create(request: Request, session: dict = Depends(changing)) -> Response:
         return await provider_save(request, session, None)
 
-    @app.post("/admin/stt/routing", include_in_schema=False)
+    @app.post("/admin/stt-routing", include_in_schema=False)  # not under /admin/stt/: "routing" is a valid id
     async def stt_routing(request: Request, session: dict = Depends(changing)) -> Response:
         form = await request.form()
         rules = []
@@ -608,8 +638,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             return back(target, session, "success", f"{entry.title or key} deleted.")
         lecture = videos.find(store, entry.item_id) if entry.item_id else None
         if action == "redownload" and kind == "video" and lecture:  # an explicit request to the content server
-            cache.delete(kind, key)
-            ctx.videos.start(lecture)
+            ctx.videos.start(lecture, refresh=True)  # the copy here (and its pin) stays until the new one arrived
             return back(target, session, "success", f"Downloading {entry.title or key} again.")
         if action == "transcribe" and lecture:
             try:

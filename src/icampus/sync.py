@@ -41,6 +41,7 @@ class Syncer:
         self.next_run: datetime | None = None
         self._task: asyncio.Task | None = None
         self.after_run: list = []  # called with the run's status after each run that synced something
+        self.when_idle: list = []  # called after every run, whatever its outcome, once `running` is False again
 
     # --- manual trigger (REST / MCP) --------------------------------------
 
@@ -125,6 +126,11 @@ class Syncer:
                 return run_id
         finally:
             self.running = False
+            for callback in self.when_idle:
+                try:
+                    callback()
+                except Exception as exc:
+                    log.error("after-run step failed: %s", clean_error(exc))
 
     async def _run(self, detail: dict[str, Any]) -> str:
         s_ = self.settings

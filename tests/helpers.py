@@ -157,7 +157,7 @@ def make_lecture_mp4(path: Path) -> Path:
 
 
 def settings(tmp_path: Path, **overrides) -> Settings:
-    return Settings(api_tokens=f"mcp:{TOKEN},admin:{ADMIN}", data_dir=tmp_path, _env_file=None,
-                    stt_seed='[{"id": "el", "type": "elevenlabs", "api_key_env": "TEST_EL_KEY", '
-                             '"cost_per_hour": 0.2, "priority": 10, "description": "hosted, word timestamps"}]',
-                    **overrides)
+    defaults = {"api_tokens": f"mcp:{TOKEN},admin:{ADMIN}", "data_dir": tmp_path,
+                "stt_seed": '[{"id": "el", "type": "elevenlabs", "api_key_env": "TEST_EL_KEY", '
+                            '"cost_per_hour": 0.2, "priority": 10, "description": "hosted, word timestamps"}]'}
+    return Settings(_env_file=None, **{**defaults, **overrides})

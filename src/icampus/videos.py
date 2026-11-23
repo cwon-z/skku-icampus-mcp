@@ -183,10 +183,11 @@ class Videos:
 
     # --- downloading -------------------------------------------------------
 
-    def start(self, lecture: dict) -> dict:
-        """Starts a download unless the video is cached and current, or already on its way."""
+    def start(self, lecture: dict, refresh: bool = False) -> dict:
+        """Starts a download unless the video is cached and current, or already on its way. With refresh, a
+        current copy is downloaded again; it stays (with its pin) until the new one has arrived."""
         status = self.status(lecture)
-        if status["state"] in ("ready", "queued", "downloading"):
+        if status["state"] in ("queued", "downloading") or (status["state"] == "ready" and not refresh):
             return status
         asset_id = lecture["video"]["asset_id"]
         job = self.jobs[asset_id] = Job("queued")

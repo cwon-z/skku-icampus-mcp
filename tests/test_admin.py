@@ -193,6 +193,43 @@ def test_plain_http_needs_the_setting_and_the_page_says_so(tmp_path, monkeypatch
         assert c.get("/health").status_code == 200
 
 
+def test_a_session_is_only_as_good_as_the_token_that_opened_it(tmp_path, monkeypatch):
+    """Sessions are kept in the database, so they survive a restart. A token that was rotated out, or whose
+    label is no longer an admin one, must not."""
+    app = make(tmp_path, monkeypatch)
+    with TestClient(app, base_url="https://admin.test", follow_redirects=False) as c:
+        sign_in(c)
+        cookie = c.cookies["icampus_admin"]
+        assert c.get("/admin/settings").status_code == 200
+
+    def after_restart(**env) -> int:
+        config = settings(tmp_path, sync_times="", **env)
+        again = create_app(config, store=Store(tmp_path / "icampus.db"), background=False)
+        with TestClient(again, base_url="https://admin.test", follow_redirects=False) as other:
+            other.cookies.set("icampus_admin", cookie, domain="admin.test", path="/admin")
+            return other.get("/admin/settings").status_code
+    assert after_restart() == 200  # the same token and label: the session carries over
+    assert after_restart(admin_labels="owner") == 303  # "admin" is no longer an admin label
+    assert after_restart() == 303  # and that ended the session for good
+    with TestClient(app, base_url="https://admin.test", follow_redirects=False) as c:
+        sign_in(c)
+        cookie = c.cookies["icampus_admin"]
+    assert after_restart(api_tokens=f"mcp:{TOKEN},admin:{'z' * 24}") == 303  # the token was rotated
+
+
+def test_odd_bytes_in_a_cookie_or_token_are_refused_not_a_server_error(ui):
+    """A browser can send any bytes. They must fail the comparison, not crash it."""
+    with TestClient(ui.app, base_url="https://admin.test", follow_redirects=False) as other:
+        for value in ("sid.ünïcödé", "☃.☃", "a.b.c", "."):
+            headers = {"Cookie": b"icampus_admin=" + value.encode("utf-8")}
+            assert other.get("/admin/", headers=headers).status_code == 303, value
+            assert other.get("/admin/login", headers=headers).status_code == 200, value
+        assert sign_in(other, "töken-that-is-not-ascii-1234").status_code == 401
+    assert ui.post("/admin/settings", data={"csrf": "snöwman"}).status_code == 403
+    assert ui.post("/admin/settings", headers={"X-CSRF-Token": "café".encode("utf-8")}).status_code == 403
+    assert ui.get("/admin/").status_code == 200  # and the real session is untouched
+
+
 # --- CSRF ----------------------------------------------------------------------------------------
 
 def test_every_request_that_changes_something_needs_the_sessions_csrf_token(ui):
@@ -406,9 +443,37 @@ def test_providers_are_added_edited_tested_and_removed_and_the_key_is_write_only
     assert ui.submit("/admin/stt/groq/delete").status_code == 404 and ui.submit("/admin/stt/el/explode").status_code == 404
 
 
+def test_a_provider_may_be_called_routing_or_new(ui):
+    registry = ui.app.state.registry
+    for name in ("routing", "new"):
+        assert ui.submit("/admin/stt", **{"id": name, "type": "openai_compatible", "model": "m", "enabled": "1",
+                                         "base_url": "http://gpu.tailnet.example:8000/v1", "audio_format": "opus",
+                                         "capabilities": "", "params": ""}).status_code == 303
+        assert ui.get(f"/admin/stt/{name}/edit").status_code == 200
+        edited = ui.submit(f"/admin/stt/{name}", **{"type": "openai_compatible", "model": "m2", "enabled": "1",
+                                                   "base_url": "http://gpu.tailnet.example:8000/v1",
+                                                   "audio_format": "opus", "capabilities": "", "params": ""})
+        assert edited.status_code == 303 and registry.get(name).model == "m2"
+    assert ui.get("/admin/stt/new").status_code == 200  # the empty form, not the provider called "new"
+
+
+def test_changing_a_providers_address_drops_its_stored_key_and_says_so(ui):
+    registry = ui.app.state.registry
+    registry.set_key("whisper", OTHER_SECRET)
+    form = {"type": "openai_compatible", "model": "large-v3", "enabled": "1", "audio_format": "opus",
+            "capabilities": '{"max_upload_mb": null}', "params": "", "key": ""}
+    ui.submit("/admin/stt/whisper", **form, base_url="http://gpu.tailnet.example:8000/v1", description="reworded")
+    assert registry.key(registry.get("whisper")) == OTHER_SECRET and "whisper saved." in flash(ui, "/admin/stt")
+    ui.submit("/admin/stt/whisper", **form, base_url="https://elsewhere.example/v1")
+    assert registry.key(registry.get("whisper")) is None
+    assert "stored key was removed" in flash(ui, "/admin/stt")
+    ui.submit("/admin/stt/whisper", **{**form, "key": OTHER_SECRET}, base_url="https://third.example/v1")
+    assert registry.key(registry.get("whisper")) == OTHER_SECRET  # entered again with the new address: kept
+
+
 def test_routing_is_edited_on_the_stt_page(ui):
     live = ui.app.state.settings
-    saved = ui.submit("/admin/stt/routing", default="whisper", fallback="el", min_timestamps="word",
+    saved = ui.submit("/admin/stt-routing", default="whisper", fallback="el", min_timestamps="word",
                     rule_course_0="MTH2002", rule_language_0="ko", rule_provider_0="el",
                     rule_course_1="", rule_language_1="en", rule_provider_1="whisper",
                     rule_course_2="CSE1001", rule_language_2="", rule_provider_2="")
@@ -421,9 +486,9 @@ def test_routing_is_edited_on_the_stt_page(ui):
     assert page.find("select", {"name": "rule_course_0"}).find("option", selected=True)["value"] == "MTH2002"
     assert page.find("select", {"name": "rule_provider_3"}) is not None  # two empty rows after the two rules
 
-    ui.submit("/admin/stt/routing", default="nobody", fallback="", min_timestamps="word", rule_provider_0="")
+    ui.submit("/admin/stt-routing", default="nobody", fallback="", min_timestamps="word", rule_provider_0="")
     assert "no provider is called nobody" in flash(ui, "/admin/stt") and live.stt_default_provider == "whisper"
-    ui.submit("/admin/stt/routing", default="", fallback="", min_timestamps="letter", rule_provider_0="")
+    ui.submit("/admin/stt-routing", default="", fallback="", min_timestamps="letter", rule_provider_0="")
     assert "Not saved" in flash(ui, "/admin/stt") and live.stt_min_timestamps == "word"
 
 
@@ -467,7 +532,10 @@ def test_cache_actions(ui):
     assert ui.submit("/admin/cache/video/asset7001/transcribe").status_code == 303
     assert "transcript ready" in flash(ui, "/admin/cache") and pipeline.jobs() == []  # it already has one
     assert ui.app.state.commons.downloads == []
+    cache.pin("video", "asset7001")
     assert ui.submit("/admin/cache/video/asset7001/redownload").status_code == 303  # asked for: the content server is used
+    assert cache.get("video", "asset7001").pinned  # the copy and its pin stay until the new one has arrived
+    assert ui.app.state.videos.jobs["asset7001"].state in ("queued", "downloading")
     assert ui.submit("/admin/cache/attachment/701/redownload").status_code == 404  # not something attachments offer
     assert ui.submit("/admin/cache/attachment/701/delete").status_code == 303
     assert cache.get("attachment", "701") is None and ui.get("/admin/attachment/701").status_code == 404
@@ -483,6 +551,9 @@ async def test_lecture_actions(ui):
     assert ui.submit("/admin/lecture/7002/transcribe", model="whisper").status_code == 303
     assert pipeline.jobs()[0]["model"] == "whisper" and "Transcript: queued." in flash(ui, "/admin/lecture/7002")
     assert ui.submit("/admin/lecture/7001/transcribe", model="").status_code == 303 and len(pipeline.jobs()) == 1
+    ui.submit("/admin/lecture/7001/transcribe", model="", force="1")
+    assert len(pipeline.jobs()) == 1  # its transcript is minutes old: "again" right away doesn't pay twice
+    ui.app.state.store.execute("UPDATE transcripts SET created_at='2026-01-01T00:00:00+09:00'")
     assert ui.submit("/admin/lecture/7001/transcribe", model="", force="1").status_code == 303 and len(pipeline.jobs()) == 2
     ui.submit("/admin/lecture/7002/transcribe", model="nobody")
     assert "no speech-to-text provider is called" in flash(ui, "/admin/lecture/7002")

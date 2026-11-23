@@ -311,9 +311,10 @@ async def transcribe_lecture(item_id: str, model: str | None = None, language: s
                              force: bool = False, estimate_only: bool = False) -> dict:
     """Make a timestamped transcript of a lecture video (an `item_id` from list_lectures with `exportable`).
     The first call queues the work: the server downloads the video unless it has it (about a minute per 50 MB),
-    extracts the audio and sends it to a speech-to-text model. Call again to follow `state` (queued, downloading,
-    extracting, transcribing); once it is ready, read it with get_transcript. A lecture that already has a
-    transcript of its current video answers ready at once and costs nothing.
+    extracts the audio and sends it to a speech-to-text model. Follow `state` (queued, downloading, extracting,
+    transcribing) with transcription_status, or by calling this again; once it is ready, read it with
+    get_transcript. A lecture that already has a transcript of its current video answers ready at once and
+    costs nothing.
 
     Leave `model` out: the server then picks by its routing rules and default, and falls back to another model if
     that one fails. Pass a model id (from list_stt_models) only when the user asks for a particular model or
@@ -326,7 +327,8 @@ async def transcribe_lecture(item_id: str, model: str | None = None, language: s
         model: a model id, only when the user wants that one.
         language: ISO 639-1 code (ko, en) when the lecture's language is known; otherwise the course's setting or
             detection decides.
-        force: make a new transcript even though a current one exists (costs again).
+        force: make a new transcript even though a current one exists (costs again). Use it once; follow
+            the job with transcription_status.
         estimate_only: queue nothing; say which model would run, the hours and the cost.
     """
     _numeric(item_id, "item_id")
@@ -339,7 +341,7 @@ async def transcribe_lecture(item_id: str, model: str | None = None, language: s
         if body["state"] == "outdated":
             body["next"] += "; the video changed since, call again with force=true for a new one"
     elif body.get("state") in ("queued", "downloading", "extracting", "transcribing"):
-        body["next"] = "call transcribe_lecture again (same arguments) to follow it"
+        body["next"] = f"transcription_status(item_id='{item_id}') follows it"
     return body
 
 

@@ -152,6 +152,9 @@ async def test_transcribe_then_read_in_every_format(api):
     assert (await api.get("/api/v1/transcripts/7001")).json()["model"] == "el"
     assert (await api.put("/api/v1/transcripts/7002/preferred")).status_code == 404
 
+    again = await api.post("/api/v1/transcripts/7001?force=true")  # both transcripts are seconds old
+    assert again.status_code == 200 and "made less than 15 minutes ago" in again.json()["note"]
+    api.app.state.store.execute("UPDATE transcripts SET created_at='2026-01-01T00:00:00+09:00'")
     forced = await api.post("/api/v1/transcripts/7001?force=true")
     assert forced.status_code == 202  # a new transcript although one exists
     assert (await api.post("/api/v1/transcripts/9001")).status_code == 404  # a YouTube lecture

@@ -211,3 +211,14 @@ def test_small_helpers():
 def test_the_bundled_clip_is_small_and_is_not_a_lecture():
     data = TEST_CLIP.read_bytes()
     assert data.startswith(b"OggS") and b"OpusHead" in data[:100] and 5_000 < len(data) < 40_000
+
+
+async def test_a_key_cut_in_two_by_the_length_limit_still_does_not_leak():
+    """A long non-JSON error page that echoes the key right where the message is shortened."""
+    for filler in (250, 280, 290, 299, 300, 320):
+        def handler(request, filler=filler):
+            return httpx.Response(502, text="x" * filler + SECRET + " trailing words")
+        with pytest.raises(SttError) as failure:
+            await whisper(handler).transcribe(TEST_CLIP, language=None, options={})
+        message = str(failure.value)
+        assert len(message) < 400 and not any(SECRET[:n] in message for n in (8, 12, 20)), filler

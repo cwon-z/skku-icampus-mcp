@@ -6,6 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KST = ZoneInfo("Asia/Seoul")
 CANVAS = "https://canvas.skku.edu"
+# What a child process (ffmpeg, the attachment reader) gets from this process's environment: enough to run, and
+# none of the secrets that live there (the SKKU login, API tokens, speech-to-text keys under any name).
+_CHILD_ENV = {"PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "PYTHONPATH",
+              "PYTHONHOME", "VIRTUAL_ENV", "SYSTEMROOT"}
+
+
+def child_env() -> dict[str, str]:
+    import os
+    return {k: v for k, v in os.environ.items() if k in _CHILD_ENV or k.startswith("LC_")}
 
 
 def parse_tokens(raw: str) -> dict[str, str]:

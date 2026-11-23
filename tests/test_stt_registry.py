@@ -304,3 +304,64 @@ def test_describe_gives_enough_to_choose_and_nothing_secret(tmp_path, monkeypatc
     assert whisper["key"] == "not needed" and whisper["max_upload_mb"] is None and not whisper["default"]
     assert "config" not in el and "key_status" not in el
     assert SECRET not in json.dumps([el, whisper])
+
+
+def test_the_cap_for_all_providers_counts_running_jobs_too(tmp_path, monkeypatch):
+    registry = make(tmp_path, monkeypatch, EL, {**WHISPER, "cost_per_hour": 0.1}, stt_monthly_usd_cap=1.0)
+    el, whisper = registry.get("el"), registry.get("whisper")
+    spend(registry, "el", 2.5)  # $0.50 billed
+    assert registry.over_budget(el, 2.0, NOW) is None  # $0.40 more fits
+    registry.reserve(1, "el", 2.0)  # a job that is running now will be billed $0.40
+    assert "total monthly cap of $1" in registry.over_budget(el, 2.0, NOW, but=2)  # so a second one doesn't fit
+    assert "total monthly cap of $1" in registry.over_budget(whisper, 2.0, NOW, but=2)  # whichever provider it uses
+    assert registry.over_budget(whisper, 0.5, NOW, but=2) is None
+    registry.release(1)
+    assert registry.over_budget(el, 2.0, NOW, but=2) is None
+
+
+def test_a_used_up_cap_takes_nothing_not_even_a_lecture_of_unknown_length(tmp_path, monkeypatch):
+    registry = make(tmp_path, monkeypatch, {**EL, "monthly_hours_cap": 2}, WHISPER)
+    el = registry.get("el")
+    assert registry.over_budget(el, 0.0, NOW) is None and registry.not_eligible(el, now=NOW) is None
+    spend(registry, "el", 2.0)
+    assert registry.over_budget(el, 0.0, NOW) == "its monthly cap of 2 h is used up (resets 2026-12-01)"
+    assert registry.not_eligible(el, now=NOW)[1] == "budget"
+    described = registry.describe(el, now=NOW)
+    assert described["ready"] is False and "used up" in described["not_ready"]
+    assert registry.working(now=NOW) == ["whisper"]
+
+
+def test_a_stored_key_only_ever_goes_to_the_address_it_was_entered_for(tmp_path, monkeypatch):
+    registry = make(tmp_path, monkeypatch)
+    registry.set_key("whisper", OTHER_SECRET)
+    registry.save({**WHISPER, "description": "same place, new words", "priority": 5})
+    assert registry.key(registry.get("whisper")) == OTHER_SECRET  # an edit that leaves the address alone keeps it
+    registry.save({**WHISPER, "base_url": "http://gpu.tailnet.example:8000/v2"})
+    assert registry.key(registry.get("whisper")) == OTHER_SECRET  # the same host: still the same server
+    registry.save({**WHISPER, "base_url": "https://collector.attacker.example/v1"})
+    assert registry.key(registry.get("whisper")) is None  # another host: the key has to be entered again
+    assert "whisper" not in registry._stored_keys()
+
+    with pytest.raises(ValueError, match="only talks to elevenlabs.io"):  # nor can the ElevenLabs key be redirected
+        registry.save({**EL, "base_url": "https://collector.attacker.example/v1"})
+    with pytest.raises(ValueError, match="only talks to elevenlabs.io"):
+        registry.save({**EL, "base_url": "https://api.elevenlabs.io.attacker.example/v1"})
+    registry.save({**EL, "base_url": "https://api.eu.residency.elevenlabs.io/v1"})
+    assert registry.get("el").base_url == "https://api.eu.residency.elevenlabs.io/v1"
+
+
+def test_a_local_run_finds_provider_keys_kept_in_the_env_file(tmp_path, monkeypatch):
+    from icampus.cli import export_dotenv
+    env_file = tmp_path / ".env"
+    env_file.write_text("ICAMPUS_PASSWORD='hunter2'\nTEST_LOCAL_STT_KEY=from-the-file-1234\nALREADY_SET=from-file\nEMPTY=\n")
+    monkeypatch.delenv("TEST_LOCAL_STT_KEY", raising=False)
+    monkeypatch.delenv("ICAMPUS_PASSWORD", raising=False)
+    monkeypatch.setenv("ALREADY_SET", "from-the-shell")
+    export_dotenv(str(env_file))
+    import os
+    assert os.environ["TEST_LOCAL_STT_KEY"] == "from-the-file-1234" and os.environ["ALREADY_SET"] == "from-the-shell"
+    assert "ICAMPUS_PASSWORD" not in os.environ and "EMPTY" not in os.environ  # the settings read those themselves
+    registry = make(tmp_path / "data", monkeypatch, {**EL, "api_key_env": "TEST_LOCAL_STT_KEY"})
+    assert registry.key(registry.get("el")) == "from-the-file-1234"
+    monkeypatch.delenv("TEST_LOCAL_STT_KEY")
+    export_dotenv(str(tmp_path / "missing.env"))  # no file: nothing happens

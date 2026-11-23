@@ -145,6 +145,11 @@ class ProviderConfig(BaseModel):
                              "and a model")
         if self.type == "elevenlabs" and not self.model:
             self.model = elevenlabs.DEFAULT_MODEL  # spelled out, so the list shows what is actually used
+        if self.type == "elevenlabs" and self.base_url:
+            host = urlsplit(self.base_url).hostname or ""
+            if host != "elevenlabs.io" and not host.endswith(".elevenlabs.io"):
+                raise ValueError("an ElevenLabs provider only talks to elevenlabs.io (its key would go to this "
+                                 "address); for another server use the OpenAI-compatible type")
         base = elevenlabs.LIMITS if self.type == "elevenlabs" else openai_compatible.LIMITS
         base.merged(self.capabilities)  # raises ValueError for an unknown or malformed override
         return self
@@ -244,11 +249,16 @@ class Registry:
             error = ValueError("; ".join(f"{k}: {v}" for k, v in fields.items()))
             error.fields = fields  # type: ignore[attr-defined]
             raise error from None
-        exists = self.store.one("SELECT 1 FROM stt_providers WHERE id=?", (cfg.id,)) is not None
+        old = self.get(cfg.id)
+        exists = old is not None or self.store.one("SELECT 1 FROM stt_providers WHERE id=?", (cfg.id,)) is not None
         if create and exists:
             error = ValueError(f"id: a provider called {cfg.id} already exists")
             error.fields = {"id": "a provider with this id already exists"}  # type: ignore[attr-defined]
             raise error
+        if old and (old.type != cfg.type or urlsplit(old.base_url).netloc != urlsplit(cfg.base_url).netloc):
+            # The stored key was typed in for the old address. Sending it to a new one would let anyone who can
+            # edit a provider read a "write-only" key by pointing the provider at their own server.
+            self.set_key(cfg.id, None)
         now = datetime.now(KST).isoformat()
         body = json.dumps(cfg.model_dump(), ensure_ascii=False)
         if exists:
@@ -452,15 +462,22 @@ class Registry:
                     but: int | None = None) -> str | None:
         """Why `hours` more would break a cap, or None when they fit."""
         budget = self.budget(cfg, now, but)
-        if budget["left_hours"] is not None and hours > budget["left_hours"] + 1e-6:
+        left = budget["left_hours"]
+        if left is not None and (hours > left + 1e-6 or left <= 0):
             cap = (f"{budget['cap_hours']:g} h" if cfg.monthly_hours_cap is not None
                    else f"${budget['cap_usd']:g}")
-            return (f"over its monthly cap of {cap}: {budget['left_hours']:.1f} h left, this needs {hours:.1f} h "
+            if hours <= 0:  # a lecture of unknown length, or the question "can it take anything at all"
+                return f"its monthly cap of {cap} is used up (resets {budget['resets']})"
+            return (f"over its monthly cap of {cap}: {left:.1f} h left, this needs {hours:.1f} h "
                     f"(resets {budget['resets']})")
         total_cap = self.settings.stt_monthly_usd_cap
         if total_cap > 0:
-            used = self.usage(cfg, now)["hours"] + self._reserved_hours(cfg.id, but)
-            if self.total_usd(now) + self.cost(cfg, hours, used) > total_cap + 1e-9:
+            # what is billed, what the running jobs of every provider will be billed, and this
+            pending = sum(self.cost(c, self._reserved_hours(c.id, but), self.usage(c, now)["hours"])
+                          for c in self.all() if c.id != cfg.id and self._reserved_hours(c.id, but))
+            held = self._reserved_hours(cfg.id, but)
+            mine = self.cost(cfg, held + hours, self.usage(cfg, now)["hours"])
+            if self.total_usd(now) + pending + mine > total_cap + 1e-9:
                 return f"over the total monthly cap of ${total_cap:g} for all providers (stt_monthly_usd_cap)"
         return None
 

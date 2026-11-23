@@ -102,3 +102,42 @@ async def test_scheduler_skips_slot_already_run_before_restart(tmp_path, monkeyp
     except asyncio.CancelledError:
         pass
     assert syncer.next_run.date() == datetime(2026, 9, 27).date()  # tomorrow's 07:30, not today's again
+
+
+async def test_one_sync_after_an_upgrade_respects_the_cooldown_and_the_login_guard(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import timedelta
+
+    import icampus.sync as sync_mod
+    store = Store(tmp_path / "t.db")
+    syncer = Syncer(Settings(data_dir=tmp_path, manual_cooldown_min=10, _env_file=None), store)
+    assert not syncer.needs_upgrade_sync()  # a new database: the first sync writes the current shape anyway
+    store.replace_scope("lectures", "course:1001", [], datetime.now(KST))  # rows from an older version
+    assert syncer.needs_upgrade_sync()
+
+    runs = []
+
+    async def fake_run(trigger, *, retry_login=False):
+        runs.append(trigger)
+        store.set_state("collect_version", sync_mod.COLLECT_VERSION)
+        return 1
+    monkeypatch.setattr(syncer, "run", fake_run)
+
+    store.set_state("login_block", {"reason": "password rejected", "at": "x"})
+    await syncer.upgrade_sync()
+    assert runs == [] and syncer.needs_upgrade_sync()  # blocked logins stay blocked
+
+    store.set_state("login_block", None)
+    store.set_state("last_manual_at", (datetime.now(KST) - timedelta(minutes=9)).isoformat())  # synced by hand 9 min ago
+    waits = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+        store.set_state("last_manual_at", None)  # the cooldown passes
+        await real_sleep(0)
+    monkeypatch.setattr(sync_mod.asyncio, "sleep", fake_sleep)
+    await syncer.upgrade_sync()
+    assert runs == ["upgrade"] and 0 < waits[0] <= 61 and not syncer.needs_upgrade_sync()
+    await syncer.upgrade_sync()
+    assert runs == ["upgrade"]  # once is enough

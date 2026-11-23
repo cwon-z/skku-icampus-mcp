@@ -21,6 +21,10 @@ PER_TERM = ("courses", "todos", "announcements")
 PER_COURSE = ("assignments", "lectures", "attendance")
 DATASETS = PER_TERM + PER_COURSE
 LOCK_WAIT_S = 180  # a file download holds the session for seconds: wait for it rather than skip a sync
+# The shape of the synced rows. Raise it when rows gain fields that readers rely on: a database last synced by an
+# older shape then gets one sync right after the upgrade instead of answering without them until the next slot.
+# 2: lecture rows carry `item_id` and `video` (the Commons asset), which exports and transcripts need.
+COLLECT_VERSION = 2
 
 
 def _where(exc: BaseException) -> str:
@@ -39,7 +43,7 @@ class Syncer:
 
     # --- manual trigger (REST / MCP) --------------------------------------
 
-    def request(self, *, retry_login: bool = False) -> tuple[RequestResult, int | None]:
+    def request(self, *, retry_login: bool = False, trigger: str = "manual") -> tuple[RequestResult, int | None]:
         if self.running:
             return "running", None
         if self.store.get_state("login_block") and not retry_login:
@@ -50,8 +54,31 @@ class Syncer:
             if wait.total_seconds() > 0:
                 return "cooldown", int(wait.total_seconds()) + 1
         self.store.set_state("last_manual_at", datetime.now(KST).isoformat())
-        self._task = asyncio.get_running_loop().create_task(self.run("manual", retry_login=retry_login))
+        self._task = asyncio.get_running_loop().create_task(self.run(trigger, retry_login=retry_login))
         return "started", None
+
+    # --- one sync after an upgrade -----------------------------------------
+
+    def needs_upgrade_sync(self) -> bool:
+        """True when the stored lecture rows were written by an older shape of the collector."""
+        if (self.store.get_state("collect_version") or 1) >= COLLECT_VERSION:
+            return False
+        return bool(self.store.scopes("lectures"))  # nothing synced yet: the first sync writes the new shape
+
+    async def upgrade_sync(self) -> None:
+        """Asks for one sync when the rows are from an older version, the way a manual request would: it waits out
+        the cooldown and a running sync, and does nothing while logins are blocked (the next good sync brings
+        the rows up to date then)."""
+        while self.needs_upgrade_sync():
+            result, retry_after = self.request(trigger="upgrade")
+            if result == "started":
+                log.info("synced rows are from an older version: syncing once now")
+                await self._task
+                return  # if it failed, the schedule's next good run records the new shape
+            if result == "login_blocked":
+                log.info("synced rows are from an older version, but logins are blocked: not syncing")
+                return
+            await asyncio.sleep(30 if result == "running" else (retry_after or 60))
 
     # --- a run -------------------------------------------------------------
 
@@ -82,6 +109,9 @@ class Syncer:
                 finally:
                     try:
                         self.store.finish_run(run_id, status, detail, datetime.now(KST))
+                        lectures = detail["datasets"].get("lectures", {})
+                        if status in ("ok", "partial") and not any("error" in v for v in lectures.values()):
+                            self.store.set_state("collect_version", COLLECT_VERSION)  # every lecture row is current
                     except Exception as exc:
                         log.error("could not record run %s: %s", run_id, clean_error(exc))
                 log.info("sync %s: %s", run_id, status)

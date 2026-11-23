@@ -69,3 +69,46 @@ def test_state_and_runs(store):
     assert store.recent_runs()[0]["status"] == "interrupted"
     store.finish_run(run, "ok", {"n": 1}, T0)
     assert store.recent_runs()[0]["detail"] == {"n": 1}
+
+
+def test_a_version_1_database_is_migrated_in_place(tmp_path):
+    """What an existing install has: the first schema, user_version 1, rows and state."""
+    import sqlite3
+
+    from icampus.store import MIGRATIONS, SCHEMA
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.executescript(SCHEMA + "PRAGMA user_version = 1;")
+    old.execute("INSERT INTO records VALUES ('lectures', 'a', 'course:1', '1', NULL, '{\"key\": \"a\"}', 't', 't', 1)")
+    old.execute("INSERT INTO state VALUES ('term', '\"2026-2\"')")
+    old.commit()
+    old.close()
+
+    store = Store(path)
+    assert store.upgraded_from == 1 and store.schema_version == len(MIGRATIONS)
+    assert [r["key"] for r in store.records("lectures")] == ["a"] and store.get_state("term") == "2026-2"
+    tables = {r["name"] for r in store.query("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"settings", "cache_entries"} <= tables
+    store.execute("INSERT INTO settings VALUES ('video_cache_gb', '20', 't')")
+    store.close()
+
+    again = Store(path)  # nothing to do the second time, and nothing lost
+    assert again.upgraded_from is None and again.one("SELECT value FROM settings")["value"] == "20"
+    # the first version of this program set user_version back to 1 at every start: after such a downgrade the
+    # scripts run again and must leave the newer tables' rows alone
+    again.execute("PRAGMA user_version = 1")
+    again.close()
+    third = Store(path)
+    assert third.upgraded_from == 1 and third.one("SELECT value FROM settings")["value"] == "20"
+    assert Store(tmp_path / "new.db").upgraded_from == 0
+
+
+def test_transactions_are_all_or_nothing(store):
+    with pytest.raises(RuntimeError):
+        with store.transaction() as db:
+            db.execute("INSERT INTO settings VALUES ('a', '1', 't')")
+            raise RuntimeError("halfway")
+    assert store.query("SELECT * FROM settings") == []
+    with store.transaction() as db:
+        db.execute("INSERT INTO settings VALUES ('a', '1', 't')")
+    assert store.one("SELECT value FROM settings WHERE key='a'")["value"] == "1"

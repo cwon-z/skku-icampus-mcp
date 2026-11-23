@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     # Lecture videos kept in var/videos; the least recently used go first once the total passes the cap.
     video_cache_gb: float = 30
     video_max_gb: float = 4  # bigger videos aren't downloaded
+    # The other kinds of file under var/ (cache.py). Each kind has a cap; cache_total_gb caps them all together.
+    attachment_cache_gb: float = 2
+    attachment_reuse_hours: int = 12  # a download whose version iCampus didn't give is reused this long
+    attachment_max_mb: int = 30  # bigger attachments aren't downloaded
+    audio_cache_gb: float = 5
+    frames_cache_gb: float = 5
+    cache_total_gb: float = 40
     kuma_push_url: str = ""
     log_level: str = "INFO"
 

@@ -13,8 +13,10 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from . import files, videos, views
 from .browser import NotLoggedIn, clean_error
+from .cache import CAPS, GB, Cache
 from .config import KST, Settings, parse_tokens
 from .dates import term_year
+from .runtime import SPECS, Runtime
 from .store import Store
 from .sync import DATASETS, Syncer
 
@@ -24,31 +26,48 @@ Kind = Literal["video", "material", "embedded_resource", "quiz", "assignment", "
 Status = Literal["todo", "done", "missed", "upcoming", "unknown"]
 FileId = Annotated[str, Path(pattern=r"^\d+$")]
 ItemId = Annotated[str, Path(pattern=r"^\d+$", description="the lecture's item_id")]
+CacheKind = Literal["video", "audio", "attachment", "transcript", "frames"]
+CacheKey = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")]
 
 
 def create_app(settings: Settings | None = None, *, store: Store | None = None, background: bool = True) -> FastAPI:
-    settings = settings or Settings()
-    store = store or Store(settings.db_path)
+    env = settings or Settings()
+    store = store or Store(env.db_path)
+    settings = Runtime(env, store)  # the environment with the values changed in the admin UI on top
     syncer = Syncer(settings, store)
-    tokens = parse_tokens(settings.api_tokens)
-    admins = {x.strip() for x in settings.admin_labels.split(",") if x.strip()}
+    tokens = parse_tokens(env.api_tokens)
+    admins = {x.strip() for x in env.admin_labels.split(",") if x.strip()}
+    cache = Cache(settings, store)
+    video_cache = videos.Videos(settings, cache)
+    cache.adopter(lambda: files.adopt(cache, settings, store))
+    cache.reconcile()  # adopts downloads made before the index existed; reads the disk only
+    loops: dict[str, asyncio.Task] = {}  # the background loops, by name
+
+    def setting_changed(key: str) -> None:
+        if key in CAPS.values() or key == "cache_total_gb":
+            cache.enforce()  # a lowered cap applies now
+        if key in ("sync_times", "sync_jitter_min") and "scheduler" in loops:
+            loops.pop("scheduler").cancel()  # the running schedule sleeps towards a slot from the old times
+            loops["scheduler"] = asyncio.get_running_loop().create_task(syncer.scheduler())
+    settings.on_change(setting_changed)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        tasks = []
         if background:
-            tasks.append(asyncio.create_task(syncer.scheduler()))
-            if settings.kuma_push_url:
-                tasks.append(asyncio.create_task(syncer.kuma_pusher()))
+            loops["scheduler"] = asyncio.create_task(syncer.scheduler())
+            loops["upgrade"] = asyncio.create_task(syncer.upgrade_sync())  # at most one sync, after an upgrade
+            if env.kuma_push_url:
+                loops["kuma"] = asyncio.create_task(syncer.kuma_pusher())
         yield
-        for t in tasks:
+        for t in loops.values():
             t.cancel()
+        loops.clear()
 
     app = FastAPI(title="SKKU iCampus", version=VERSION, lifespan=lifespan,
                   description="Your iCampus tasks, assignments, announcements, lectures and grades, "
                               "as last synced. Times are Asia/Seoul.")
-    video_cache = videos.Videos(settings)
     app.state.store, app.state.syncer, app.state.videos = store, syncer, video_cache
+    app.state.cache, app.state.settings = cache, settings
 
     def auth(request: Request) -> str:
         if not tokens:
@@ -59,6 +78,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
             if given and hmac.compare_digest(given, token.encode()):
                 return label
         raise HTTPException(401, "missing or wrong bearer token", headers={"WWW-Authenticate": "Bearer"})
+
+    def admin(label: str = Depends(auth)) -> str:
+        if label not in admins:
+            raise HTTPException(403, f"this needs a token labelled one of {sorted(admins)} (ICAMPUS_ADMIN_LABELS)")
+        return label
 
     def synced(datasets: tuple[str, ...]) -> tuple[str | None, bool]:
         expected = store.get_state("expected_scopes", {})
@@ -228,7 +252,7 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
 
     async def fetch(ref: dict) -> files.Fetched:
         try:
-            return await files.get(settings, store, ref)
+            return await files.get(settings, store, ref, cache)
         except files.Busy as exc:
             raise HTTPException(409, str(exc)) from None
         except files.Unavailable as exc:
@@ -299,10 +323,88 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         video_cache.touch(asset_id)
         return FileResponse(path, media_type=meta["content_type"], filename=meta["name"])
 
-    @app.delete("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
+    @app.delete("/api/v1/videos/{item_id}", dependencies=[Depends(admin)], tags=["videos"])
     async def video_delete(item_id: ItemId) -> dict:
-        """Remove the cached copy (a later export downloads it again)."""
+        """Remove the cached copy (a later export downloads it again). Needs an admin token."""
         return {"deleted": video_cache.delete(lecture_video(item_id)["video"]["asset_id"])}
+
+    # --- everything kept on disk -------------------------------------------
+
+    def gb(n: int | None) -> float | None:
+        return None if n is None else round(n / GB, 2)
+
+    def cache_totals() -> dict:
+        return {kind: {"count": t["count"], "used_gb": gb(t["bytes"]), "cap_gb": gb(t["cap_bytes"]),
+                       "pinned_gb": gb(t["pinned_bytes"]), "in_use_gb": gb(t["in_use_bytes"])}
+                for kind, t in cache.totals().items()}
+
+    @app.get("/api/v1/cache", dependencies=api, tags=["cache"])
+    async def cache_list(kind: CacheKind | None = None, course: str | None = None, pinned: bool | None = None,
+                         sort: Literal["last_used", "size", "kind", "title", "created_at"] = "last_used",
+                         order: Literal["asc", "desc"] = "desc", limit: int = Query(200, ge=1, le=2000)) -> dict:
+        """What the server has on disk: videos, extracted audio, attachments, transcripts and frames, with the
+        totals against each cap. Read from the index only; nothing is fetched from iCampus. `state` says why an
+        entry is safe from eviction: pinned, in use (a queued or running job needs it) or kept (transcripts)."""
+        held = cache.protected()
+        items = [{"kind": e.kind, "key": e.key, "course_id": e.course_id, "item_id": e.item_id, "title": e.title,
+                  "size_mb": round(e.size / 2**20, 1), "created_at": e.created_at, "last_used": e.last_used,
+                  "pinned": e.pinned, "state": cache.state(e, held)}
+                 for e in cache.entries(kind, course_ids=course_ids(course), pinned=pinned)]
+        key = {"size": "size_mb"}.get(sort, sort)
+        items.sort(key=lambda x: (x[key] is None, x[key] if x[key] is not None else ""), reverse=order == "desc")
+        body = {"count": len(items), "totals": cache_totals(), "items": with_course(items)}
+        if len(items) > limit:
+            body.update(count=limit, total=len(items), truncated=True, items=body["items"][:limit])
+        return body
+
+    @app.post("/api/v1/cache/{kind}/{key}/pin", dependencies=api, tags=["cache"])
+    async def cache_pin(kind: CacheKind, key: CacheKey) -> dict:
+        """Keep this entry: eviction skips it until it is unpinned."""
+        if not cache.pin(kind, key, True):
+            raise HTTPException(404, "nothing cached under that kind and key")
+        return {"kind": kind, "key": key, "pinned": True}
+
+    @app.delete("/api/v1/cache/{kind}/{key}/pin", dependencies=api, tags=["cache"])
+    async def cache_unpin(kind: CacheKind, key: CacheKey) -> dict:
+        if not cache.pin(kind, key, False):
+            raise HTTPException(404, "nothing cached under that kind and key")
+        cache.enforce()  # it may be over a cap that only the pin was holding off
+        return {"kind": kind, "key": key, "pinned": False}
+
+    @app.delete("/api/v1/cache/{kind}/{key}", dependencies=[Depends(admin)], tags=["cache"])
+    async def cache_delete(kind: CacheKind, key: CacheKey) -> dict:
+        """Remove an entry and its files. Needs an admin token."""
+        if not cache.delete(kind, key):
+            raise HTTPException(404, "nothing cached under that kind and key")
+        return {"kind": kind, "key": key, "deleted": True}
+
+    # --- runtime settings ----------------------------------------------------
+
+    @app.get("/api/v1/settings", dependencies=[Depends(admin)], tags=["settings"])
+    async def settings_list() -> dict:
+        """Every runtime setting: its value, where that comes from (ui, env or default) and its limits. Settings
+        that stay in the environment are listed under `env_only`, secrets only as set or not set."""
+        return {"items": settings.describe(), "env_only": settings.describe_env_only()}
+
+    @app.put("/api/v1/settings", dependencies=[Depends(admin)], tags=["settings"])
+    async def settings_update(changes: dict[str, Any]) -> dict:
+        """Set runtime settings: {"video_cache_gb": 20}. A null value drops the override (back to the environment
+        or the default). All of them are checked before any is stored."""
+        from .runtime import coerce
+        errors = {}
+        for key, value in changes.items():
+            if key not in SPECS:
+                errors[key] = "not a runtime setting (settings that decide who gets in stay in the environment)"
+            elif value is not None:
+                try:
+                    coerce(SPECS[key], value)
+                except ValueError as exc:
+                    errors[key] = str(exc)
+        if errors:
+            raise HTTPException(422, {"error": "invalid settings", "details": errors})
+        for key, value in changes.items():
+            settings.reset(key) if value is None else settings.set(key, value)
+        return {"changed": sorted(changes), "items": [s for s in settings.describe() if s["key"] in changes]}
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])
     async def grades(course: str | None = None) -> dict:

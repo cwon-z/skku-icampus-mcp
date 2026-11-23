@@ -107,3 +107,69 @@ def test_reader_skips_the_memory_cap_only_on_macos(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(sys, "platform", "linux")
     with pytest.raises(ValueError):
         extract.main()
+
+
+async def test_reuse_window_size_limit_and_cap_are_settings(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    import pytest
+
+    from icampus.cache import Cache
+    from icampus.config import KST
+    fake = Fake(updated_at=None)  # iCampus gives no version: the reuse window decides
+    settings, store = setup(tmp_path, monkeypatch, fake)
+    settings.attachment_reuse_hours = 2
+    cache = Cache(settings, store)
+    ref = {"id": "7", "via": "linked", "course_id": "1001", "parent": {"type": "assignment", "id": "9", "title": "HW"}}
+    await files.get(settings, store, ref, cache)
+    entry = cache.get("attachment", "7")
+    assert entry.course_id == "1001" and entry.title == "notes.txt" and entry.meta["parent"]["title"] == "HW"
+    assert len(entry.files) == 3 and entry.size > 5  # the file, its text and its record
+    await files.get(settings, store, ref, cache)
+    assert fake.downloads == 1
+
+    sidecar = tmp_path / "files" / "7.json"
+    meta = json.loads(sidecar.read_text())
+    meta["fetched_at"] = (datetime.now(KST) - timedelta(hours=3)).isoformat()
+    sidecar.write_text(json.dumps(meta))
+    assert files.peek(settings, "7").text == "hello"  # still on disk for the cache page, without asking iCampus
+    await files.get(settings, store, ref, cache)
+    assert fake.downloads == 2  # past the 2-hour window: fetched again
+
+    settings.attachment_max_mb = 1
+
+    async def huge(path, params=None):
+        return {"id": 7, "display_name": "big.bin", "size": 3 * 2**20, "url": "https://canvas.skku.edu/files/7/download"}
+    monkeypatch.setattr(fake, "canvas", huge)
+    sidecar.unlink()
+    with pytest.raises(files.Unavailable, match="only files up to 1 MB"):
+        await files.get(settings, store, ref, cache)
+
+
+async def test_attachments_past_their_cap_go_least_recently_used_first(tmp_path, monkeypatch):
+    from icampus.cache import Cache
+
+    class Sized(Fake):
+        async def canvas(self, path, params=None):
+            fid = path.rsplit("/", 1)[1]
+            return {"id": int(fid), "display_name": f"{fid}.txt", "content-type": "text/plain", "size": 4000,
+                    "updated_at": SYNCED, "url": f"https://canvas.skku.edu/files/{fid}/download?verifier=x"}
+
+        async def download(self, url, max_bytes):
+            self.downloads += 1
+            return b"k" * 4000
+
+    fake = Sized()
+    settings, store = setup(tmp_path, monkeypatch, fake)
+    settings.attachment_cache_gb = 20_000 / 2**30  # room for two files with their text and record, not three
+    cache = Cache(settings, store)
+
+    def ref(fid):
+        return {"id": fid, "via": "linked", "course_id": "1001", "updated_at": SYNCED, "parent": {"type": "assignment"}}
+    for fid in ("1", "2"):
+        await files.get(settings, store, ref(fid), cache)
+    await files.get(settings, store, ref("1"), cache)  # read again: now the most recent
+    await files.get(settings, store, ref("3"), cache)
+    assert {e.key for e in cache.entries("attachment")} == {"1", "3"}
+    assert not (tmp_path / "files" / "2.bin").exists() and files.peek(settings, "2") is None
+    assert fake.downloads == 3

@@ -6,7 +6,9 @@ import asyncio
 import httpx
 import pytest
 
+from icampus.cache import Cache
 from icampus.config import Settings
+from icampus.store import Store
 from icampus.videos import Videos
 
 MP4 = b"\0\0\0\x18ftypmp42" + b"x" * 4000
@@ -49,7 +51,8 @@ class Commons:
 
 
 def videos(tmp_path, commons, **settings) -> Videos:
-    return Videos(Settings(data_dir=tmp_path, _env_file=None, **settings), transport=httpx.MockTransport(commons))
+    config = Settings(data_dir=tmp_path, _env_file=None, **settings)
+    return Videos(config, Cache(config, Store(config.db_path)), transport=httpx.MockTransport(commons))
 
 
 async def finish(v: Videos, lec: dict) -> dict:
@@ -119,7 +122,8 @@ async def test_least_recently_used_video_goes_first(tmp_path):
     v.touch("aaa111")  # watched again: now the most recent
     await finish(v, third)
     assert v.path("aaa111") and v.path("ccc333") and v.path("bbb222") is None
-    assert v.used_bytes() == 2 * len(MP4)
+    on_disk = sum(p.stat().st_size for p in (tmp_path / "videos").iterdir())  # the videos and their sidecars
+    assert v.used_bytes() == on_disk and 2 * len(MP4) < on_disk < 2.5 * len(MP4)
 
 
 async def test_not_an_mp4_is_kept_but_labelled(tmp_path):
@@ -145,9 +149,9 @@ def test_api_endpoints(tmp_path):
              "title": "YouTube talk", "kind": "video"}
     store.replace_scope("lectures", "course:1001", [Record(r["key"], "1001", None, r) for r in (lec, plain)],
                         datetime.now(KST))
-    token = "t" * 20
-    app = create_app(Settings(api_tokens=f"test:{token}", data_dir=tmp_path, _env_file=None), store=store,
-                     background=False)
+    token, admin = "t" * 20, "a" * 20
+    app = create_app(Settings(api_tokens=f"test:{token},admin:{admin}", data_dir=tmp_path, _env_file=None),
+                     store=store, background=False)
     app.state.videos._transport = httpx.MockTransport(Commons())
     with TestClient(app) as c:
         c.headers["Authorization"] = f"Bearer {token}"
@@ -168,6 +172,8 @@ def test_api_endpoints(tmp_path):
         assert part.status_code == 206 and part.content == b"ftyp"
         listing = c.get("/api/v1/videos").json()
         assert listing["count"] == 1 and listing["items"][0]["item_id"] == "7002"
-        assert c.delete("/api/v1/videos/7002").json() == {"deleted": True}
+        assert c.delete("/api/v1/videos/7002").status_code == 403  # deleting from the cache takes an admin token
+        assert c.delete("/api/v1/videos/7002", headers={"Authorization": f"Bearer {admin}"}).json() == {
+            "deleted": True}
         assert c.get("/api/v1/videos/7002").json()["state"] == "not_downloaded"
         assert c.get("/api/v1/videos/7002", headers={"Authorization": ""}).status_code == 401

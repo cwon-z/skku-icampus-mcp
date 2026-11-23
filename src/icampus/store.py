@@ -117,7 +117,7 @@ class Store:
 
     @property
     def schema_version(self) -> int:
-        return self._db.execute("PRAGMA user_version").fetchone()[0]
+        return self.one("PRAGMA user_version")[0]
 
     def close(self) -> None:
         self._db.close()
@@ -128,11 +128,17 @@ class Store:
         with self._lock:
             return self._db.execute(sql, args)
 
+    # Reads take the lock too. One connection is shared, and the sqlite3 module reuses prepared statements, so
+    # two threads running the same query at once fail with "API misuse". Nearly everything runs on the event
+    # loop's thread, but a single plain-function FastAPI dependency (they run in a thread pool) is enough.
+
     def query(self, sql: str, args: tuple | list = ()) -> list[sqlite3.Row]:
-        return self._db.execute(sql, args).fetchall()
+        with self._lock:
+            return self._db.execute(sql, args).fetchall()
 
     def one(self, sql: str, args: tuple | list = ()) -> sqlite3.Row | None:
-        return self._db.execute(sql, args).fetchone()
+        with self._lock:
+            return self._db.execute(sql, args).fetchone()
 
     @contextmanager
     def transaction(self):
@@ -194,11 +200,11 @@ class Store:
         sql = "SELECT * FROM records WHERE dataset=?"
         if not include_inactive:
             sql += " AND active=1"
-        rows = self._db.execute(sql + " ORDER BY due_at IS NULL, due_at, key", (dataset,)).fetchall()
+        rows = self.query(sql + " ORDER BY due_at IS NULL, due_at, key", (dataset,))
         return [self._row(r) for r in rows if course_ids is None or r["course_id"] in course_ids]
 
     def record(self, dataset: str, key: str) -> dict[str, Any] | None:
-        row = self._db.execute("SELECT * FROM records WHERE dataset=? AND key=?", (dataset, key)).fetchone()
+        row = self.one("SELECT * FROM records WHERE dataset=? AND key=?", (dataset, key))
         return self._row(row) if row else None
 
     @staticmethod
@@ -212,13 +218,13 @@ class Store:
         sql, args = "SELECT * FROM scopes", ()
         if dataset:
             sql, args = sql + " WHERE dataset=?", (dataset,)
-        return [dict(r) for r in self._db.execute(sql + " ORDER BY dataset, scope", args)]
+        return [dict(r) for r in self.query(sql + " ORDER BY dataset, scope", args)]
 
     def synced_at(self, dataset: str, expected: list[str] | None = None) -> str | None:
         """Oldest successful sync among the dataset's scopes (what a caller can rely on).
         With `expected`, a scope that never synced makes the whole dataset count as not synced."""
         rows = {r["scope"]: r["synced_at"] for r in
-                self._db.execute("SELECT scope, synced_at FROM scopes WHERE dataset=?", (dataset,))}
+                self.query("SELECT scope, synced_at FROM scopes WHERE dataset=?", (dataset,))}
         if expected is not None:
             if any(s not in rows for s in expected):
                 return None
@@ -243,13 +249,13 @@ class Store:
             self._db.execute("UPDATE runs SET status='interrupted' WHERE status='running'")
 
     def recent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
-        rows = self._db.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = self.query("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,))
         return [{**dict(r), "detail": json.loads(r["detail"]) if r["detail"] else None} for r in rows]
 
     # --- small key/value state --------------------------------------------
 
     def get_state(self, key: str, default: Any = None) -> Any:
-        row = self._db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        row = self.one("SELECT value FROM state WHERE key=?", (key,))
         return json.loads(row["value"]) if row else default
 
     def set_state(self, key: str, value: Any) -> None:

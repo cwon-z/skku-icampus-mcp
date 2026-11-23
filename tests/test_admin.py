@@ -353,6 +353,20 @@ def test_overview_cache_and_lecture_pages(ui):
     assert "시험 범위" in attachment.text and "Nothing is fetched to show it" in attachment.text
 
 
+async def test_a_page_that_loads_several_files_at_once_gets_all_of_them(app):
+    """A lecture page asks for its video, subtitles and pictures in parallel. Each request checks the session
+    in the database; found with a real browser, where two of three thumbnails failed."""
+    import asyncio
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://admin.test") as c:
+        page = await c.get("/admin/login")
+        token = BeautifulSoup(page.text, "html.parser").find("input", {"name": "login_token"})["value"]
+        assert (await c.post("/admin/login", data={"token": ADMIN, "login_token": token})).status_code == 303
+        paths = ["/admin/media/video/7001", "/admin/media/transcript/1.vtt", "/admin/media/attachment/701",
+                 "/admin/", "/admin/cache", "/admin/jobs/table"] * 12
+        answers = await asyncio.gather(*(c.get(path) for path in paths))
+        assert [r.status_code for r in answers] == [200] * len(paths)
+
+
 # --- what the forms do -----------------------------------------------------------------------------
 
 def test_settings_change_at_once_show_their_source_and_refuse_bad_values(ui):

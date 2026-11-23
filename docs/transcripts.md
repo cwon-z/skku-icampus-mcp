@@ -128,15 +128,43 @@ unclear. Provider setup has its own page: [stt-providers.md](stt-providers.md). 
 `search_transcripts`, `lecture_stats`, plus transcript fields in `list_lectures`. Same conventions as the existing
 tools: slim rows, numeric ids checked before the call, `ToolError` for anything the API refuses.
 
-### Part 4: admin UI
+### Part 4: admin UI (`admin/`)
 
-Served by the API at `/admin`. Sign-in takes an admin-labelled API token once and sets a signed, expiring,
-`HttpOnly`, `SameSite=Strict` cookie scoped to `/admin`; sessions are recorded server-side so signing out ends
-them. Every form carries a CSRF token and every state-changing request is checked for it and for a same-origin
-`Origin`. Jinja2 templates with autoescape, HTMX vendored, one `theme.css` built from the Nocturne tokens, a
-strict Content-Security-Policy (no inline script or style, no external hosts). The pages read the index, the
-database and the disk; only buttons that say so (re-download, transcribe, queue) reach lcms, and nothing in the UI
-reaches canvas.
+Served by the API at `/admin`, because that service owns the data and the settings.
+
+- **Sign-in.** An admin-labelled API token, pasted once. The answer is a cookie holding a random session id and
+  its HMAC (key in `var/admin.key`, 0600): `HttpOnly`, `SameSite=Strict`, `Secure` unless
+  `ICAMPUS_ADMIN_COOKIE_SECURE=false`, scoped to `/admin`, valid for `ICAMPUS_ADMIN_SESSION_HOURS`. Sessions are
+  also recorded in the database, so signing out (or expiry) ends one for every copy of the cookie. Five failed
+  sign-ins from an address block it for ten minutes. The cookie opens the UI only; `/api/v1` still wants a bearer
+  token, and a bearer token is not a session.
+- **CSRF.** Every form carries a token derived from the session (the sign-in form has a signed, 30-minute one of
+  its own), htmx sends it as a header, and every route that changes something checks it. The same routes refuse
+  requests the browser marks as coming from another site (`Sec-Fetch-Site`, else `Origin`/`Referer`). All
+  changes are POSTs; there is no state-changing GET.
+- **Rendering.** Jinja2 with autoescape; lecture titles, file names, transcripts and provider error messages are
+  other people's text and are only ever inserted as text. The Content-Security-Policy allows no inline script or
+  style and no other origin, so the pages have none: htmx (vendored, 2.0.11, eval off), one small `admin.js`, one
+  `theme.css`, and the two font files, all served from the package. Attachments are sent as downloads with
+  `nosniff` and a sandbox policy, never rendered.
+- **Pages.** Overview, Settings (generated from the registry in `runtime.py`), STT models (providers, keys,
+  test, routing), Jobs (the queue, refreshed by an htmx poll; queue a course as plan → confirm), Cache (one table
+  over every kind) and a page per lecture with the player beside the transcript. They read the database, the
+  cache index and the disk. The buttons that say so (download, re-download, transcribe) start what an export or
+  a transcription request starts; nothing in the UI reaches canvas or learningx.
+- **Design.** The Nocturne design system: its tokens are the custom properties at the top of `theme.css` (dark
+  on `:root`, light by OS setting or `data-theme`), followed by its own component classes (`nc-*`) as shipped,
+  followed by this UI's layout rules, which use tokens only. Usage shares are Nocturne meters (rows of pips), so
+  no element needs an inline style.
+- **Reaching it from outside the tailnet (not built).** The API should stay private. The route that already
+  exists for videos would carry the UI too: the MCP host is the one thing behind Cloudflare Access, and it could
+  proxy `/admin/*` to the API the way `mcp_server.video_file` proxies `/videos/<id>`. Three things would have to
+  be added for that: the proxy must pass methods, form bodies, `Cookie` and `Set-Cookie` through (today it
+  passes `Range` only); the origin check must accept the public host (Access rewrites nothing, but the `Host`
+  seen by the API would be the proxy's); and the MCP container would then relay admin sessions, which is more
+  than the "holds one API token" role it has now. A second Access application on its own hostname pointing at a
+  reverse proxy in front of the API is the alternative that leaves the MCP container alone. Either is a
+  decision for later; `tailscale serve` already gives HTTPS inside the tailnet.
 
 ## Schema changes
 
@@ -198,14 +226,31 @@ request, so it waits out the cooldown and does nothing while logins are blocked.
     read, which iCampus records as another open. The default cap (2 GB) is far above what a term's attachments
     need, so in practice only a deliberately low cap triggers it.
 15. **The 5-second test clip can't be "generated" at run time on every machine**, since that needs ffmpeg built
-    with a speech synthesizer. It is generated once (command in `stt/__init__.py`) and bundled as a 13 kB Ogg file.
+    with a speech synthesizer. It is generated once (command in `stt/__init__.py`) and bundled as a 14 kB Ogg
+    file of synthesized speech.
 16. **"Looking at the cache must never send a request to iCampus"** conflicts with `GET /api/v1/files/{id}`, which
     downloads on first use by design. The cache routes and every admin page read through `files.peek()`, which
     only looks at the disk; the files route is unchanged and remains an explicit action.
-17. **ffmpeg in the image** comes from Debian (`apt-get install --no-install-recommends ffmpeg`). It adds roughly
-    300–400 MB to the image. No Python dependency is heavy: Jinja2 is the only new package (python-multipart was
-    already installed for the MCP server).
-18. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
+17. **ffmpeg in the image** comes from Debian (`apt-get install --no-install-recommends ffmpeg`), which adds a
+    few hundred MB of codec libraries. No Python dependency is heavy: Jinja2 is the only new package
+    (python-multipart was already installed for the MCP server and is now named directly).
+18. **"Violet for primary actions" is not what Nocturne says.** The design system's own rule is "violet points,
+    blue measures, white acts": the primary button is the inverse (white on dark) one, and the violet button is
+    kept for brand moments. The UI follows the design system: violet marks where you are (navigation, the line
+    being spoken, focus, switches), blue is the meters, and the one primary action per view is the inverse
+    button. Swapping `nc-btn--primary` for `nc-btn--accent` in the templates makes primary actions violet.
+19. **"Dark first"** is implemented the way Nocturne prescribes: dark is the default, and a browser that asks for
+    a light scheme gets the light companion unless you pick one with the toggle.
+20. **The batch route's `kind` filter** can only ever select videos, since nothing else can be transcribed; it
+    is accepted and defaults to `video`.
+21. **`Origin: null`.** With a strict referrer policy Chrome sends `Origin: null` on same-site form posts, which
+    a naive origin check refuses (found by driving the UI in a real browser). The check trusts `Sec-Fetch-Site`
+    when the browser sends it, and the pages use `Referrer-Policy: same-origin`.
+22. **A chunked provider and retries.** Pieces already transcribed are remembered while the server runs, so a
+    retry after a failure in piece 5 doesn't pay for pieces 1 to 4 again. After a restart they are sent again.
+23. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
     key (a ~10-minute and a ~130-minute lecture through ElevenLabs and a second provider) were not run: this was
-    built without access to the deployment. Everything else is covered offline, with real ffmpeg where audio is
-    involved and fake provider servers.
+    built without access to the deployment or any provider key. The Docker image was not built either (no
+    Docker daemon in the build environment), so the ffmpeg layer is untested as an image. Everything else is
+    covered offline: fake provider servers, real ffmpeg on generated audio (extract, silences, cuts, an
+    end-to-end job), and the admin UI driven in headless Chromium.

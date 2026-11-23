@@ -2,11 +2,13 @@
 
 Keeps a copy of your own SKKU iCampus data and serves it to other programs over a REST API, and to AI
 assistants over MCP. That covers tasks and deadlines, assignment submission status, announcements,
-lectures and attendance, grades, the files attached to announcements and assignments, and lecture videos.
+lectures and attendance, grades, the files attached to announcements and assignments, lecture videos, and
+timestamped, searchable transcripts of those videos.
 
 ```
-icampus      (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite
-icampus-mcp  (:8724/mcp)      MCP tools; only talks to the API, never sees your password
+icampus      (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite;
+                              transcribes lectures in the background; admin UI at /admin
+icampus-mcp  (:8724/mcp)      MCP tools; only talks to the API, never sees your password or any key
 ```
 
 Unofficial, not affiliated with Sungkyunkwan University. It only reads your own account; follow your
@@ -33,6 +35,17 @@ university's rules when you use it.
   involved. Videos stay in `var/videos` (up to `ICAMPUS_VIDEO_CACHE_GB`, 30 by default; the least recently
   used go first) and are reused until a sync sees a new version. YouTube and Zoom lectures aren't covered.
   Lecture videos are copyrighted: keep them for your own study.
+- **Transcripts, on request or by the batch.** A job downloads the video (as above), cuts out the sound with
+  ffmpeg and sends it to a speech-to-text provider: ElevenLabs Scribe, or any server with OpenAI's
+  `/audio/transcriptions` route (OpenAI, Groq, a self-hosted Whisper). Several providers can be registered; a
+  request names one or lets the routing rules pick, with fallback when one fails. Each has a monthly cap, and a
+  job that would pass it waits for the next period. The queue lives in SQLite and survives restarts.
+  Transcripts are kept as JSON under `var/transcripts` and indexed for search (Korean included). They are
+  lecture content like the videos: private, for your own study. See [docs/transcripts.md](docs/transcripts.md)
+  and [docs/stt-providers.md](docs/stt-providers.md).
+- **One cache, with caps.** Videos, extracted audio, attachments and transcripts are indexed together. Each kind
+  has a cap and so does the total; past a cap the least recently used go first, but never something you pinned,
+  something a queued job still needs, or a transcript.
 - **Careful with logins.** At most 3 password logins a day. A rejected password, a locked account
   or a password-expiry notice stops automatic logins until you retry with an admin token
   (`POST /api/v1/sync?retry_login=true`).
@@ -75,13 +88,29 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/announcements` | `course, since_days=30, unread_only, limit`. `/{id}` gives the full text |
 | `GET /api/v1/files/{id}` | an announcement or assignment attachment and its text: `offset, max_chars=20000`. Downloads it on first use |
 | `GET /api/v1/files/{id}/content` | the file itself |
-| `GET /api/v1/lectures` | `course, week, kind, incomplete_only, available_only, upcoming_only, include_attendance, limit` |
+| `GET /api/v1/lectures` | `course, week, kind, incomplete_only, available_only, upcoming_only, include_attendance, limit`. Hosted videos carry `transcript` (`state`: none, queued, …, ready, outdated; `model`) |
 | `GET /api/v1/videos` | lecture videos kept on the server, and how full the cache is |
 | `POST /api/v1/videos/{item_id}` | download a lecture video to the server unless it's cached (202 while it downloads, 200 when ready) |
 | `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued, downloading (with `downloaded_mb`), ready, outdated or failed |
-| `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy |
+| `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy (admin token) |
+| `GET /api/v1/lectures/stats` | per course and in total: videos, hours, exportable hours and GB, transcribed hours, cost of the rest per provider |
+| `GET /api/v1/stt/models` | the speech-to-text providers: description, cost per hour, word timestamps, languages, health, cap left |
+| `POST /api/v1/transcripts/{item_id}` | transcribe a lecture: `model, language, force, estimate_only`. 202 with the job, 200 when a transcript exists, 409 with `working_models` when the named model can't run |
+| `GET /api/v1/transcripts/{item_id}` | `model, format=text\|json\|vtt\|srt, offset, max_chars=15000, start_s, end_s`. `PUT .../preferred?model=` pins which transcript is read |
+| `POST /api/v1/transcripts/batch` | `course, week, kind, model, only_missing`. A dry run (the plan) unless `confirm=true` |
+| `GET /api/v1/transcripts/status` | `item_id` for one lecture; otherwise the queue, use per provider and open jobs (`course`) |
+| `GET /api/v1/jobs` | `state, course, item_id, limit`. `POST /api/v1/jobs/{id}/retry`, `DELETE /api/v1/jobs/{id}` (cancel) |
+| `GET /api/v1/search` | `q, course, week, limit`: where something was said, with the moment and the sentences around it |
+| `GET /api/v1/cache` | everything on disk: `kind, course, pinned, sort, order, limit`, with totals against caps. `POST\|DELETE /api/v1/cache/{kind}/{key}/pin`; `DELETE /api/v1/cache/{kind}/{key}` needs an admin token |
+| `GET\|PUT /api/v1/settings` | runtime settings (admin token): values, where each comes from, limits |
+| `/api/v1/stt/providers` | manage providers (admin token): `GET`, `POST`, `PUT /{id}`, `DELETE /{id}`, `PUT\|DELETE /{id}/key` (write-only), `POST /{id}/test` |
 | `GET /api/v1/grades` | `course` |
 | `GET /api/v1/export` | everything as one JSON document |
+
+Any token may read, queue transcriptions and cancel jobs: queueing can cost money, but only inside each
+provider's cap. Changing settings or providers, testing a provider and deleting from the cache (including
+`DELETE /api/v1/videos/{item_id}`) need a token whose label is in `ICAMPUS_ADMIN_LABELS`. No route returns an
+API key.
 
 A few fields to read carefully:
 - `status` sums up a task or lecture item: `todo`, `done`, `missed` (deadline and any late period passed),
@@ -105,6 +134,21 @@ the download; when it is ready it returns a link, `<ICAMPUS_MCP_PUBLIC_URL>/vide
 the file from the API behind the same auth as `/mcp`, so over Cloudflare Access the link opens in a signed-in
 browser. Without `ICAMPUS_MCP_PUBLIC_URL` the link is the API address (bearer token needed).
 
+Transcript tools:
+
+| Tool | What it does |
+|---|---|
+| `list_stt_models` | the registered models with description, cost per hour, word timestamps, languages, health and cap left |
+| `transcribe_lecture(item_id, model, language, force, estimate_only)` | queue one lecture; call again to follow it. Not read-only: it downloads and may cost money. Leave `model` out for automatic routing |
+| `queue_transcriptions(course, week, model, only_missing, confirm)` | many lectures. Returns the plan (count, hours, cost per model, cap left) unless `confirm=True` |
+| `transcription_status(item_id, course)` | one lecture's state, or the queue |
+| `get_transcript(item_id, model, start_s, end_s, offset)` | the text with `[mm:ss]` markers, about 15,000 characters per call, and a link pattern into the video (`…/videos/<item_id>#t=<seconds>`) |
+| `search_transcripts(query, course, week, limit)` | where something was said: title, course, time, the sentence, a link to that moment |
+| `lecture_stats(course)` | totals per course, so "how many hours of lectures are there" doesn't need the whole list |
+
+The links into a video work while the video is on the server; `export_video` brings it back. The server's
+instructions tell the assistant that transcripts are machine-made, private and for your own study.
+
 ```bash
 # over HTTP (icampus-mcp --http), with a token from ICAMPUS_MCP_TOKENS
 claude mcp add --transport http icampus http://<server>:8724/mcp --header "Authorization: Bearer <token>"
@@ -125,6 +169,49 @@ The Access route is how claude.ai and the mobile apps reach it:
    - `ICAMPUS_MCP_ACCESS_EMAILS`, the emails allowed in;
    - `ICAMPUS_MCP_ALLOWED_HOSTS`, which must include the public hostname.
 
+## Admin UI
+
+`http://<api address>:9013/admin` shows what the server has and lets you change how it runs: an overview (sync
+status, storage against caps, the queue, speech-to-text use this month), every runtime setting, the STT models
+(add, edit, test, routing), the job queue (retry, cancel, queue a course after a dry run), and one table of
+everything on disk (open, pin, delete, re-download, transcribe). A lecture's page plays the video beside its
+transcript; clicking a line seeks to it.
+
+- **Sign in** by pasting an admin-labelled API token once. You get a session cookie that is signed, expires after
+  `ICAMPUS_ADMIN_SESSION_HOURS` (12), and is HttpOnly, SameSite=Strict and Secure. Every form carries a CSRF
+  token. Signing out ends the session on the server.
+- **HTTPS.** The cookie is only sent over HTTPS. On a tailnet, `tailscale serve --bg --https=443 9013` on the
+  host gives the API (and the UI) an HTTPS address with a real certificate, reachable from your tailnet only.
+  To use plain HTTP on a tailnet address instead, set `ICAMPUS_ADMIN_COOKIE_SECURE=false`.
+- **It is reachable wherever the API is**, so keep the API on a private address, as before.
+  `ICAMPUS_ADMIN_UI=false` turns the UI off.
+- **From outside the tailnet** it is not exposed, on purpose. If you want that later, the route would be the one
+  videos already take: the MCP host, which sits behind Cloudflare Access, proxying `/admin` to the API the way it
+  proxies `/videos`. That would need the proxy to pass cookies and form posts through and the UI to accept the
+  public origin; it is described in [docs/transcripts.md](docs/transcripts.md) and not built.
+- Looking at any page reads the database and the disk only. Nothing in the UI sends a request to iCampus; the
+  buttons that download a video or transcribe a lecture reach SKKU's content server without your login, like
+  an export.
+- The look is the Nocturne design system. All of its tokens are CSS custom properties at the top of
+  `src/icampus/admin/static/theme.css`; the fonts (Inter, JetBrains Mono, SIL OFL) and htmx are served from the
+  package, so the UI makes no outside requests.
+
+## Settings
+
+Everything under *Settings* in the admin UI can also be set as `ICAMPUS_<NAME>` in the environment (a value saved
+in the UI wins, and the page shows which is in force) or through `PUT /api/v1/settings`. The groups:
+
+| Group | Settings |
+|---|---|
+| Storage | `video_cache_gb` (30), `video_max_gb` (4), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
+| Sync | `sync_times`, `sync_jitter_min` (10), `manual_cooldown_min` (10), `stale_hours` (12) |
+| Transcription jobs | `prefetch_limit` (2), `keep_video_after_processing` (on), `download_retries` (3), `ffmpeg_threads` (1), `stt_auto_transcribe` (off), `stt_auto_courses`, `stt_auto_retranscribe` (off) |
+| Speech-to-text | `stt_default_provider`, `stt_fallback_order`, `stt_routing_rules`, `stt_default_language`, `stt_course_languages`, `stt_course_terms`, `stt_min_timestamps` (segment), `stt_chunk_minutes` (20), `stt_audio_bitrate_kbps` (24), `stt_fail_threshold` (3), `stt_skip_minutes` (15) |
+| Budget | `stt_monthly_usd_cap` (0 = none), `stt_budget_reset_day` (1); each provider has its own hour and USD caps |
+
+Tokens, the SKKU login, login limits, the listen address and the admin cookie settings stay in the environment
+and are only shown, never changed, from the UI.
+
 ## Deploy with Docker
 
 ```bash
@@ -135,7 +222,13 @@ docker compose up -d --build              # ports on 127.0.0.1 only
 To expose the ports on a server, copy `compose.homelab.example.yaml` to `compose.homelab.yaml`
 (gitignored), put in your addresses, and add `COMPOSE_FILE=compose.yaml:compose.homelab.yaml` to
 `.env`. Keep the API off the public internet, and put only the MCP port behind Cloudflare Access.
-The MCP container never gets your SSO password.
+The MCP container never gets your SSO password, a speech-to-text key or the data volume.
+
+Upgrading an existing install needs nothing by hand: the database migrates in place, videos and attachments
+already on disk are indexed instead of downloaded again, and if the stored lecture rows come from an older
+version one sync runs at start (through the usual cooldown and login guard). The image now includes ffmpeg.
+For transcripts, put `ELEVENLABS_API_KEY=...` in `.env` (or register another provider), then open `/admin/stt`
+and press *Test*.
 
 ## License
 
@@ -146,8 +239,12 @@ MIT — see [LICENSE](LICENSE).
 | Path | What |
 |---|---|
 | `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
+| `src/icampus/` (transcripts) | `cache.py` the cache manager, `runtime.py` the settings registry, `audio.py` ffmpeg, `stt/` providers and their registry, `pipeline.py` the job queue, `transcripts.py` storage and search, `api_transcripts.py` |
+| `src/icampus/admin/` | the admin UI: `__init__.py` (sessions, CSRF, pages), `templates/`, `static/` (theme, htmx, fonts) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |
-| `tests/` | offline tests; one runs a local Chromium against a fake login page, one downloads from a local server |
+| `docs/transcripts.md` | the design of the transcript pipeline, cache and admin UI, the schema versions, and what the brief got wrong |
+| `docs/stt-providers.md` | provider configs: ElevenLabs, OpenAI, Groq, a self-hosted Whisper server |
+| `tests/` | offline tests with made-up data and fake servers; one runs a local Chromium against a fake login page, a few run ffmpeg on generated audio (skipped without it) |
 
-`var/` (the database, saved session, downloaded attachments and videos, probe output), `.env` and `private/` hold
-personal data and are gitignored.
+`var/` (the database, saved session, downloaded attachments and videos, audio, transcripts, stored provider keys,
+probe output), `.env` and `private/` hold personal data and are gitignored.

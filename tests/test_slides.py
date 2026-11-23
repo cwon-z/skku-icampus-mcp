@@ -323,6 +323,22 @@ async def test_the_lecture_page_shows_the_slides_and_can_ask_for_them(app):
     assert before == ["asset7001"] and app.state.pipeline.slides(LECTURES[1])[0] in ("ready", "extracting")
 
 
+async def test_all_slide_pictures_load_when_asked_for_at_once(app):
+    """The strip asks for every thumbnail in parallel (two of three once failed in a real browser)."""
+    import asyncio
+    app.state.pipeline.request_slides(LECTURES[0])
+    await app.state.pipeline._slide_jobs["asset7001"]["task"]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://admin.test") as c:
+        token = BeautifulSoup((await c.get("/admin/login")).text, "html.parser").find(
+            "input", {"name": "login_token"})["value"]
+        await c.post("/admin/login", data={"token": ADMIN, "login_token": token})
+        answers = await asyncio.gather(*(c.get(f"/admin/media/slide/7001/{n}.jpg") for n in (1, 2) * 20))
+        assert [r.status_code for r in answers] == [200] * 40
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api", headers=MCP) as c:
+        answers = await asyncio.gather(*(c.get(f"/api/v1/slides/7001/{n}.jpg") for n in (1, 2) * 20))
+        assert [r.status_code for r in answers] == [200] * 40
+
+
 # --- are lecture materials on the content server? --------------------------------------------------
 
 def material(kind="pdf", **extra) -> dict:

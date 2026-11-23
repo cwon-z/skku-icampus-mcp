@@ -40,7 +40,10 @@ MODULES = [{"module_id": 1, "title": "1주차", "position": 1, "module_items": [
     {"module_item_id": 7002, "title": "Week 1 lecture", "content_type": "attendance_item",
      "content_data": {"item_id": 9001, "use_attendance": True, "lecture_period_status": "late_after",
                       "unlock_at": "2026-03-01T15:00:00Z", "late_at": None, "due_at": "2026-03-15T14:59:59Z",
-                      "lock_at": None, "item_content_data": {"content_type": "movie", "duration": 1200}},
+                      "lock_at": None, "item_content_data": {
+                          "content_type": "movie", "duration": 1200, "total_file_size": 104857600,
+                          "last_updated_date": "20260301120000",
+                          "thumbnail_url": "https://lcms.skku.edu/CommonsCore2/v2/contents/a1b2c3d4e5f6.jpg"}},
      "completion_determinable": True, "completed": False},
     {"module_item_id": 7003, "title": "[Quiz] Week 1", "content_type": "quiz",
      "content_data": {"due_at": "2026-03-15T14:59:00Z"}, "completion_determinable": True, "completed": True},
@@ -58,6 +61,20 @@ def test_lectures():
     assert video["due_at"] == "2026-03-15T23:59:59+09:00" and video["completed"] is False
     assert quiz["kind"] == "quiz" and quiz["attendance"] is None and quiz["completed"] is True
     assert exam["completed"] is None and exam["review_flags"] == []  # completion not determinable != incomplete
+    assert video["item_id"] == "7002" and video["video"] == {
+        "asset_id": "a1b2c3d4e5f6", "host": "lcms.skku.edu", "listed_size": 104857600, "updated_at": "20260301120000"}
+    assert "video" not in quiz
+
+
+def test_commons_video_only_for_hosted_skku_videos():
+    from icampus.parse import commons_video
+    thumb = "https://lcms.skku.edu/CommonsCore2/v2/contents/a1b2c3.jpg"
+    assert commons_video({"content_type": "everlec", "thumbnail_url": thumb})["asset_id"] == "a1b2c3"
+    assert commons_video({"content_type": "youtube", "thumbnail_url": thumb}) is None
+    assert commons_video({"content_type": "movie", "thumbnail_url": "https://evil.example/CommonsCore2/v2/contents/a.jpg"}) is None
+    assert commons_video({"content_type": "movie", "thumbnail_url": "http://lcms.skku.edu/CommonsCore2/v2/contents/a.jpg"}) is None
+    assert commons_video({"content_type": "movie", "thumbnail_url": "https://lcms.skku.edu/x/../a.jpg"}) is None
+    assert commons_video({"content_type": "movie"}) is None
 
 
 def test_lesson_attendance_and_text():

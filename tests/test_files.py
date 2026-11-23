@@ -86,3 +86,24 @@ def test_reader_caps_its_memory_first(tmp_path, monkeypatch, capsys):
     extract.main()
     assert calls == [(resource.RLIMIT_AS, (extract.MEMORY_LIMIT, extract.MEMORY_LIMIT))]
     assert json.loads(capsys.readouterr().out) == {"text": "hi", "how": "text"}
+
+
+def test_reader_skips_the_memory_cap_only_on_macos(tmp_path, monkeypatch, capsys):
+    import resource
+
+    import pytest
+
+    import icampus.extract as extract
+
+    def refuse(what, limits):
+        raise ValueError("current limit exceeds maximum limit")  # what macOS says
+    monkeypatch.setattr(resource, "setrlimit", refuse)
+    path = tmp_path / "a.txt"
+    path.write_text("hi")
+    monkeypatch.setattr(sys, "argv", ["extract", str(path), "a.txt", ""])
+    monkeypatch.setattr(sys, "platform", "darwin")
+    extract.main()
+    assert json.loads(capsys.readouterr().out) == {"text": "hi", "how": "text"}
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(ValueError):
+        extract.main()

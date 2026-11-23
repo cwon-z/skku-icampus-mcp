@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import files, views
+from . import files, videos, views
 from .browser import NotLoggedIn, clean_error
 from .config import KST, Settings, parse_tokens
 from .dates import term_year
@@ -23,6 +23,7 @@ VERSION = "0.1.0"
 Kind = Literal["video", "material", "embedded_resource", "quiz", "assignment", "exam", "unknown"]
 Status = Literal["todo", "done", "missed", "upcoming", "unknown"]
 FileId = Annotated[str, Path(pattern=r"^\d+$")]
+ItemId = Annotated[str, Path(pattern=r"^\d+$", description="the lecture's item_id")]
 
 
 def create_app(settings: Settings | None = None, *, store: Store | None = None, background: bool = True) -> FastAPI:
@@ -46,7 +47,8 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     app = FastAPI(title="SKKU iCampus", version=VERSION, lifespan=lifespan,
                   description="Your iCampus tasks, assignments, announcements, lectures and grades, "
                               "as last synced. Times are Asia/Seoul.")
-    app.state.store, app.state.syncer = store, syncer
+    video_cache = videos.Videos(settings)
+    app.state.store, app.state.syncer, app.state.videos = store, syncer, video_cache
 
     def auth(request: Request) -> str:
         if not tokens:
@@ -255,6 +257,52 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         got = await fetch(attachment(file_id))
         return FileResponse(got.path, media_type=got.meta.get("content_type") or "application/octet-stream",
                             filename=got.meta.get("name") or file_id)
+
+    def lecture_video(item_id: str) -> dict:
+        lecture = videos.find(store, item_id)
+        if lecture is None:
+            raise HTTPException(404, "no synced lecture video with this item_id is hosted on SKKU's content server "
+                                     "(YouTube and Zoom videos aren't; a sync after updating adds new ones)")
+        return lecture
+
+    @app.get("/api/v1/videos", dependencies=api, tags=["videos"])
+    async def video_cache_list() -> dict:
+        """Videos kept on this server, most recently used first, and how full the cache is."""
+        items = [{k: m.get(k) for k in ("item_id", "course_id", "title", "format", "downloaded_at", "last_used")}
+                 | {"size_mb": round((m.get("size") or 0) / 2**20)} for m in video_cache.cached()]
+        return {"count": len(items), "used_gb": round(video_cache.used_bytes() / 2**30, 2),
+                "cap_gb": settings.video_cache_gb, "items": with_course(items)}
+
+    @app.get("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
+    async def video_status(item_id: ItemId) -> dict:
+        """state: not_downloaded, queued, downloading, ready, outdated (a sync saw a newer version) or failed."""
+        return video_cache.status(lecture_video(item_id))
+
+    @app.post("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
+    async def video_export(item_id: ItemId) -> JSONResponse:
+        """Download the lecture video to this server, unless it is cached and current. Returns at once (202 while
+        it downloads, 200 when ready). The download goes to SKKU's content server without your login, so it
+        records no viewing or attendance."""
+        body = video_cache.start(lecture_video(item_id))
+        return JSONResponse(body, status_code=200 if body["state"] == "ready" else 202)
+
+    @app.get("/api/v1/videos/{item_id}/content", dependencies=api, tags=["videos"])
+    async def video_content(item_id: ItemId) -> FileResponse:
+        """The cached video file (supports Range, so players can seek). POST /videos/{item_id} first."""
+        lecture = lecture_video(item_id)
+        asset_id = lecture["video"]["asset_id"]
+        path, meta = video_cache.path(asset_id), video_cache.meta(asset_id)
+        if path is None or meta is None:
+            state = video_cache.status(lecture)["state"]
+            raise HTTPException(409 if state in ("queued", "downloading") else 404,
+                                f"the video isn't on this server yet (state: {state})")
+        video_cache.touch(asset_id)
+        return FileResponse(path, media_type=meta["content_type"], filename=meta["name"])
+
+    @app.delete("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
+    async def video_delete(item_id: ItemId) -> dict:
+        """Remove the cached copy (a later export downloads it again)."""
+        return {"deleted": video_cache.delete(lecture_video(item_id)["video"]["asset_id"])}
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])
     async def grades(course: str | None = None) -> dict:

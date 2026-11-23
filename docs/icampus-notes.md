@@ -65,3 +65,24 @@ changes over time, so re-check with `icampus probe` when something breaks.
   on request, only when a synced announcement or assignment points at them, and never from lecture items
   (LearningX materials): not yet observed live, but that is how Canvas treats file downloads.
 - **Everything here counts as account activity.** Canvas and LearningX record page views and API use.
+
+## Lecture videos (checked with `icampus video-check` and a real export, November 2026)
+
+- The LearningX `modules` list (the sync already reads it) gives every video item a `thumbnail_url` of
+  `https://lcms.skku.edu/CommonsCore2/v2/contents/<asset id>.jpg`, plus `content_type`, `duration` and usually
+  `total_file_size`. The asset id differs from `content_id` and `_id`. Seen types: movie, everlec, screenlecture
+  (hosted on Commons), youtube and zoom (hosted elsewhere).
+- `GET /CommonsCore2/v2/contents/<asset id>` describes the content without any login: type, extension,
+  conversion state, privacy, sizes, `read_cnt`, and download addresses. It also names the uploader: don't keep that.
+- `/CommonsCore2/v2/services/download/<asset id>` answers 500 to a plain request, and with a `Referer` of
+  `https://canvas.skku.edu/` redirects once (to an `index.php` address with a query: never log it) and serves the
+  original file as `application/octet-stream`, the size of `original_file_length`. No cookies are needed, so the
+  request isn't tied to the account. It ignores `Range` (200, not 206). `services/mp4_download/<id>` with a
+  Referer leads to an HTML page instead.
+- None of this moved `read_cnt`, and no LearningX progress or attendance is involved (that comes from the
+  player inside the LearningX viewer). The bare player page `/em/<id>` answers 404 without LearningX's parameters.
+- Originals are mp4 files: movie ones say so, and an everlec original (no extension in its description) also
+  turned out to be a plain MP4 when exported. `videos.py` still checks the first bytes of each download (`ftyp` at
+  offset 4) and labels anything else "not mp4".
+- No captions or scripts: all 127 hosted videos checked in November 2026 had `exists_caption` and `exists_script`
+  "N" and no `caption_track_list` (`icampus video-check --captions` checks again).

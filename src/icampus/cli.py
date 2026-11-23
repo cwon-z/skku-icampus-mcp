@@ -15,6 +15,16 @@ def main() -> None:
     probe = sub.add_parser("probe", help="one-off live check of what the iCampus pages load (read-only)")
     probe.add_argument("--login", choices=["manual", "auto"], default="manual")
     probe.add_argument("--course", help="course ID to inspect (default: first current course)")
+    video = sub.add_parser("video-check", help="one-off check whether lecture videos can be fetched without "
+                                               "their viewer (shapes only; no downloads)")
+    video.add_argument("--course", help="course ID (default: all current courses)")
+    video.add_argument("--head", type=int, default=0, metavar="N",
+                       help="also ask the content server about N videos: description and one byte of the file "
+                            "(no cookies)")
+    video.add_argument("--captions", action="store_true",
+                       help="read every hosted video's Commons description (no cookies) for caption/script flags")
+    video.add_argument("--login", choices=["saved", "manual"], default="saved",
+                       help="manual: sign in yourself in a browser window if the saved login has expired")
     args = parser.parse_args()
 
     settings = Settings()
@@ -41,6 +51,9 @@ def main() -> None:
         from .probe import probe as run_probe
         out = asyncio.run(run_probe(settings, args.login, args.course))
         print(f"report: {out / 'report.md'}")
+    elif args.cmd == "video-check":
+        from .video_check import check
+        print(asyncio.run(check(settings, args.course, args.head, args.login == "manual", args.captions)))
 
 
 if __name__ == "__main__":

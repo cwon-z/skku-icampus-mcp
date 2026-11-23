@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     term: str = ""  # e.g. "2026년 2학기"; empty = detect from Canvas
     mypage_path: str = "/accounts/1/external_tools/346?launch_type=global_navigation"
     headless: bool = True
+    # Lecture videos kept in var/videos; the least recently used go first once the total passes the cap.
+    video_cache_gb: float = 30
+    video_max_gb: float = 4  # bigger videos aren't downloaded
     kuma_push_url: str = ""
     log_level: str = "INFO"
 
@@ -72,4 +75,5 @@ class McpSettings(BaseSettings):
     access_aud: str = ""
     access_emails: str = ""
     allowed_hosts: str = ""  # comma list; empty = loopback only, "*" = no Host check
+    public_url: str = ""  # e.g. https://mcp.example.com: export_video links point here
     log_level: str = "INFO"

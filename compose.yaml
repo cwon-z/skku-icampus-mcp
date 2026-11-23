@@ -16,6 +16,8 @@ services:
       ICAMPUS_TERM: ${ICAMPUS_TERM:-}
       ICAMPUS_SYNC_TIMES: ${ICAMPUS_SYNC_TIMES-07:30,12:30,18:00,22:30}  # set empty to turn the schedule off
       ICAMPUS_KUMA_PUSH_URL: ${ICAMPUS_KUMA_PUSH_URL:-}
+      ICAMPUS_VIDEO_CACHE_GB: ${ICAMPUS_VIDEO_CACHE_GB:-30}
+      ICAMPUS_VIDEO_MAX_GB: ${ICAMPUS_VIDEO_MAX_GB:-4}
     volumes:
       - icampus-data:/data
     ports:
@@ -42,6 +44,7 @@ services:
       ICAMPUS_MCP_ACCESS_AUD: ${ICAMPUS_MCP_ACCESS_AUD:-}
       ICAMPUS_MCP_ACCESS_EMAILS: ${ICAMPUS_MCP_ACCESS_EMAILS:-}
       ICAMPUS_MCP_ALLOWED_HOSTS: ${ICAMPUS_MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*}
+      ICAMPUS_MCP_PUBLIC_URL: ${ICAMPUS_MCP_PUBLIC_URL:-}
     ports:
       - "127.0.0.1:8724:8724"
     init: true

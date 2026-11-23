@@ -20,6 +20,9 @@ KIND = {
 _SOURCE = re.compile(r"^/courses/(\d+)/(modules/items|assignments|quizzes|discussion_topics)/(\d+)/?$")
 _FILE = re.compile(r"^(?:/courses/\d+)?/files/(\d+)(?:/(?:download|preview))?/?$")
 _WEEK = re.compile(r"(\d+)")
+# Commons thumbnails carry the asset id the Commons API knows the video by (not content_id or _id)
+_COMMONS_THUMB = re.compile(r"^/CommonsCore2/v2/contents/([A-Za-z0-9_-]+)\.[A-Za-z0-9]+$")
+COMMONS_TYPES = {"movie", "everlec", "screenlecture"}  # hosted on lcms.skku.edu; youtube and zoom live elsewhere
 _COURSE = re.compile(r"^(?P<name>.+)_(?P<code>[A-Z]{3,4}\d{3,4})_(?P<section>[A-Z0-9]+)\((?P<teacher>[^)]*)\)$")
 
 
@@ -95,6 +98,22 @@ def attachments(files: list[dict] | None, html: str | None) -> list[dict]:
     return list(found.values())
 
 
+def commons_video(content: dict) -> dict | None:
+    """The Commons asset behind a hosted lecture video (from LearningX item_content_data), or None."""
+    if content.get("content_type") not in COMMONS_TYPES:
+        return None
+    try:
+        parts = urlsplit(content.get("thumbnail_url") or "")
+    except ValueError:
+        return None
+    m = _COMMONS_THUMB.match(parts.path)
+    if not m or parts.scheme != "https" or not (parts.hostname or "").endswith(".skku.edu"):
+        return None
+    return {k: v for k, v in {
+        "asset_id": m.group(1), "host": parts.hostname, "listed_size": content.get("total_file_size"),
+        "updated_at": content.get("last_updated_date") or content.get("updated_at")}.items() if v is not None}
+
+
 def todo(item: dict, course_id: str, year: int | None) -> dict | None:
     """One row of LearningX learner/todos (what My Page's remaining list is built from)."""
     src = source_key(item.get("url"))
@@ -127,9 +146,10 @@ def lectures(modules: list[dict], attendance: dict, course_id: str, year: int | 
             due = from_canvas(data.get("due_at"))
             item_id = str(data.get("item_id")) if data.get("item_id") else None
             duration = content.get("duration")
-            rows.append({
+            row = {
                 "key": f"canvas.skku.edu:{course_id}:modules/items:{it['module_item_id']}",
-                "course_id": course_id, "week": module.get("title"), "week_no": week_no,
+                "course_id": course_id, "item_id": str(it["module_item_id"]),
+                "week": module.get("title"), "week_no": week_no,
                 "title": it.get("title"), "kind": kind_of(content.get("content_type"), it.get("content_type")),
                 "type_raw": content.get("content_type") or it.get("content_type"),
                 "url": f"https://canvas.skku.edu/courses/{course_id}/modules/items/{it['module_item_id']}",
@@ -143,7 +163,10 @@ def lectures(modules: list[dict], attendance: dict, course_id: str, year: int | 
                 "attendance": status.get(item_id) if item_id else None,
                 "period": data.get("lecture_period_status"),
                 "review_flags": review_flags(due, year) if due else [],
-            })
+            }
+            if video := commons_video(content):
+                row["video"] = video
+            rows.append(row)
     return rows
 
 

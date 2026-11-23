@@ -43,6 +43,9 @@ university's rules when you use it.
   Transcripts are kept as JSON under `var/transcripts` and indexed for search (Korean included). They are
   lecture content like the videos: private, for your own study. See [docs/transcripts.md](docs/transcripts.md)
   and [docs/stt-providers.md](docs/stt-providers.md).
+- **Slides.** While a lecture's video is on the server for transcription, ffmpeg also saves a picture of each
+  slide (the key frames where the picture changes, near-identical ones folded together) with the time it was on
+  screen. Each slide can then be read together with what was said during it.
 - **One cache, with caps.** Videos, extracted audio, attachments and transcripts are indexed together. Each kind
   has a cap and so does the total; past a cap the least recently used go first, but never something you pinned,
   something a queued job still needs, or a transcript.
@@ -70,6 +73,10 @@ uv run pytest
 
 Swagger UI: http://127.0.0.1:9013/docs. `icampus probe` is a one-off read-only check of what the
 iCampus pages load. It writes its report to `var/probe/`, which is gitignored and holds personal data.
+`icampus video-check` and `icampus material-check` are one-off read-only checks too: they print the shape of
+the lecture video and lecture material items (no titles, no IDs) and, with `--head N`, what SKKU's content server
+says about N of them. `material-check` never requests a file: whether lecture materials may be fetched at all is
+an open question that its report is meant to answer.
 
 ## REST API
 
@@ -99,6 +106,8 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/transcripts/{item_id}` | `model, format=text\|json\|vtt\|srt, offset, max_chars=15000, start_s, end_s`. `PUT .../preferred?model=` pins which transcript is read |
 | `POST /api/v1/transcripts/batch` | `course, week, kind, model, only_missing`. A dry run (the plan) unless `confirm=true` |
 | `GET /api/v1/transcripts/status` | `item_id` for one lecture; otherwise the queue, use per provider and open jobs (`course`) |
+| `GET /api/v1/slides/{item_id}` | the slide frames of a lecture: `state` and each slide's time. `POST` cuts them now (downloads the video if needed); `/{n}.jpg` is one frame |
+| `GET /api/v1/lectures/{item_id}/segments` | slide by slide: each frame with what was said while it was on screen. `model, offset, limit=4, max_chars` |
 | `GET /api/v1/jobs` | `state, course, item_id, limit`. `POST /api/v1/jobs/{id}/retry`, `DELETE /api/v1/jobs/{id}` (cancel) |
 | `GET /api/v1/search` | `q, course, week, limit`: where something was said, with the moment and the sentences around it |
 | `GET /api/v1/cache` | everything on disk: `kind, course, pinned, sort, order, limit`, with totals against caps. `POST\|DELETE /api/v1/cache/{kind}/{key}/pin`; `DELETE /api/v1/cache/{kind}/{key}` needs an admin token |
@@ -143,6 +152,7 @@ Transcript tools:
 | `queue_transcriptions(course, week, model, only_missing, confirm)` | many lectures. Returns the plan (count, hours, cost per model, cap left) unless `confirm=True` |
 | `transcription_status(item_id, course)` | one lecture's state, or the queue |
 | `get_transcript(item_id, model, start_s, end_s, offset)` | the text with `[mm:ss]` markers, about 15,000 characters per call, and a link pattern into the video (`…/videos/<item_id>#t=<seconds>`) |
+| `get_lecture_segments(item_id, offset)` | a lecture slide by slide: each slide's picture (as an image) with what was said while it was on screen, a few slides per call |
 | `search_transcripts(query, course, week, limit)` | where something was said: title, course, time, the sentence, a link to that moment |
 | `lecture_stats(course)` | totals per course, so "how many hours of lectures are there" doesn't need the whole list |
 
@@ -205,7 +215,7 @@ in the UI wins, and the page shows which is in force) or through `PUT /api/v1/se
 |---|---|
 | Storage | `video_cache_gb` (30), `video_max_gb` (4), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
 | Sync | `sync_times`, `sync_jitter_min` (10), `manual_cooldown_min` (10), `stale_hours` (12) |
-| Transcription jobs | `prefetch_limit` (2), `keep_video_after_processing` (on), `download_retries` (3), `ffmpeg_threads` (1), `stt_auto_transcribe` (off), `stt_auto_courses`, `stt_auto_retranscribe` (off) |
+| Transcription jobs | `prefetch_limit` (2), `keep_video_after_processing` (on), `download_retries` (3), `ffmpeg_threads` (1), `slides_enabled` (on), `slides_scene_threshold` (0.1), `slides_width` (960), `stt_auto_transcribe` (off), `stt_auto_courses`, `stt_auto_retranscribe` (off) |
 | Speech-to-text | `stt_default_provider`, `stt_fallback_order`, `stt_routing_rules`, `stt_default_language`, `stt_course_languages`, `stt_course_terms`, `stt_min_timestamps` (segment), `stt_chunk_minutes` (20), `stt_audio_bitrate_kbps` (24), `stt_fail_threshold` (3), `stt_skip_minutes` (15) |
 | Budget | `stt_monthly_usd_cap` (0 = none), `stt_budget_reset_day` (1); each provider has its own hour and USD caps |
 
@@ -239,7 +249,7 @@ MIT — see [LICENSE](LICENSE).
 | Path | What |
 |---|---|
 | `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
-| `src/icampus/` (transcripts) | `cache.py` the cache manager, `runtime.py` the settings registry, `audio.py` ffmpeg, `stt/` providers and their registry, `pipeline.py` the job queue, `transcripts.py` storage and search, `api_transcripts.py` |
+| `src/icampus/` (transcripts) | `cache.py` the cache manager, `runtime.py` the settings registry, `audio.py` ffmpeg, `frames.py` slide frames, `stt/` providers and their registry, `pipeline.py` the job queue, `transcripts.py` storage and search, `api_transcripts.py` |
 | `src/icampus/admin/` | the admin UI: `__init__.py` (sessions, CSRF, pages), `templates/`, `static/` (theme, htmx, fonts) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |
 | `docs/transcripts.md` | the design of the transcript pipeline, cache and admin UI, the schema versions, and what the brief got wrong |

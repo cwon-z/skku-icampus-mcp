@@ -37,7 +37,7 @@
   // Mark the transcript line being spoken, and keep it in view.
   document.addEventListener("DOMContentLoaded", function () {
   var player = document.querySelector("[data-player]");
-  var lines = Array.prototype.slice.call(document.querySelectorAll("[data-seek]"));
+  var lines = Array.prototype.slice.call(document.querySelectorAll(".line[data-seek]"));
   if (player && lines.length) {
     var starts = lines.map(function (el) { return parseFloat(el.getAttribute("data-seek")) || 0; });
     var current = -1;

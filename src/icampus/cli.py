@@ -37,6 +37,14 @@ def main() -> None:
                        help="read every hosted video's Commons description (no cookies) for caption/script flags")
     video.add_argument("--login", choices=["saved", "manual"], default="saved",
                        help="manual: sign in yourself in a browser window if the saved login has expired")
+    material = sub.add_parser("material-check", help="one-off check whether lecture materials (slide PDFs) sit on "
+                                                     "the content server like the videos (shapes only; nothing is "
+                                                     "opened or downloaded)")
+    material.add_argument("--course", help="course ID (default: all current courses)")
+    material.add_argument("--head", type=int, default=0, metavar="N",
+                          help="also ask the content server to describe N materials (no cookies, no download)")
+    material.add_argument("--login", choices=["saved", "manual"], default="saved",
+                          help="manual: sign in yourself in a browser window if the saved login has expired")
     args = parser.parse_args()
 
     settings = Settings()
@@ -67,6 +75,9 @@ def main() -> None:
     elif args.cmd == "video-check":
         from .video_check import check
         print(asyncio.run(check(settings, args.course, args.head, args.login == "manual", args.captions)))
+    elif args.cmd == "material-check":
+        from .video_check import check_materials
+        print(asyncio.run(check_materials(settings, args.course, args.head, args.login == "manual")))
 
 
 if __name__ == "__main__":

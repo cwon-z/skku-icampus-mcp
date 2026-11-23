@@ -83,11 +83,13 @@ async def test_one_lecture_from_request_to_transcript(rig):
     assert t["cost_usd"] == pytest.approx(0.2 * 600 / 3600, abs=1e-4)
     job = job_of(rig, "7001")
     assert job["state"] == "done" and job["provider"] == "el" and job["transcript_id"] == t["id"]
-    assert set(job["stages"]) == {"download", "extract", "transcribe"} and job["hours"] == pytest.approx(1 / 6, abs=1e-3)
+    assert set(job["stages"]) == {"download", "extract", "slides", "transcribe"}
+    assert job["stages"]["slides"]["count"] == 2 and job["hours"] == pytest.approx(1 / 6, abs=1e-3)
     assert rig.commons.downloads == ["asset7001"] and rig.stt.hosts() == ["api.elevenlabs.io"]
     assert rig.audio["extract"] == [("asset7001.mp4", "asset7001.opus24.ogg", "opus", 24)]
     assert rig.registry.usage(rig.registry.get("el"))["hours"] == pytest.approx(1 / 6)
-    assert {e.kind for e in rig.cache.entries()} == {"video", "audio", "transcript"} and rig.pipeline.in_use() == set()
+    assert {e.kind for e in rig.cache.entries()} == {"video", "audio", "frames", "transcript"}
+    assert rig.pipeline.in_use() == set()
 
     stored = json.loads((rig.tmp_path / "transcripts" / f"t{t['id']}.json").read_text())
     assert stored["provider"] == "el" and stored["segments"][0] == [1.0, 4.6, "행렬 분해는 eigenvalue 문제입니다."]
@@ -400,7 +402,8 @@ async def test_videos_are_deleted_after_processing_when_asked_unless_pinned(rig)
     rig.pipeline.queue([find(rig, "7001"), find(rig, "7002")])
     await rig.pipeline.drain()
     assert rig.videos.path("asset7001") is None and rig.videos.path("asset7002") is not None
-    assert {e.kind for e in rig.cache.entries()} == {"video", "audio", "transcript"}
+    assert {e.kind for e in rig.cache.entries()} == {"video", "audio", "frames", "transcript"}
+    assert rig.pipeline.slides(find(rig, "7001"))[0] == "ready"  # the slides were cut before the video left
     assert len(rig.transcripts.rows()) == 2
 
 

@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     keep_video_after_processing: bool = True  # False: delete a video once its audio is extracted
     download_retries: int = 3
     ffmpeg_threads: int = 1
+    slides_enabled: bool = True  # extract slide frames while a lecture's video is here for transcription
+    slides_scene_threshold: float = 0.1  # how different two key frames must be to count as a new slide (0..1)
+    slides_width: int = 960  # frames are scaled down to this width
     stt_default_provider: str = ""  # a provider id; empty = the enabled provider with the lowest priority number
     stt_fallback_order: list[str] = []
     stt_routing_rules: list[dict] = []  # [{"course": "CSE1001", "language": "ko", "provider": "<id>"}], first match wins

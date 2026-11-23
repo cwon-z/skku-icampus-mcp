@@ -585,6 +585,12 @@ form.inline { display: inline-flex; }
 .line:hover { background: var(--bg-hover); }
 .line.is-current { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
 .line__time { flex: none; width: 7ch; color: var(--text-tertiary); font-family: var(--font-mono); font-size: 12px; line-height: 20px; font-variant-numeric: tabular-nums; }
+.slides { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: var(--space-2); max-height: 44vh; overflow-y: auto; padding: var(--space-1); }
+.slide { all: unset; box-sizing: border-box; cursor: pointer; display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-1); border-radius: var(--radius-md); border: 1px solid var(--line-subtle); background: var(--bg-raised); color: var(--text-tertiary); }
+.slide:hover { border-color: var(--line-strong); color: var(--text); }
+.slide.is-current { border-color: var(--accent-line); background: var(--accent-soft); color: var(--accent-text); }
+.slide:focus-visible { box-shadow: var(--focus-ring); }
+.slide img { width: 100%; aspect-ratio: 16 / 9; object-fit: contain; border-radius: var(--radius-sm); background: var(--bg-canvas); display: block; }
 .pre { margin: 0; padding: var(--space-4); background: var(--bg-raised); border: 1px solid var(--line-subtle); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: 13px; line-height: 20px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 72vh; overflow-y: auto; }
 
 .auth { min-height: 100vh; display: grid; place-items: center; padding: var(--space-4); }

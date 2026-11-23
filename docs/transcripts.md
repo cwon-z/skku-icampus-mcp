@@ -173,6 +173,28 @@ Served by the API at `/admin`, because that service owns the data and the settin
   reverse proxy in front of the API is the alternative that leaves the MCP container alone. Either is a
   decision for later; `tailscale serve` already gives HTTPS inside the tailnet.
 
+### Part 5: slides (`frames.py`)
+
+- **Extraction.** One ffmpeg pass over the key frames only (`-skip_frame nokey`): fast, light on memory, and
+  encoders place key frames where the picture changes. Frames whose scene score against the previous key frame
+  passes `slides_scene_threshold` (0.1) are written as JPEGs scaled to `slides_width` (960). A second, tiny
+  ffmpeg pass turns each into a 16x16 grey thumbnail, its fingerprint; consecutive frames whose fingerprints
+  differ by no more than about one line of text are one slide, and the last picture of such a run is kept (the
+  slide with all its bullets) with the first one's start time. A slide that returns later is a new slide.
+  Output: `var/frames/<item_id>/NNN.jpg` and `index.json` (item, asset, video version, each slide's start and
+  end), indexed as cache kind `frames` under `frames_cache_gb`.
+- **When.** Inside a transcription job, right after the audio and before the video may leave: a job in
+  `extracting` holds its video for exactly that. A failure there is recorded in the job's stages and does not
+  fail the transcript. For lectures transcribed earlier, `POST /api/v1/slides/{item_id}` (or the button on the
+  lecture's admin page) cuts them on request, downloading the video first if it isn't cached.
+- **Reading.** `GET /api/v1/lectures/{item_id}/segments` pairs each slide with the transcript segments that
+  began while it was on screen. The MCP tool `get_lecture_segments` returns a few slides per call, each as the
+  image itself followed by that text, so the assistant reads the slide rather than an OCR of it.
+- **Lecture materials (slide PDFs).** Nothing fetches them. `icampus material-check` reads the modules list the
+  sync already reads and prints the shape of the material items; with `--head N` it asks the content server to
+  describe N of them, without cookies, and never requests a download address (fetching a material may count
+  as opening it). Its report decides what, if anything, is built next.
+
 ## Schema changes
 
 `PRAGMA user_version` now means something: `MIGRATIONS` is a list of scripts, one per version, applied in order
@@ -183,6 +205,9 @@ at start. Every statement is `IF NOT EXISTS` and nothing is dropped or rewritten
 | 1 | (existing) `records`, `scopes`, `runs`, `state` |
 | 2 | `settings` (runtime overrides), `cache_entries` (the cache index) |
 | 3 | `stt_providers`, `stt_usage`, `jobs`, `transcripts`, `segments`, and the FTS table `segments_fts` when SQLite supports it |
+
+Slides need no schema change: their index is a cache entry of kind `frames`, and each directory's `index.json`
+says what it belongs to.
 
 The old program set `user_version` back to 1 at each start. After a downgrade and a second upgrade the scripts
 therefore run again, which is why they must be repeatable. Synced rows have a version of their own
@@ -262,7 +287,20 @@ request, so it waits out the cooldown and does nothing while logins are blocked.
     letting lectures of unknown length download; an error message shortened before the key was cut out of it;
     sessions outliving their token; child processes (ffmpeg, the attachment reader) inheriting provider keys
     from the environment; and smaller ones.
-24. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
+24. **"Perceptual-hash de-duplication" is done on thumbnails, not bit hashes.** A difference hash merged two
+    different test pictures made of horizontal bands, gives sparse slides (a title on white) only a handful of
+    bits to differ in, and can't tell a white page from a black one. Comparing 16x16 grey thumbnails by mean
+    difference has none of these problems and needs no image library either. The thresholds (scene score 0.1,
+    mean difference 2.5) are reasoned, not measured: no real lecture was available to tune them on.
+25. **Slide times are as fine as the video's key frames**, typically a few seconds, because only key frames are
+    decoded. Decoding every frame of a two-hour video would take many CPU-minutes for little gain.
+26. **A camera recording has no slides.** Its picture never settles, so the grouping is loosened and then
+    thinned to at most 400 frames; those are stills of the lecturer, not slides. `slides_enabled` turns the
+    whole step off.
+27. **The material check could not be run here**: it needs the saved iCampus login. The command is in this
+    change; its report (which content types materials have, whether they name a Commons asset, what Commons
+    says about one) is the thing to send back before anything fetches a material.
+28. **What could not be checked here.** The acceptance checks that need the real server, real lectures and a paid
     key (a ~10-minute and a ~130-minute lecture through ElevenLabs and a second provider) were not run: this was
     built without access to the deployment or any provider key. The Docker image was not built either (no
     Docker daemon in the build environment), so the ffmpeg layer is untested as an image. Everything else is

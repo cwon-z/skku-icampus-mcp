@@ -77,6 +77,13 @@ register(
          "growing pauses. Commons can't resume, so each try starts from zero.", 0, 10),
     Spec("ffmpeg_threads", "int", "Transcription jobs", "Threads ffmpeg may use. One keeps the container well under "
          "its memory limit.", 1, 8),
+    Spec("slides_enabled", "bool", "Transcription jobs", "While a lecture's video is on the server for "
+         "transcription, also save a picture of each slide, with the time it was on screen. Off: transcripts only."),
+    Spec("slides_scene_threshold", "float", "Transcription jobs", "How much the picture must change to count as a "
+         "new slide (ffmpeg's scene score, 0 to 1). Lower finds more slides; near-identical ones are merged anyway.",
+         0.01, 1),
+    Spec("slides_width", "int", "Transcription jobs", "Slide pictures are scaled down to this width.", 320, 1920,
+         unit="px"),
     Spec("stt_auto_transcribe", "bool", "Transcription jobs", "After each sync, queue new lecture videos of the "
          "courses below, using automatic routing. Spends from the provider's budget without asking."),
     Spec("stt_auto_courses", "list", "Transcription jobs", "Course IDs or codes that auto-transcribe covers."),

@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import audio, videos
+from . import audio, frames, videos
 from .cache import Cache, CacheFull, Entry
 from .config import KST
 from .store import Store
@@ -83,6 +83,7 @@ class Pipeline:
         self._ffmpeg = asyncio.Lock()  # one ffmpeg at a time
         self._wake = asyncio.Event()
         self._paused_checked = 0.0
+        self._slide_jobs: dict[str, dict] = {}  # asset id -> {state, error, task} of an extraction asked for by hand
         cache.protect(self.in_use)
         # A restart: whatever was mid-stage starts that stage over; finished stages are found on disk.
         self.store.execute(f"UPDATE jobs SET state='queued', progress='{{}}', updated_at=? "
@@ -93,11 +94,97 @@ class Pipeline:
 
     def _sweep(self) -> None:
         """Start-up: audio files the index doesn't know (a stopped extraction, a lost index) can't be reused,
-        because what they were cut from isn't recorded anywhere else. They are removed."""
+        because what they were cut from isn't recorded anywhere else. They are removed. A slide directory says in
+        its index.json what it belongs to, so one without a row is indexed again; a half-written one is removed."""
         known = {self.cache.path(e).name for e in self.cache.entries("audio")}
         for path in self.dir.glob("*"):
             if path.is_file() and path.name not in known:
                 path.unlink(missing_ok=True)
+        indexed = {self.cache.path(e).name for e in self.cache.entries("frames")}
+        for path in (Path(self.settings.data_dir) / "frames").glob("*"):
+            if not path.is_dir() or path.name in indexed:
+                continue
+            about = frames.index(path)
+            if path.name.endswith(".part") or not (about.get("asset_id") and frames.read(path)):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                self.cache.put("frames", about["asset_id"], [path], course_id=about.get("course_id"),
+                               item_id=about.get("item_id"), title=about.get("title"),
+                               meta={"asset_id": about["asset_id"], "version": about.get("version") or "",
+                                     "count": len(frames.read(path)), "duration_s": about.get("duration")})
+
+    # --- slides ------------------------------------------------------------
+
+    def slides(self, lecture: dict) -> tuple[str, list[dict]]:
+        """(state, slides) for a lecture: none, extracting, failed, outdated (cut from an older version of the
+        video) or ready, and each slide as {n, start, end, file}."""
+        asset_id = lecture["video"]["asset_id"]
+        job = self._slide_jobs.get(asset_id)
+        if job and job["state"] == "extracting":
+            return "extracting", []
+        entry = self.cache.get("frames", asset_id)
+        if entry is None:
+            return ("failed" if job and job["state"] == "failed" else "none"), []
+        found = frames.read(self.cache.path(entry))
+        return ("ready" if entry.meta.get("version") == self.version(lecture) else "outdated"), found
+
+    def slide_error(self, lecture: dict) -> str | None:
+        return (self._slide_jobs.get(lecture["video"]["asset_id"]) or {}).get("error")
+
+    def slide_file(self, lecture: dict, n: int) -> Path | None:
+        entry = self.cache.get("frames", lecture["video"]["asset_id"])
+        if entry is None:
+            return None
+        slide = next((s for s in frames.read(self.cache.path(entry)) if s.get("n") == n), None)
+        path = self.cache.path(entry) / slide["file"] if slide else None
+        if path is None or not path.is_file():
+            return None
+        self.cache.touch("frames", entry.key)
+        return path
+
+    async def _extract_slides(self, lecture: dict, video: Path, duration: float) -> list[dict]:
+        """Cuts the slide frames out of a video that is on disk and indexes them. Raises AudioError."""
+        asset_id = lecture["video"]["asset_id"]
+        out_dir = Path(self.settings.data_dir) / "frames" / lecture["item_id"]
+        about = {"item_id": lecture["item_id"], "asset_id": asset_id, "course_id": lecture.get("course_id"),
+                 "title": lecture.get("title"), "version": self.version(lecture)}
+        async with self._ffmpeg:
+            found = await frames.extract(video, out_dir, duration=duration, about=about,
+                                         threshold=self.settings.slides_scene_threshold,
+                                         width=self.settings.slides_width, threads=self.settings.ffmpeg_threads)
+        self.cache.put("frames", asset_id, [out_dir], course_id=lecture.get("course_id"), item_id=lecture["item_id"],
+                       title=lecture.get("title"), meta={"asset_id": asset_id, "version": self.version(lecture),
+                                                         "count": len(found), "duration_s": duration})
+        try:
+            self.cache.make_room("frames", 0, keep={("frames", asset_id)})
+        except CacheFull:
+            pass
+        return found
+
+    def request_slides(self, lecture: dict) -> str:
+        """Starts cutting a lecture's slide frames in the background, downloading the video first if it isn't
+        here (an explicit request to the content server, like an export). Returns the state."""
+        state, _ = self.slides(lecture)
+        if state in ("ready", "extracting"):
+            return state
+        if not audio.available():
+            raise audio.AudioError("ffmpeg is not installed on this server, so slides can't be extracted")
+        asset_id = lecture["video"]["asset_id"]
+        job = self._slide_jobs[asset_id] = {"state": "extracting", "error": None}
+
+        async def run() -> None:
+            try:
+                video = await self.videos.ensure(lecture)
+                duration = (lecture.get("duration_min") or 0) * 60 or await audio.probe(video)
+                await self._extract_slides(lecture, video, duration)
+                self._slide_jobs.pop(asset_id, None)
+            except (videos.VideoError, audio.AudioError) as exc:
+                job.update(state="failed", error=str(exc))
+            except Exception as exc:  # the message could hold anything: only its type is kept
+                log.error("slides for item %s: %s", lecture["item_id"], type(exc).__name__)
+                job.update(state="failed", error=f"internal error ({type(exc).__name__})")
+        job["task"] = asyncio.get_running_loop().create_task(run())
+        return "extracting"
 
     # --- lookups -----------------------------------------------------------
 
@@ -140,19 +227,26 @@ class Pipeline:
                 return [t.strip() for t in by_course[str(course[key]).lower()].split(",") if t.strip()]
         return []
 
-    def in_use(self) -> set[tuple[str, str]]:
-        """What queued and running jobs still need: a job's audio once it exists, its cached video until then.
-        A job paused for budget holds no video (it may wait for weeks), only audio that was already made."""
+    def in_use(self, but: int | None = None) -> set[tuple[str, str]]:
+        """What queued and running jobs still need: a job's audio once it exists, its cached video until then
+        (and while its slide frames are being cut). A job paused for budget holds no video (it may wait for
+        weeks), only audio that was already made. `but` leaves one job out: what the others need."""
         audio_by_asset: dict[str, list[str]] = {}
         for entry in self.cache.entries("audio"):
             audio_by_asset.setdefault(entry.meta.get("asset_id"), []).append(entry.key)
         held: set[tuple[str, str]] = set()
-        for row in self.store.query(f"SELECT asset_id, state FROM jobs WHERE state IN ({','.join('?' * len(ACTIVE))})",
-                                    ACTIVE):
+        for row in self.store.query(f"SELECT id, asset_id, state FROM jobs WHERE state IN "
+                                    f"({','.join('?' * len(ACTIVE))})", ACTIVE):
+            if row["id"] == but:
+                continue
             if row["asset_id"] in audio_by_asset:
                 held |= {("audio", key) for key in audio_by_asset[row["asset_id"]]}
             elif row["state"] != "paused_budget":
                 held.add(("video", row["asset_id"]))
+            if row["state"] == "extracting":  # the slide frames are cut from the video after the audio
+                held.add(("video", row["asset_id"]))
+        # and a slide extraction asked for by hand holds its video while it runs (not after it failed)
+        held |= {("video", asset_id) for asset_id, job in self._slide_jobs.items() if job["state"] == "extracting"}
         return held
 
     # --- views -------------------------------------------------------------
@@ -651,13 +745,21 @@ class Pipeline:
                                      "format": fmt, "kbps": kbps})
         stages["extract"] = {"s": round(time.monotonic() - started, 1), "audio_s": round(duration),
                              "mb": round(entry.size / 2**20, 1)}
+        if self.settings.slides_enabled and source.parent == self.videos.dir and self.slides(lecture)[0] != "ready":
+            self._progress[job_id] = {"stage": "extracting", "note": "slide frames"}
+            started = time.monotonic()
+            try:  # the video is here now: cut its slides before it may leave. A failure costs the job nothing.
+                found = await self._extract_slides(lecture, source, duration)
+                stages["slides"] = {"s": round(time.monotonic() - started, 1), "count": len(found)}
+            except audio.AudioError as exc:
+                stages["slides"] = {"error": str(exc)}
         try:
             self.cache.make_room("audio", 0, keep={("audio", key)})
         except CacheFull:
             pass  # over its cap only with entries that may not go: the cache page shows it
         if not self.settings.keep_video_after_processing:
             video = self.cache.get("video", asset_id)
-            if video and not video.pinned and ("video", asset_id) not in self.in_use():
+            if video and not video.pinned and ("video", asset_id) not in self.in_use(but=job_id):
                 self.cache.delete("video", asset_id)
         return entry
 

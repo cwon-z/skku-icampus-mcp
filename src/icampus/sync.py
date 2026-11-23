@@ -40,6 +40,7 @@ class Syncer:
         self.running = False
         self.next_run: datetime | None = None
         self._task: asyncio.Task | None = None
+        self.after_run: list = []  # called with the run's status after each run that synced something
 
     # --- manual trigger (REST / MCP) --------------------------------------
 
@@ -115,6 +116,12 @@ class Syncer:
                     except Exception as exc:
                         log.error("could not record run %s: %s", run_id, clean_error(exc))
                 log.info("sync %s: %s", run_id, status)
+                if status in ("ok", "partial"):
+                    for hook in self.after_run:  # e.g. the transcription queue marking outdated transcripts
+                        try:
+                            hook(status)
+                        except Exception as exc:
+                            log.error("after-sync step failed: %s", clean_error(exc))
                 return run_id
         finally:
             self.running = False

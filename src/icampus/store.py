@@ -43,10 +43,47 @@ CREATE TABLE IF NOT EXISTS cache_entries (
 CREATE INDEX IF NOT EXISTS cache_lru ON cache_entries(kind, last_used);
 """
 
+# Version 3: speech-to-text providers and what they cost, the transcription job queue, and transcripts with their
+# segments. The full-text table over segments is made by transcripts.py, because it needs an SQLite with FTS5 and
+# the trigram tokenizer and the server must start without one.
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS stt_providers (
+    id TEXT PRIMARY KEY, config TEXT NOT NULL, health TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stt_usage (
+    id INTEGER PRIMARY KEY, provider_id TEXT NOT NULL, at TEXT NOT NULL, audio_seconds REAL NOT NULL,
+    cost_usd REAL NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'transcribe', job_id INTEGER, item_id TEXT);
+CREATE INDEX IF NOT EXISTS stt_usage_at ON stt_usage(provider_id, at);
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY, item_id TEXT NOT NULL, asset_id TEXT NOT NULL, course_id TEXT, title TEXT,
+    video_version TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', language TEXT,
+    state TEXT NOT NULL, retryable INTEGER NOT NULL DEFAULT 0, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT, progress TEXT NOT NULL DEFAULT '{}', stages TEXT NOT NULL DEFAULT '{}',
+    provider_id TEXT, reason TEXT, transcript_id INTEGER, hours REAL, priority INTEGER NOT NULL DEFAULT 0,
+    trigger TEXT NOT NULL DEFAULT 'api', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    started_at TEXT, finished_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active ON jobs(asset_id, video_version, model)
+    WHERE state IN ('queued', 'downloading', 'extracting', 'transcribing', 'paused_budget');
+CREATE INDEX IF NOT EXISTS jobs_item ON jobs(item_id);
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
+CREATE TABLE IF NOT EXISTS transcripts (
+    id INTEGER PRIMARY KEY, item_id TEXT NOT NULL, asset_id TEXT NOT NULL, course_id TEXT, title TEXT,
+    video_version TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL, model TEXT, language TEXT,
+    duration_s REAL, chars INTEGER NOT NULL DEFAULT 0, segment_count INTEGER NOT NULL DEFAULT 0,
+    timestamps TEXT NOT NULL DEFAULT 'segment', status TEXT NOT NULL DEFAULT 'ready',
+    preferred INTEGER NOT NULL DEFAULT 0, reason TEXT, job_id INTEGER, cost_usd REAL, path TEXT NOT NULL,
+    created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS transcripts_item ON transcripts(item_id);
+CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY, transcript_id INTEGER NOT NULL, idx INTEGER NOT NULL,
+    start_s REAL NOT NULL, end_s REAL NOT NULL, text TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS segments_transcript ON segments(transcript_id, idx);
+"""
+
 # One script per schema version, applied in order; PRAGMA user_version records how far a file has come. Every
 # statement is safe to repeat (IF NOT EXISTS) and nothing is ever dropped: version 1 of this program set
 # user_version back to 1 at each start, so after a downgrade and a second upgrade the scripts run again.
-MIGRATIONS = [SCHEMA, SCHEMA_V2]
+MIGRATIONS = [SCHEMA, SCHEMA_V2, SCHEMA_V3]
 
 
 @dataclass(frozen=True)

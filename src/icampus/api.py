@@ -11,14 +11,19 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
-from . import files, videos, views
+from types import SimpleNamespace
+
+from . import api_transcripts, files, videos, views
 from .browser import NotLoggedIn, clean_error
 from .cache import CAPS, GB, Cache
 from .config import KST, Settings, parse_tokens
 from .dates import term_year
+from .pipeline import Pipeline
 from .runtime import SPECS, Runtime
 from .store import Store
+from .stt.registry import Registry
 from .sync import DATASETS, Syncer
+from .transcripts import Transcripts
 
 log = logging.getLogger(__name__)
 VERSION = "0.1.0"
@@ -40,7 +45,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     cache = Cache(settings, store)
     video_cache = videos.Videos(settings, cache)
     cache.adopter(lambda: files.adopt(cache, settings, store))
+    registry = Registry(settings, store)
+    transcripts = Transcripts(settings, store, cache)
+    pipeline = Pipeline(settings, store, cache, video_cache, registry, transcripts)
     cache.reconcile()  # adopts downloads made before the index existed; reads the disk only
+    syncer.after_run.append(lambda status: pipeline.after_sync())
     loops: dict[str, asyncio.Task] = {}  # the background loops, by name
 
     def setting_changed(key: str) -> None:
@@ -56,18 +65,25 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         if background:
             loops["scheduler"] = asyncio.create_task(syncer.scheduler())
             loops["upgrade"] = asyncio.create_task(syncer.upgrade_sync())  # at most one sync, after an upgrade
+            loops["pipeline"] = asyncio.create_task(pipeline.run())  # the transcription queue
             if env.kuma_push_url:
                 loops["kuma"] = asyncio.create_task(syncer.kuma_pusher())
+            try:
+                pipeline.after_sync()  # a sync by the CLI or an older version may have seen newer videos
+            except Exception as exc:
+                log.error("could not check transcripts against the synced videos: %s", clean_error(exc))
         yield
         for t in loops.values():
             t.cancel()
         loops.clear()
+        await pipeline.stop()
 
     app = FastAPI(title="SKKU iCampus", version=VERSION, lifespan=lifespan,
                   description="Your iCampus tasks, assignments, announcements, lectures and grades, "
                               "as last synced. Times are Asia/Seoul.")
     app.state.store, app.state.syncer, app.state.videos = store, syncer, video_cache
     app.state.cache, app.state.settings = cache, settings
+    app.state.registry, app.state.transcripts, app.state.pipeline = registry, transcripts, pipeline
 
     def auth(request: Request) -> str:
         if not tokens:
@@ -148,6 +164,8 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
             "running": syncer.running, "next_run": syncer.next_run.isoformat() if syncer.next_run else None,
             "login": {"blocked": store.get_state("login_block"), "credential_logins_24h": len(attempts)},
             "datasets": {d: store.synced_at(d, expected.get(d)) for d in DATASETS},
+            "transcription": {**pipeline.queue_summary(),
+                              "search": "trigram index" if transcripts.fts else "substring scan (no FTS5 trigram)"},
             "runs": store.recent_runs(5),
         }
 
@@ -239,6 +257,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
                  and (not upcoming_only or not deadline(x) or deadline(x) >= now)]
         items.sort(key=lambda x: (x.get("due_at") is None, x.get("due_at") or "", x["course_id"], x.get("week_no") or 0))
         items = views.lecture_status(items, moment, outdated_before(moment))
+        states = pipeline.states()
+        for x in items:
+            if x.get("video"):  # only videos on SKKU's content server can be transcribed
+                state = states.get(x["item_id"]) or {"state": "none"}
+                x["transcript"] = {k: v for k, v in state.items() if v is not None}
         body = envelope(("lectures",), with_course(items), limit)
         if include_attendance:
             body["attendance"] = with_course(store.records("attendance", course_ids=ids))
@@ -405,6 +428,13 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         for key, value in changes.items():
             settings.reset(key) if value is None else settings.set(key, value)
         return {"changed": sorted(changes), "items": [s for s in settings.describe() if s["key"] in changes]}
+
+    ctx = SimpleNamespace(settings=settings, store=store, cache=cache, videos=video_cache, registry=registry,
+                          transcripts=transcripts, pipeline=pipeline, syncer=syncer, api=api, auth=auth, admin=admin,
+                          admins=admins, tokens=tokens, course_ids=course_ids, with_course=with_course,
+                          synced=synced, courses=courses)
+    app.state.ctx = ctx
+    api_transcripts.register(app, ctx)
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])
     async def grades(course: str | None = None) -> dict:

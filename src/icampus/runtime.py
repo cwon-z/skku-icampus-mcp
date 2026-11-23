@@ -67,6 +67,48 @@ register(
          1, 168, unit="h"),
 )
 
+register(
+    Spec("prefetch_limit", "int", "Transcription jobs", "How many jobs may be past the queue at once (downloading, "
+         "extracting, transcribing). It keeps downloads from running far ahead of transcription, so a backlog much "
+         "larger than the video cache still fits.", 1, 10),
+    Spec("keep_video_after_processing", "bool", "Transcription jobs", "Keep a video once its audio is extracted "
+         "(it still leaves when the cache needs the room). Off: delete it right away, unless you pinned it."),
+    Spec("download_retries", "int", "Transcription jobs", "How often a failed video download is tried again, with "
+         "growing pauses. Commons can't resume, so each try starts from zero.", 0, 10),
+    Spec("ffmpeg_threads", "int", "Transcription jobs", "Threads ffmpeg may use. One keeps the container well under "
+         "its memory limit.", 1, 8),
+    Spec("stt_auto_transcribe", "bool", "Transcription jobs", "After each sync, queue new lecture videos of the "
+         "courses below, using automatic routing. Spends from the provider's budget without asking."),
+    Spec("stt_auto_courses", "list", "Transcription jobs", "Course IDs or codes that auto-transcribe covers."),
+    Spec("stt_auto_retranscribe", "bool", "Transcription jobs", "When a sync sees a newer version of a video, queue "
+         "its transcript again instead of only marking it outdated."),
+    Spec("stt_default_provider", "str", "Speech-to-text", "The provider automatic routing uses when no rule "
+         "matches. Empty: the enabled provider with the lowest priority number."),
+    Spec("stt_fallback_order", "list", "Speech-to-text", "Provider ids to try, in order, when the first choice is "
+         "unavailable or fails. Providers not listed come after, by priority."),
+    Spec("stt_routing_rules", "rules", "Speech-to-text", 'Rules such as [{"course": "CSE1001", "provider": "id"}] or '
+         '[{"language": "ko", "provider": "id"}]. The first rule that matches a lecture picks its provider.'),
+    Spec("stt_default_language", "str", "Speech-to-text", "Language given to the provider (ISO 639-1, e.g. ko) when "
+         "a request names none and the course has none. Empty: the provider detects it."),
+    Spec("stt_course_languages", "map", "Speech-to-text", 'Language per course, e.g. {"CSE1001": "en"}. Keys are '
+         "course IDs or codes."),
+    Spec("stt_course_terms", "map", "Speech-to-text", 'Terms to listen for per course, e.g. {"CSE1001": "eigenvalue, '
+         'Krylov"}. Only sent to providers with key terms turned on (ElevenLabs bills them extra).'),
+    Spec("stt_min_timestamps", "enum", "Speech-to-text", "The least a transcript must carry to be accepted: word "
+         "times, segment times, or none (plain text from models that give no timestamps).",
+         choices=("word", "segment", "none")),
+    Spec("stt_chunk_minutes", "int", "Speech-to-text", "Target length of a piece when a provider's upload or "
+         "duration limit forces a lecture to be split. Pieces are cut at silences.", 1, 240, unit="min"),
+    Spec("stt_audio_bitrate_kbps", "int", "Speech-to-text", "Bitrate of the extracted audio (24 kbps Opus is about "
+         "11 MB per hour). A provider's config can set its own.", 8, 256, unit="kbps"),
+    Spec("stt_fail_threshold", "int", "Speech-to-text", "Failures in a row after which a provider is skipped.", 1, 20),
+    Spec("stt_skip_minutes", "int", "Speech-to-text", "How long a failing provider is skipped.", 1, 1440, unit="min"),
+    Spec("stt_monthly_usd_cap", "float", "Budget", "Spending cap for all providers together per budget period. "
+         "0: only each provider's own caps apply.", 0, 100000, unit="USD"),
+    Spec("stt_budget_reset_day", "int", "Budget", "Day of the month a budget period starts, to match a billing "
+         "cycle. A provider's config can set its own.", 1, 31),
+)
+
 # Shown on the settings page, never editable there. (key, what it is, secret)
 ENV_ONLY: list[tuple[str, str, bool]] = [
     ("username", "SKKU login ID", False),

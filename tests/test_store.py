@@ -112,3 +112,29 @@ def test_transactions_are_all_or_nothing(store):
     with store.transaction() as db:
         db.execute("INSERT INTO settings VALUES ('a', '1', 't')")
     assert store.one("SELECT value FROM settings WHERE key='a'")["value"] == "1"
+
+
+def test_one_connection_serves_several_threads_at_once(store):
+    """A plain-function FastAPI dependency runs in a thread pool. Reads from there must not collide with the
+    event loop's on the shared connection (sqlite3 answers "API misuse" when they do)."""
+    import threading
+    store.set_state("k", {"n": 0})
+    store.replace_scope("lectures", "course:1", [rec("a"), rec("b")], T0)
+    errors: list[BaseException] = []
+
+    def work(n: int) -> None:
+        try:
+            for i in range(300):
+                assert store.get_state("k") is not None
+                assert len(store.records("lectures")) == 2
+                assert store.one("SELECT COUNT(*) AS c FROM records")["c"] == 2
+                if i % 50 == 0:
+                    store.set_state(f"thread-{n}", i)
+        except BaseException as exc:  # noqa: BLE001 - whatever it is, the test must see it
+            errors.append(exc)
+    threads = [threading.Thread(target=work, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []

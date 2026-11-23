@@ -216,7 +216,10 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             sessions.flash(session["sid"], tone, message)
         return RedirectResponse(path, status_code=303, headers=HEADERS)
 
-    def signed_in(request: Request) -> dict:
+    async def signed_in(request: Request) -> dict:
+        # async on purpose: FastAPI runs a plain function dependency in a thread pool, and this one reads the
+        # database. Every other reader runs on the event loop; a second thread on the same SQLite connection
+        # fails as soon as a page loads a few files at once.
         session = sessions.get(request.cookies.get(COOKIE))
         if session is None:
             raise _Login()
@@ -232,7 +235,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
 
     async def changing(request: Request) -> dict:
         """For every request that changes something: a session, this origin, and the session's CSRF token."""
-        session = signed_in(request)
+        session = await signed_in(request)
         if not same_origin(request):
             raise _Refused(403, "This request came from another site and was refused.")
         form = await request.form()
@@ -274,7 +277,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
     @app.get("/admin/login", include_in_schema=False)
     async def login_page(request: Request) -> Response:
         try:
-            signed_in(request)
+            await signed_in(request)
             return RedirectResponse("/admin/", status_code=303)
         except _Login:
             pass

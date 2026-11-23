@@ -1,23 +1,63 @@
 {% extends "base.html" %}
+{% from "_ui.html" import mark, theme_control with context %}
 {% block title %}Sign in{% endblock %}
 {% block body %}
-<main class="auth">
-  <section class="nc-card nc-card--pad-lg auth__panel">
-    <div>
-      <h1 class="t-title-2">Sign in</h1>
-      <p class="muted">Paste an admin API token. It is checked once and replaced by a session cookie; the token itself is not kept in the browser.</p>
+<div class="split">
+  <section class="card art" aria-label="About this server">
+    {# The picture is drawn by admin.js in the theme's own colours: a voice, its sound, and the lines it becomes. #}
+    <canvas class="art-layer" data-art aria-hidden="true"></canvas>
+    <svg class="art-layer art-lines" viewBox="0 0 100 100" preserveAspectRatio="none" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true">
+      <line x1="0" y1="31" x2="100" y2="31" vector-effect="non-scaling-stroke"/>
+      <line x1="66" y1="0" x2="66" y2="100" vector-effect="non-scaling-stroke"/>
+      <line x1="0" y1="100" x2="100" y2="-4.5" vector-effect="non-scaling-stroke"/>
+    </svg>
+    <span class="ring-mark" aria-hidden="true"></span>
+    <div class="art-top">
+      <span class="lockup">{{ mark() }}<b>iCampus</b></span>
+      <span class="eyebrow">Collector admin</span>
     </div>
-    {% if error %}<div class="notice notice--danger" role="alert">{{ error }}</div>{% endif %}
-    {% if not configured %}<div class="notice notice--warning">No admin token is configured. Set ICAMPUS_API_TOKENS with a token whose label is in ICAMPUS_ADMIN_LABELS.</div>{% endif %}
-    {% if plain_http %}<div class="notice notice--warning">This page came over plain HTTP, and the session cookie is only sent over HTTPS, so signing in won't stick. Serve it over HTTPS (for example with <span class="mono">tailscale serve</span>), or set <span class="mono">ICAMPUS_ADMIN_COOKIE_SECURE=false</span> on a private address.</div>{% endif %}
-    <form class="stack" method="post" action="/admin/login">
-      <input type="hidden" name="login_token" value="{{ login_token }}">
-      <label class="nc-field">
-        <span class="nc-field__label">Admin token</span>
-        <span class="nc-field__control"><input class="nc-field__input" type="password" name="token" autocomplete="off" autofocus required></span>
-      </label>
-      <div class="row row--end"><button class="nc-btn nc-btn--primary" type="submit">Sign in</button></div>
-    </form>
+    <div class="art-bottom">
+      <div class="ink tag-card">
+        <span class="eyebrow">Lecture transcripts</span>
+        <p class="pixel">Every lecture,<br>word for word.</p>
+      </div>
+      <div class="ink tag-tab" aria-hidden="true">
+        <svg width="60" height="60" viewBox="0 0 20 20" shape-rendering="crispEdges"><path fill="currentColor" d="M7 3h6v1h-6zM6 4h2v5h-2zM12 4h2v5h-2zM4 9h12v8h-12z"/><path class="lit" d="M9 11h2v2h-2zM9 13h2v2h-2z"/></svg>
+      </div>
+    </div>
   </section>
-</main>
+
+  <main class="form-col" aria-labelledby="signin">
+    <form method="post" action="/admin/login">
+      <input type="hidden" name="login_token" value="{{ login_token }}">
+      <div class="form-top">{{ theme_control() }}</div>
+
+      <div class="form-mid">
+        <div class="stack">
+          <p class="eyebrow">Self-hosted · one admin token</p>
+          <h1 id="signin" class="display">Sign in</h1>
+          <p class="form-lede">Paste an admin API token. It is checked once and replaced by a session cookie; the token itself is not kept in the browser.</p>
+        </div>
+        <div class="stack">
+          <div class="field">
+            <label class="label" for="token">Admin token</label>
+            <input id="token" class="uline{% if error %} bad{% endif %}" type="password" name="token" autocomplete="off" autofocus required{% if error %} aria-invalid="true" aria-describedby="signin-error"{% endif %}>
+            <button type="button" class="eye" data-reveal="token" aria-pressed="false" aria-label="Show the token" title="Show or hide"><span class="when-off">{{ icon("eye") }}</span><span class="when-on">{{ icon("eye-off") }}</span></button>
+          </div>
+          {% if error %}<p class="msg" id="signin-error" role="alert">{{ icon("alert-square", 18, 1.8) }}<span>{{ error }}</span></p>{% endif %}
+          {% if not configured %}<div class="notice notice--warning">{{ icon("alert", 18, 1.8) }}<span>No admin token is configured. Set ICAMPUS_API_TOKENS with a token whose label is in ICAMPUS_ADMIN_LABELS.</span></div>{% endif %}
+          {% if plain_http %}<div class="notice notice--warning">{{ icon("alert", 18, 1.8) }}<span>This page came over plain HTTP, and the session cookie is only sent over HTTPS, so signing in won't stick. Serve it over HTTPS (for example with <span class="mono">tailscale serve</span>), or set <span class="mono">ICAMPUS_ADMIN_COOKIE_SECURE=false</span> on a private address.</span></div>{% endif %}
+        </div>
+      </div>
+
+      <div class="form-end">
+        <ul class="badges">
+          <li class="badge"><i aria-hidden="true"></i>Runs on your own server</li>
+          <li class="badge"><i aria-hidden="true"></i>Can't submit coursework</li>
+        </ul>
+        <button class="orb" type="submit"><span>Sign in</span>{{ icon("arrow-right", 18, 1.8) }}</button>
+      </div>
+    </form>
+  </main>
+</div>
 {% endblock %}

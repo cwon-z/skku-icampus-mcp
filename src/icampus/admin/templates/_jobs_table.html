@@ -1,29 +1,29 @@
-{% from "_ui.html" import badge, meter, post with context %}
-<div id="jobs-table" hx-get="/admin/jobs/table{% if state %}?state={{ state }}{% endif %}" hx-trigger="every 4s" hx-swap="outerHTML">
-<div class="nc-table-wrap"><table class="nc-table nc-table--dense">
-  <thead><tr><th class="is-num">Job</th><th>Lecture</th><th>State</th><th>Model</th><th>Progress</th><th>Updated</th><th></th></tr></thead>
+{% from "_ui.html" import badge, bar, post with context %}
+<section class="card sec" id="jobs-table" aria-label="Jobs" hx-get="/admin/jobs/table{% if state %}?state={{ state }}{% endif %}" hx-trigger="every 4s" hx-swap="outerHTML">
+<div class="table-wrap"><table class="tbl">
+  <thead><tr><th class="r">Job</th><th>Lecture</th><th>State</th><th>Model</th><th>Progress</th><th>Updated</th><th><span class="sr">Actions</span></th></tr></thead>
   <tbody>
   {% for j in jobs %}
   <tr>
-    <td class="is-num mono">{{ j.id }}</td>
-    <td class="wrap"><a href="/admin/lecture/{{ j.item_id }}">{{ j.title or j.item_id }}</a><div class="t-caption faint">{{ j.course }} · <span class="mono">{{ j.item_id }}</span>{% if j.hours %} · {{ (j.hours * 60) | round | int }} min{% endif %} · {{ j.trigger }}</div></td>
-    <td>{{ badge(j.state) }}{% if j.state == "failed" %}<div class="t-caption faint">{{ "may pass on a retry" if j.retryable else "needs a change first" }}</div>{% endif %}</td>
-    <td><span class="mono">{{ j.provider or j.model }}</span>{% if j.chosen %}<div class="t-caption faint wrap">{{ j.chosen }}</div>{% endif %}</td>
-    <td class="wrap">
+    <td class="r tight mono faint">{{ j.id }}</td>
+    <td class="wide"><span class="cell"><a class="t1" href="/admin/lecture/{{ j.item_id }}">{{ j.title or j.item_id }}</a><span class="t2">{{ j.course }} · <span class="mono">{{ j.item_id }}</span>{% if j.hours %} · {{ (j.hours * 60) | round | int }} min{% endif %} · {{ j.trigger }}</span></span></td>
+    <td>{{ badge(j.state) }}{% if j.state == "failed" %}<div class="t2">{{ "may pass on a retry" if j.retryable else "needs a change first" }}</div>{% endif %}</td>
+    <td><span class="mono">{{ j.provider or j.model }}</span>{% if j.chosen %}<div class="t2">{{ j.chosen }}</div>{% endif %}</td>
+    <td>
       {% set p = j.progress or {} %}
-      {% if p.stage == "downloading" and p.total_mb %}<div class="meter-cell"><span class="mono">{{ p.downloaded_mb }} / {{ p.total_mb }} MB</span>{{ meter(p.downloaded_mb, p.total_mb, label="Downloaded") }}</div>
-      {% elif p.stage == "extracting" %}<div class="meter-cell"><span class="mono">{{ p.percent or 0 }}%</span>{{ meter(p.percent or 0, 100, label="Extracted") }}</div>
-      {% elif p.stage == "transcribing" and p.pieces %}<div class="meter-cell"><span class="mono">piece {{ p.piece }} of {{ p.pieces }}</span>{{ meter(p.piece - 1, p.pieces, label="Pieces done") }}</div>
-      {% elif p.note %}<span class="t-caption muted">{{ p.note }}</span>{% endif %}
-      {% if j.error %}<div class="t-caption {{ 'muted' if j.state != 'failed' else '' }}">{{ j.error }}</div>{% endif %}
+      {% if p.stage == "downloading" and p.total_mb %}<span class="share"><span class="t2 num">{{ p.downloaded_mb }} / {{ p.total_mb }} MB</span>{{ bar(p.downloaded_mb, p.total_mb, "Downloaded") }}</span>
+      {% elif p.stage == "extracting" %}<span class="share"><span class="t2 num">{{ p.percent or 0 }}%</span>{{ bar(p.percent or 0, 100, "Extracted") }}</span>
+      {% elif p.stage == "transcribing" and p.pieces %}<span class="share"><span class="t2 num">piece {{ p.piece }} of {{ p.pieces }}</span>{{ bar(p.piece - 1, p.pieces, "Pieces done") }}</span>
+      {% elif p.note %}<span class="t2">{{ p.note }}</span>{% endif %}
+      {% if j.error %}<div class="t2{% if j.state == 'failed' %} ok--bad{% endif %}">{{ j.error }}</div>{% endif %}
     </td>
-    <td class="mono nowrap">{{ j.updated_at | when }}</td>
-    <td><div class="table-actions">
-      {% if j.state in ("failed", "canceled") %}{{ post("/admin/jobs/" ~ j.id ~ "/retry", "Retry") }}{% endif %}
-      {% if j.state in ("queued", "downloading", "extracting", "transcribing", "paused_budget") %}{{ post("/admin/jobs/" ~ j.id ~ "/cancel", "Cancel", confirm="Cancel job " ~ j.id ~ "?") }}{% endif %}
+    <td class="when">{{ j.updated_at | when }}</td>
+    <td class="tight"><div class="table-actions">
+      {% if j.state in ("failed", "canceled") %}{{ post("/admin/jobs/" ~ j.id ~ "/retry", "Retry", glyph="refresh") }}{% endif %}
+      {% if j.state in ("queued", "downloading", "extracting", "transcribing", "paused_budget") %}{{ post("/admin/jobs/" ~ j.id ~ "/cancel", "Cancel", "btn btn-ghost btn-sm", confirm="Cancel job " ~ j.id ~ "?") }}{% endif %}
     </div></td>
   </tr>
   {% else %}<tr><td colspan="7" class="empty">No jobs{% if state %} in this state{% endif %}. Queue a course above, or ask for one lecture from its page.</td></tr>{% endfor %}
   </tbody>
 </table></div>
-</div>
+</section>

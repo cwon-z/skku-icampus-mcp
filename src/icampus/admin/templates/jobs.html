@@ -2,48 +2,54 @@
 {% from "_ui.html" import badge, switch with context %}
 {% block title %}Jobs{% endblock %}
 {% block content %}
-<header class="page-head">
-  <div><h1 class="t-title-2">Jobs</h1><p>The transcription queue. Jobs run a few at a time: download, extract the audio, transcribe. The list refreshes by itself.</p></div>
-  <div class="row">{% for s, n in (("queued", queue.queued), ("paused_budget", queue.paused_budget), ("failed", queue.failed), ("done", queue.done)) %}{{ badge(s, s ~ " " ~ n) }}{% endfor %}</div>
+{% set running = queue.queued + queue.downloading + queue.extracting + queue.transcribing %}
+{% set total = running + queue.paused_budget + queue.done + queue.failed + queue.canceled %}
+<header class="top">
+  <div class="top-text">
+    <p class="eyebrow">{{ running }} in the queue · {{ queue.waiting_hours }} h of audio waiting</p>
+    <h1 class="h1">Jobs</h1>
+  </div>
 </header>
-{% if not queue.ffmpeg %}<div class="notice notice--warning">ffmpeg is not installed on this server, so no audio can be extracted. The Docker image includes it.</div>{% endif %}
+<p class="intro">The transcription queue. Jobs run a few at a time: download, extract the audio, transcribe. The list refreshes by itself.</p>
+{% if not queue.ffmpeg %}<div class="notice notice--warning">{{ icon("alert", 18, 1.8) }}<span>ffmpeg is not installed on this server, so no audio can be extracted. The Docker image includes it.</span></div>{% endif %}
 
-<section class="nc-card nc-card--pad-lg">
-  <div class="nc-card__header"><div class="nc-card__titles"><h2 class="t-title-3">Queue a course</h2><p class="nc-card__subtitle">The first step only shows what would happen. Nothing is downloaded or sent until you confirm.</p></div></div>
+<section class="card sec" id="queue" aria-labelledby="h-queue">
+  <div class="stack stack--sm"><h2 class="h2" id="h-queue">Queue a course</h2><p class="intro">The first step only shows what would happen. Nothing is downloaded or sent until you confirm.</p></div>
   <form class="stack" method="post" action="/admin/jobs/queue">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <div class="form-grid">
-      <label class="nc-field nc-select"><span class="nc-field__label">Course</span><span class="nc-field__control"><select class="nc-field__input" name="course"><option value="">Every course</option>{% for c in courses %}<option value="{{ c.id }}"{% if asked.course == c.id %} selected{% endif %}>{{ c.name }}{% if c.code %} ({{ c.code }}){% endif %}</option>{% endfor %}</select></span></label>
-      <label class="nc-field"><span class="nc-field__label">Week</span><span class="nc-field__control"><input class="nc-field__input" type="number" min="0" name="week" value="{{ asked.week or '' }}" placeholder="every week"></span></label>
-      <label class="nc-field nc-select"><span class="nc-field__label">Model</span><span class="nc-field__control"><select class="nc-field__input" name="model"><option value="">Automatic routing</option>{% for i in providers %}<option value="{{ i }}"{% if asked.model == i %} selected{% endif %}>{{ i }}</option>{% endfor %}</select></span></label>
-      {{ switch("only_missing", "Only lectures without a current transcript", asked.only_missing if asked else True) }}
+    <div class="filters">
+      <span class="ctl"><span class="ctl-label">Course</span><select name="course" aria-label="Course"><option value="">Every course</option>{% for c in courses %}<option value="{{ c.id }}"{% if asked.course == c.id %} selected{% endif %}>{{ c.name }}{% if c.code %} ({{ c.code }}){% endif %}</option>{% endfor %}</select>{{ icon("chevron", 16, 1.8) }}</span>
+      <span class="ctl ctl--narrow"><span class="ctl-label">Week</span><input type="number" min="0" name="week" value="{{ asked.week or '' }}" placeholder="every" aria-label="Week"></span>
+      <span class="ctl"><span class="ctl-label">Model</span><select name="model" aria-label="Model"><option value="">Automatic routing</option>{% for i in providers %}<option value="{{ i }}"{% if asked.model == i %} selected{% endif %}>{{ i }}</option>{% endfor %}</select>{{ icon("chevron", 16, 1.8) }}</span>
+      <button class="btn btn-secondary" type="submit">{{ "Show the plan again" if plan else "Show the plan" }}</button>
     </div>
+    {{ switch("only_missing", "Only lectures without a current transcript", asked.only_missing if asked else True) }}
     {% if plan %}
-    <div class="notice{% if not plan.count %} notice--warning{% endif %}">
-      <p>{% if plan.count %}<strong>{{ plan.count }} lecture(s), {{ plan.hours }} h of audio</strong>, about {{ plan.download_gb }} GB to download.{% if plan.unknown_duration %} {{ plan.unknown_duration }} have no known length.{% endif %}{% else %}Nothing to queue with these choices.{% endif %}</p>
-      {% if plan.skipped %}<p>Left out: {% for why, n in plan.skipped.items() %}{{ n }} {{ why }}{{ ", " if not loop.last }}{% endfor %}.</p>{% endif %}
-      {% if plan.automatic_would_use %}<p>Automatic routing would start with <span class="mono">{{ plan.automatic_would_use }}</span>.</p>{% endif %}
+    <div class="ink pad stack" role="status">
+      <h3 class="eyebrow">The plan · nothing has started</h3>
+      <div class="stack stack--sm">
+        <p class="lede">{% if plan.count %}<strong>{{ plan.count }} lecture(s), {{ plan.hours }} h of audio</strong>, about {{ plan.download_gb }} GB to download.{% if plan.unknown_duration %} {{ plan.unknown_duration }} have no known length.{% endif %}{% else %}Nothing to queue with these choices.{% endif %}</p>
+        {% if plan.skipped %}<p class="sub">Left out: {% for why, n in plan.skipped.items() %}{{ n }} {{ why }}{{ ", " if not loop.last }}{% endfor %}.</p>{% endif %}
+        {% if plan.automatic_would_use %}<p class="sub">Automatic routing would start with <span class="mono">{{ plan.automatic_would_use }}</span>.</p>{% endif %}
+      </div>
+      {% if plan.count %}
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>Model</th><th>Ready</th><th class="r">Cost for these</th><th class="r">Cap left</th><th class="r">Would wait for the next period</th></tr></thead>
+        <tbody>{% for m in plan.models %}<tr><td class="mono">{{ m.id }}</td><td>{% if m.ready %}{{ badge("ok", "ready") }}{% else %}{{ badge("failed", "no") }} <span class="t2">{{ m.not_ready }}</span>{% endif %}</td><td class="r">${{ "%.2f" | format(m.cost_usd) }}</td><td class="r">{{ m.cap_left_hours ~ " h" if m.cap_left_hours is not none else "no cap" }}</td><td class="r">{{ m.hours_that_would_wait }} h</td></tr>{% endfor %}</tbody>
+      </table></div>
+      <details class="fold"><summary>The lectures ({{ plan["items"] | length }}{% if plan.count > plan["items"] | length %} of {{ plan.count }} shown{% endif %})</summary>
+        <div class="table-wrap"><table class="tbl"><tbody>{% for i in plan["items"] %}<tr><td class="mono tight">{{ i.item_id }}</td><td>{{ i.title }}</td><td class="t2">{{ i.course }}</td><td class="r">{{ i.minutes or "?" }} min</td></tr>{% endfor %}</tbody></table></div>
+      </details>
+      <div class="row row--end"><button class="btn btn-paper" type="submit" name="confirm" value="1">Queue {{ plan.count }} lecture(s){{ icon("arrow-right", 18, 1.8) }}</button></div>
+      {% endif %}
     </div>
-    {% if plan.count %}
-    <div class="nc-table-wrap"><table class="nc-table nc-table--dense">
-      <thead><tr><th>Model</th><th>Ready</th><th class="is-num">Cost for these</th><th class="is-num">Cap left</th><th class="is-num">Would wait for the next period</th></tr></thead>
-      <tbody>{% for m in plan.models %}<tr><td class="mono">{{ m.id }}</td><td>{% if m.ready %}{{ badge("ok", "ready") }}{% else %}{{ badge("failed", "no") }} <span class="t-caption faint">{{ m.not_ready }}</span>{% endif %}</td><td class="is-num mono">${{ "%.2f" | format(m.cost_usd) }}</td><td class="is-num mono">{{ m.cap_left_hours ~ " h" if m.cap_left_hours is not none else "no cap" }}</td><td class="is-num mono">{{ m.hours_that_would_wait }} h</td></tr>{% endfor %}</tbody>
-    </table></div>
-    <details><summary class="muted">The lectures ({{ plan["items"] | length }}{% if plan.count > plan["items"] | length %} of {{ plan.count }} shown{% endif %})</summary>
-      <div class="nc-table-wrap"><table class="nc-table nc-table--dense"><tbody>{% for i in plan["items"] %}<tr><td class="mono">{{ i.item_id }}</td><td>{{ i.title }}</td><td class="muted">{{ i.course }}</td><td class="is-num mono">{{ i.minutes or "?" }} min</td></tr>{% endfor %}</tbody></table></div>
-    </details>
     {% endif %}
-    {% endif %}
-    <div class="row row--end">
-      <button class="nc-btn nc-btn--secondary" type="submit">{{ "Show the plan again" if plan else "Show the plan" }}</button>
-      {% if plan and plan.count %}<button class="nc-btn nc-btn--primary" type="submit" name="confirm" value="1">Queue {{ plan.count }} lecture(s)</button>{% endif %}
-    </div>
   </form>
 </section>
 
-<nav class="nc-tabs" aria-label="Filter by state">
-  {% for value, label in (("", "All"), ("active", "Active"), ("paused_budget", "Paused for budget"), ("failed", "Failed"), ("done", "Done")) %}
-  <a class="nc-tabs__tab" href="/admin/jobs{% if value %}?state={{ value }}{% endif %}" aria-selected="{{ 'true' if state == value else 'false' }}">{{ label }}</a>
+<nav class="tabs" aria-label="Filter by state">
+  {% for value, label, n in (("", "All", total), ("active", "Active", running + queue.paused_budget), ("paused_budget", "Paused for budget", queue.paused_budget), ("failed", "Failed", queue.failed), ("done", "Done", queue.done)) %}
+  <a{% if state == value %} class="on" aria-current="true"{% endif %} href="/admin/jobs{% if value %}?state={{ value }}{% endif %}">{{ label }} <span class="count">{{ n }}</span></a>
   {% endfor %}
 </nav>
 {% include "_jobs_table.html" %}

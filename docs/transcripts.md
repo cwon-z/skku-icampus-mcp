@@ -152,17 +152,22 @@ Served by the API at `/admin`, because that service owns the data and the settin
 - **Rendering.** Jinja2 with autoescape; lecture titles, file names, transcripts and provider error messages are
   other people's text and are only ever inserted as text. The Content-Security-Policy allows no inline script or
   style and no other origin, so the pages have none: htmx (vendored, 2.0.11, eval off), one small `admin.js`, one
-  `theme.css`, and the two font files, all served from the package. Attachments are sent as downloads with
+  `theme.css`, the icons as inline SVG (`admin/icons.py`) and three font files, all served from the package. Attachments are sent as downloads with
   `nosniff` and a sandbox policy, never rendered.
 - **Pages.** Overview, Settings (generated from the registry in `runtime.py`), STT models (providers, keys,
   test, routing), Jobs (the queue, refreshed by an htmx poll; queue a course as plan → confirm), Cache (one table
   over every kind) and a page per lecture with the player beside the transcript. They read the database, the
   cache index and the disk. The buttons that say so (download, re-download, transcribe) start what an export or
   a transcription request starts; nothing in the UI reaches canvas or learningx.
-- **Design.** The Nocturne design system: its tokens are the custom properties at the top of `theme.css` (dark
-  on `:root`, light by OS setting or `data-theme`), followed by its own component classes (`nc-*`) as shipped,
-  followed by this UI's layout rules, which use tokens only. Usage shares are Nocturne meters (rows of pips), so
-  no element needs an inline style.
+- **Design.** A monochrome system with one accent: paper canvas, white cards, one ink (black) card per page
+  for the figures that matter, cobalt for marks only, red only for what needs attention, Geist for text, Geist
+  Mono for labels and Galmuri11 pixel numerals for counts. `theme.css` has three sections: the tokens (every
+  colour, shadow, radius and font as a custom property; each colour once, as `light-dark(light, dark)`, so the
+  theme follows the system or the `data-theme` the sidebar control sets), the components, and the layout. The
+  last two use tokens only, which a test checks. Shares are rows of squares or `<progress>` bars and the sign-in
+  picture is drawn on a canvas by `admin.js` in the theme's colours, so no element needs an inline style and no
+  image is loaded. States are tags in words: solid for what is happening now, outlined for what wants a look,
+  red for what needs you. Rows keep their common actions visible and put the rest in a "more" menu.
 - **Reaching it from outside the tailnet (not built).** The API should stay private. The route that already
   exists for videos would carry the UI too: the MCP host is the one thing behind Cloudflare Access, and it could
   proxy `/admin/*` to the API the way `mcp_server.video_file` proxies `/videos/<id>`. Three things would have to

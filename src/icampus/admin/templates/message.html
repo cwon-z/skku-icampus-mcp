@@ -1,11 +1,15 @@
 {% extends "base.html" %}
+{% from "_ui.html" import mark with context %}
 {% block title %}{{ title }}{% endblock %}
 {% block body %}
-<main class="auth">
-  <section class="nc-card nc-card--pad-lg auth__panel">
-    <h1 class="t-title-2">{{ title }}</h1>
-    <p class="muted">{{ message }}</p>
-    <div class="row"><a class="nc-btn nc-btn--secondary" href="/admin/">Back to the overview</a></div>
+<main class="solo">
+  <section class="card">
+    <span class="lockup">{{ mark() }}<b>iCampus</b></span>
+    <div class="stack stack--sm">
+      <h1 class="h1 h1--long">{{ title }}</h1>
+      <p class="muted">{{ message }}</p>
+    </div>
+    <div class="row"><a class="btn btn-secondary" href="/admin/">Back to the overview{{ icon("arrow-right", 18, 1.8) }}</a></div>
   </section>
 </main>
 {% endblock %}

@@ -7,7 +7,8 @@ opens, and no watch progress or attendance is recorded (see docs/icampus-notes.m
 address with a query string, which is never stored or logged.
 
 Downloads run one at a time in the background. A finished video is reused until a sync sees a new version of it.
-Once the cache passes ICAMPUS_VIDEO_CACHE_GB, the videos used least recently are deleted first.
+The cache manager (cache.py) indexes the files and makes room: once the videos pass video_cache_gb, the ones used
+least recently are deleted first, except those you pinned and those a transcription job still needs.
 """
 
 import asyncio
@@ -24,6 +25,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .cache import Cache, CacheFull
 from .config import CANVAS, KST, Settings
 from .store import Store
 
@@ -36,7 +38,12 @@ _UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
 class VideoError(Exception):
-    """A message safe to show: no URLs with queries, no tokens."""
+    """A message safe to show: no URLs with queries, no tokens. `transient` marks a failure that may pass by
+    itself (the network, a full cache), so a queued job tries again later."""
+
+    def __init__(self, message: str, *, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
 
 def find(store: Store, item_id: str) -> dict | None:
@@ -64,33 +71,56 @@ class Job:
     total: int | None = None
     done: int = 0
     error: str | None = None
+    transient: bool = False  # the failure may pass by itself (network, full cache)
     task: asyncio.Task | None = field(default=None, repr=False)
 
 
 class Videos:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, settings: Settings, cache: Cache, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
+        self.cache = cache
         self.dir = settings.data_dir / "videos"
         for leftover in self.dir.glob("*.part"):  # a download cut short by a restart (the folder comes with the first)
             leftover.unlink(missing_ok=True)
         self.jobs: dict[str, Job] = {}
         self._one_at_a_time = asyncio.Lock()
         self._transport = transport
+        cache.adopter(self.adopt)
 
     # --- the cache ---------------------------------------------------------
 
     def _meta_path(self, asset_id: str) -> Path:
         return self.dir / f"{asset_id}.json"
 
+    def adopt(self) -> None:
+        """Indexes videos that are on disk with their sidecar but without a row: downloads from before the cache
+        manager, or all of them after the index was lost. Nothing is downloaded again."""
+        for path in self.dir.glob("*.json"):
+            if self.cache.get("video", path.stem) is not None:
+                continue
+            try:
+                meta = json.loads(path.read_text())
+                file = self.dir / meta["file"]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if file.is_file() and file.parent == self.dir:
+                self._index(path.stem, meta, file, last_used=meta.get("last_used"))
+
+    def _index(self, asset_id: str, meta: dict, file: Path, last_used: str | None = None) -> None:
+        self.cache.put("video", asset_id, [file, self._meta_path(asset_id)], course_id=meta.get("course_id"),
+                       item_id=meta.get("item_id"), title=meta.get("title"),
+                       meta={k: v for k, v in meta.items() if k != "last_used"},
+                       created_at=meta.get("downloaded_at"), last_used=last_used)
+
     def meta(self, asset_id: str) -> dict | None:
         """The finished download's record, if its file is still there."""
-        try:
-            meta = json.loads(self._meta_path(asset_id).read_text())
-        except (OSError, ValueError):
+        entry = self.cache.get("video", asset_id)
+        if entry is None:
             return None
-        return meta if (self.dir / meta.get("file", "")).is_file() else None
+        return {**entry.meta, "last_used": entry.last_used, "pinned": entry.pinned}
 
     def _write_meta(self, asset_id: str, meta: dict) -> None:
+        """The sidecar beside the file: what an older version reads, and what the index is rebuilt from."""
         tmp = self._meta_path(asset_id).with_suffix(".json.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -98,43 +128,33 @@ class Videos:
         os.replace(tmp, self._meta_path(asset_id))
 
     def cached(self) -> list[dict]:
-        out = []
-        for path in self.dir.glob("*.json"):
-            if (meta := self.meta(path.stem)) is not None:
-                out.append(meta)
-        return sorted(out, key=lambda m: m.get("last_used") or "", reverse=True)
+        """Most recently used first."""
+        return [{**e.meta, "last_used": e.last_used, "pinned": e.pinned} for e in self.cache.entries("video")]
 
     def used_bytes(self) -> int:
-        return sum(m.get("size") or 0 for m in self.cached())
+        return self.cache.used("video")
 
     def path(self, asset_id: str) -> Path | None:
-        meta = self.meta(asset_id)
-        return self.dir / meta["file"] if meta else None
+        entry = self.cache.get("video", asset_id)
+        return self.cache.path(entry) if entry else None
 
     def touch(self, asset_id: str) -> None:
-        if (meta := self.meta(asset_id)) is not None:
-            self._write_meta(asset_id, {**meta, "last_used": datetime.now(KST).isoformat()})
+        self.cache.touch("video", asset_id)
 
     def delete(self, asset_id: str) -> bool:
-        meta = self.meta(asset_id)
-        self._meta_path(asset_id).unlink(missing_ok=True)  # first, so a half-deleted entry never looks finished
-        if meta:
-            (self.dir / meta["file"]).unlink(missing_ok=True)
-        return meta is not None
+        return self.cache.delete("video", asset_id)
 
     def _make_room(self, needed: int, keep: str) -> None:
         cap = int(self.settings.video_cache_gb * 2**30)
         if needed > cap:
             raise VideoError(f"the video ({needed / 2**30:.1f} GB) is bigger than the whole video cache "
                              f"({self.settings.video_cache_gb:g} GB, ICAMPUS_VIDEO_CACHE_GB)")
-        for old in sorted(self.cached(), key=lambda m: m.get("last_used") or ""):
-            if self.used_bytes() + needed <= cap:
-                break
-            if old["asset_id"] != keep:
-                log.info("video cache full: removing %s", old["asset_id"])
-                self.delete(old["asset_id"])
+        try:
+            self.cache.make_room("video", needed, keep={("video", keep)})
+        except CacheFull as exc:  # what is left is pinned or waiting for a transcription: room comes back later
+            raise VideoError(str(exc), transient=True) from None
         if shutil.disk_usage(self.dir).free < needed + DISK_MARGIN:
-            raise VideoError("not enough free disk space for this video")
+            raise VideoError("not enough free disk space for this video", transient=True)
 
     # --- status ----------------------------------------------------------
 
@@ -163,15 +183,35 @@ class Videos:
 
     # --- downloading -------------------------------------------------------
 
-    def start(self, lecture: dict) -> dict:
-        """Starts a download unless the video is cached and current, or already on its way."""
+    def start(self, lecture: dict, refresh: bool = False) -> dict:
+        """Starts a download unless the video is cached and current, or already on its way. With refresh, a
+        current copy is downloaded again; it stays (with its pin) until the new one has arrived."""
         status = self.status(lecture)
-        if status["state"] in ("ready", "queued", "downloading"):
+        if status["state"] in ("queued", "downloading") or (status["state"] == "ready" and not refresh):
             return status
         asset_id = lecture["video"]["asset_id"]
         job = self.jobs[asset_id] = Job("queued")
         job.task = asyncio.get_running_loop().create_task(self._run(lecture, job))
         return self.status(lecture)
+
+    async def ensure(self, lecture: dict) -> Path:
+        """The video's file, downloading it first unless a current copy is cached. Shares the one-at-a-time lock
+        and the job record with exports, so /videos/{item_id} shows the progress. Raises VideoError."""
+        asset_id = lecture["video"]["asset_id"]
+        if self.start(lecture)["state"] != "ready":
+            job = self.jobs.get(asset_id)
+            if job and job.task:
+                await asyncio.shield(job.task)
+            status = self.status(lecture)
+            if status["state"] != "ready":
+                job = self.jobs.get(asset_id)
+                raise VideoError(status.get("error") or status.get("last_error") or "the download did not finish",
+                                 transient=bool(job and job.transient))
+        self.touch(asset_id)
+        path = self.path(asset_id)
+        if path is None:
+            raise VideoError("the video left the cache right after its download", transient=True)
+        return path
 
     async def _run(self, lecture: dict, job: Job) -> None:
         asset_id = lecture["video"]["asset_id"]
@@ -182,11 +222,12 @@ class Videos:
                     await self._download(lecture, job)
             del self.jobs[asset_id]
         except VideoError as exc:
-            job.state, job.error = "failed", str(exc)
+            job.state, job.error, job.transient = "failed", str(exc), exc.transient
         except TimeoutError:
             job.state, job.error = "failed", f"the download took longer than {MAX_DOWNLOAD_S // 3600} hours"
+            job.transient = True
         except httpx.HTTPError as exc:  # the message can hold the redirect URL: keep only the type
-            job.state, job.error = "failed", f"lcms.skku.edu: {type(exc).__name__}"
+            job.state, job.error, job.transient = "failed", f"lcms.skku.edu: {type(exc).__name__}", True
         except Exception as exc:
             log.warning("video %s: %s", asset_id, type(exc).__name__)
             job.state, job.error = "failed", type(exc).__name__
@@ -233,7 +274,8 @@ class Videos:
                 if not _host_ok(str(r.url)):
                     raise VideoError("the download was redirected away from SKKU; stopped")
                 if r.status_code != 200:
-                    raise VideoError(f"Commons refused the download (HTTP {r.status_code})")
+                    raise VideoError(f"Commons refused the download (HTTP {r.status_code})",
+                                     transient=r.status_code >= 500 or r.status_code == 429)
                 if "text/html" in (r.headers.get("content-type") or ""):
                     raise VideoError("Commons sent a web page instead of the video")
                 job.total = int(r.headers.get("content-length") or 0) or expected or None
@@ -252,7 +294,7 @@ class Videos:
                             raise VideoError(f"the video is over {self.settings.video_max_gb:g} GB; stopped")
                 length = r.headers.get("content-length")
             if length and int(length) != job.done:
-                raise VideoError("the download was cut short; try again")
+                raise VideoError("the download was cut short; try again", transient=True)
         mp4 = head[4:8] == b"ftyp"
         described = str(info.get("extension") or "").lower()
         ext = ".mp4" if mp4 else (f".{described}" if re.fullmatch(r"[a-z0-9]{1,8}", described)
@@ -261,7 +303,7 @@ class Videos:
         previous = self.meta(asset_id)  # an outdated copy being replaced
         os.replace(part, final)
         now = datetime.now(KST).isoformat()
-        self._write_meta(asset_id, {
+        meta = {
             "asset_id": asset_id, "file": final.name, "size": job.done, "item_id": lecture.get("item_id"),
             "course_id": lecture.get("course_id"), "title": lecture.get("title"),
             "name": _safe_name(lecture.get("title"), asset_id) + ext,
@@ -269,7 +311,9 @@ class Videos:
             "content_type": "video/mp4" if mp4 else "application/octet-stream",
             "duration_s": info.get("duration"), "captions": info.get("exists_caption"),
             "script": info.get("exists_script"), "synced_updated_at": video.get("updated_at"),
-            "downloaded_at": now, "last_used": now})
+            "downloaded_at": now, "last_used": now}
+        self._write_meta(asset_id, meta)
+        self._index(asset_id, meta, final)
         if previous and previous["file"] != final.name:
             (self.dir / previous["file"]).unlink(missing_ok=True)
         log.info("video %s downloaded (%.0f MB)", asset_id, job.done / 2**20)

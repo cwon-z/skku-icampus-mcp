@@ -102,3 +102,92 @@ async def test_scheduler_skips_slot_already_run_before_restart(tmp_path, monkeyp
     except asyncio.CancelledError:
         pass
     assert syncer.next_run.date() == datetime(2026, 9, 27).date()  # tomorrow's 07:30, not today's again
+
+
+async def test_one_sync_after_an_upgrade_respects_the_cooldown_and_the_login_guard(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import timedelta
+
+    import icampus.sync as sync_mod
+    store = Store(tmp_path / "t.db")
+    syncer = Syncer(Settings(data_dir=tmp_path, manual_cooldown_min=10, _env_file=None), store)
+    assert not syncer.needs_upgrade_sync()  # a new database: the first sync writes the current shape anyway
+    store.replace_scope("lectures", "course:1001", [], datetime.now(KST))  # rows from an older version
+    assert syncer.needs_upgrade_sync()
+
+    runs = []
+
+    async def fake_run(trigger, *, retry_login=False):
+        runs.append(trigger)
+        store.set_state("collect_version", sync_mod.COLLECT_VERSION)
+        return 1
+    monkeypatch.setattr(syncer, "run", fake_run)
+
+    store.set_state("login_block", {"reason": "password rejected", "at": "x"})
+    await syncer.upgrade_sync()
+    assert runs == [] and syncer.needs_upgrade_sync()  # blocked logins stay blocked
+
+    store.set_state("login_block", None)
+    store.set_state("last_manual_at", (datetime.now(KST) - timedelta(minutes=9)).isoformat())  # synced by hand 9 min ago
+    waits = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+        store.set_state("last_manual_at", None)  # the cooldown passes
+        await real_sleep(0)
+    monkeypatch.setattr(sync_mod.asyncio, "sleep", fake_sleep)
+    await syncer.upgrade_sync()
+    assert runs == ["upgrade"] and 0 < waits[0] <= 61 and not syncer.needs_upgrade_sync()
+    await syncer.upgrade_sync()
+    assert runs == ["upgrade"]  # once is enough
+
+
+def test_changing_the_sync_times_never_cancels_a_sync_that_is_running(tmp_path):
+    """The schedule loop is started over for new times, but not in the middle of a run: cancelling the loop then
+    would cancel the sync it is awaiting. It is done when the run has ended."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from icampus.api import create_app
+    token = "a" * 20
+    app = create_app(Settings(api_tokens=f"admin:{token}", data_dir=tmp_path, sync_times="", _env_file=None),
+                     store=Store(tmp_path / "t.db"), background=True)
+    syncer = app.state.syncer
+    with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {token}"
+        assert syncer.next_run is None  # no schedule yet
+        syncer.running = True  # a sync is in the middle of its run
+        assert c.put("/api/v1/settings", json={"sync_times": "06:00"}).status_code == 200
+        time.sleep(0.05)
+        assert syncer.next_run is None  # the loop was left alone
+        syncer.running = False  # the run ends, and says so the way Syncer.run does
+        c.portal.call(lambda: [callback() for callback in syncer.when_idle])
+        for _ in range(50):
+            if syncer.next_run is not None:
+                break
+            time.sleep(0.02)
+        assert syncer.next_run is not None and abs(syncer.next_run.hour * 60 + syncer.next_run.minute - 360) <= 10
+        first = syncer.next_run
+        assert c.put("/api/v1/settings", json={"sync_times": "18:00"}).status_code == 200  # idle: applies at once
+        for _ in range(50):
+            if syncer.next_run != first:
+                break
+            time.sleep(0.02)
+        assert abs(syncer.next_run.hour * 60 + syncer.next_run.minute - 18 * 60) <= 10
+
+
+async def test_a_run_tells_its_listeners_when_it_is_over_whatever_happened(tmp_path, monkeypatch):
+    import fcntl
+
+    import icampus.sync as sync_mod
+    monkeypatch.setattr(sync_mod, "LOCK_WAIT_S", 0)
+    syncer = Syncer(Settings(data_dir=tmp_path, _env_file=None), Store(tmp_path / "t.db"))
+    seen = []
+    syncer.when_idle.append(lambda: seen.append(syncer.running))
+    syncer.when_idle.append(lambda: 1 / 0)  # a listener that fails must not break the run
+    held = open(tmp_path / "sync.lock", "w")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    await syncer.run("manual")  # skipped: another sync holds the lock
+    assert seen == [False]

@@ -5,6 +5,18 @@ import logging
 from .config import Settings
 
 
+def export_dotenv(path: str = ".env") -> None:
+    """A local run keeps provider keys (ELEVENLABS_API_KEY=...) in .env beside the ICAMPUS_* settings, but only
+    those are read from the file by the settings. Put the other variables into this process's environment, where
+    a provider's config looks its key up. Docker passes them itself; what is already set wins."""
+    import os
+
+    from dotenv import dotenv_values
+    for name, value in dotenv_values(path).items():
+        if value and not name.startswith("ICAMPUS_") and name not in os.environ:
+            os.environ[name] = value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="icampus", description="SKKU iCampus collector")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -35,6 +47,7 @@ def main() -> None:
         import uvicorn
 
         from .api import create_app
+        export_dotenv()
         uvicorn.run(create_app(settings), host=settings.host, port=settings.port,
                     log_level=settings.log_level.lower())
     elif args.cmd == "sync":

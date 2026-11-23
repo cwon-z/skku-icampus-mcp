@@ -6,6 +6,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 KST = ZoneInfo("Asia/Seoul")
 CANVAS = "https://canvas.skku.edu"
+# What a child process (ffmpeg, the attachment reader) gets from this process's environment: enough to run, and
+# none of the secrets that live there (the SKKU login, API tokens, speech-to-text keys under any name).
+_CHILD_ENV = {"PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TMP", "TEMP", "LD_LIBRARY_PATH", "PYTHONPATH",
+              "PYTHONHOME", "VIRTUAL_ENV", "SYSTEMROOT"}
+
+
+def child_env() -> dict[str, str]:
+    import os
+    return {k: v for k, v in os.environ.items() if k in _CHILD_ENV or k.startswith("LC_")}
 
 
 def parse_tokens(raw: str) -> dict[str, str]:
@@ -51,8 +60,46 @@ class Settings(BaseSettings):
     # Lecture videos kept in var/videos; the least recently used go first once the total passes the cap.
     video_cache_gb: float = 30
     video_max_gb: float = 4  # bigger videos aren't downloaded
+    # The other kinds of file under var/ (cache.py). Each kind has a cap; cache_total_gb caps them all together.
+    attachment_cache_gb: float = 2
+    attachment_reuse_hours: int = 12  # a download whose version iCampus didn't give is reused this long
+    attachment_max_mb: int = 30  # bigger attachments aren't downloaded
+    audio_cache_gb: float = 5
+    frames_cache_gb: float = 5
+    cache_total_gb: float = 40
+
+    # Transcription (pipeline.py, stt/). Providers themselves live in the database; these are the defaults around them.
+    prefetch_limit: int = 2  # jobs past "queued" at a time, so downloads never run far ahead of transcription
+    keep_video_after_processing: bool = True  # False: delete a video once its audio is extracted
+    download_retries: int = 3
+    ffmpeg_threads: int = 1
+    stt_default_provider: str = ""  # a provider id; empty = the enabled provider with the lowest priority number
+    stt_fallback_order: list[str] = []
+    stt_routing_rules: list[dict] = []  # [{"course": "CSE1001", "language": "ko", "provider": "<id>"}], first match wins
+    stt_default_language: str = ""  # ISO 639-1; empty = let the provider detect it
+    stt_course_languages: dict[str, str] = {}  # course id or code -> language
+    stt_course_terms: dict[str, str] = {}  # course id or code -> "term, term, ...", for providers with keyterms on
+    stt_min_timestamps: str = "segment"  # word, segment or none: the least a transcript must carry to be accepted
+    stt_chunk_minutes: int = 20  # target length of a piece when a provider's limits force a split
+    stt_audio_bitrate_kbps: int = 24
+    stt_fail_threshold: int = 3  # failures in a row before a provider is skipped
+    stt_skip_minutes: int = 15
+    stt_auto_transcribe: bool = False  # after each sync, queue new Commons-hosted lectures of stt_auto_courses
+    stt_auto_courses: list[str] = []
+    stt_auto_retranscribe: bool = False  # queue a transcript again when a sync sees a newer video
+    stt_monthly_usd_cap: float = 0  # all providers together; 0 = no cap beyond each provider's own
+    stt_budget_reset_day: int = 1  # day of the month a budget period starts (a provider's config can set its own)
+    # First boot only, while no provider is registered: a JSON file, or JSON inline, with a list of provider configs
+    # (docs/stt-providers.md). Never a place for keys: a config names the environment variable that holds its key.
+    stt_seed_file: Path | None = None
+    stt_seed: str = ""
     kuma_push_url: str = ""
     log_level: str = "INFO"
+
+    # The admin UI at /admin (admin/). It is served where the API is, so keep the API on a private address.
+    admin_ui: bool = True
+    admin_cookie_secure: bool = True  # False only to use it over plain HTTP on a private (tailnet) address
+    admin_session_hours: int = 12
 
     @property
     def db_path(self) -> Path:

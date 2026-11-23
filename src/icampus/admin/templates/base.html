@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "selfRequestsOnly": true}'>
+<title>{% block title %}{% endblock %} · iCampus admin</title>
+<link rel="stylesheet" href="/admin/static/theme.css">
+<script src="/admin/static/admin.js"></script>
+<script src="/admin/static/htmx.min.js" defer></script>
+</head>
+<body hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'>
+{% block body %}
+<div class="shell">
+  <aside class="sidebar">
+    <div class="sidebar__brand">
+      <span class="t-title-3">iCampus</span>
+      <span class="t-caption faint">Collector admin</span>
+    </div>
+    <nav class="nc-nav-section" aria-label="Pages">
+      <div class="nc-nav-section__items">
+        {% for key, href, label in nav %}
+        <a class="nc-nav-item nc-nav-item--accent{% if page == key %} is-active{% endif %}" href="{{ href }}"{% if page == key %} aria-current="page"{% endif %}><span class="nc-nav-item__label">{{ label }}</span></a>
+        {% endfor %}
+      </div>
+    </nav>
+    <div class="sidebar__foot">
+      <span class="t-caption faint">Signed in with the <span class="mono">{{ session.label }}</span> token</span>
+      <div class="row">
+        <button class="nc-btn nc-btn--ghost nc-btn--sm" type="button" data-theme-toggle>Light / dark</button>
+        <form class="inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="nc-btn nc-btn--secondary nc-btn--sm" type="submit">Sign out</button></form>
+      </div>
+    </div>
+  </aside>
+  <main class="content">
+    {% for kind, text in flash %}<div class="notice notice--{{ kind }}" role="status">{{ text }}</div>{% endfor %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+{% endblock %}
+</body>
+</html>

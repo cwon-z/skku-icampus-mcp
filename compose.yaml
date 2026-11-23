@@ -18,6 +18,15 @@ services:
       ICAMPUS_KUMA_PUSH_URL: ${ICAMPUS_KUMA_PUSH_URL:-}
       ICAMPUS_VIDEO_CACHE_GB: ${ICAMPUS_VIDEO_CACHE_GB:-30}
       ICAMPUS_VIDEO_MAX_GB: ${ICAMPUS_VIDEO_MAX_GB:-4}
+      # Speech-to-text. A provider's config names the variable that holds its key (docs/stt-providers.md); only
+      # this container gets them. The other transcription settings are changed in the admin UI.
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ICAMPUS_STT_SEED: ${ICAMPUS_STT_SEED:-}
+      # The admin UI at /admin. Its cookie needs HTTPS unless this is false (plain HTTP on a tailnet address).
+      ICAMPUS_ADMIN_UI: ${ICAMPUS_ADMIN_UI:-true}
+      ICAMPUS_ADMIN_COOKIE_SECURE: ${ICAMPUS_ADMIN_COOKIE_SECURE:-true}
     volumes:
       - icampus-data:/data
     ports:

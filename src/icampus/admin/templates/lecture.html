@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_ui.html" import badge, post with context %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <nav class="nc-breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/admin/cache">Cache</a><span class="nc-breadcrumb__sep">/</span></li><li aria-current="page">{{ title }}</li></ol></nav>
+    <h1 class="t-title-2">{{ title }}</h1>
+    <p>{{ course }} · <span class="mono">{{ item_id }}</span>{% if progress %} · transcript {{ badge(progress.state) }}{% endif %}</p>
+  </div>
+  {% if exportable %}
+  <form class="row" method="post" action="/admin/lecture/{{ item_id }}/transcribe">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="model" aria-label="Model"><option value="">Automatic routing</option>{% for i in providers %}<option value="{{ i }}">{{ i }}</option>{% endfor %}</select></span></label>
+    {% if rows %}<label class="nc-check"><input class="nc-check__input" type="checkbox" name="force" value="1"><span class="nc-check__box"></span><span class="nc-check__label">Again, even if current</span></label>{% endif %}
+    <button class="nc-btn nc-btn--primary nc-btn--sm" type="submit">Transcribe</button>
+  </form>
+  {% endif %}
+</header>
+{% if progress and progress.job %}<div class="notice{% if progress.job.state == 'failed' %} notice--danger{% endif %}">Job <span class="mono">{{ progress.job.id }}</span> is {{ progress.job.state | replace("_", " ") }}{% if progress.job.error %}: {{ progress.job.error }}{% endif %}. <a href="/admin/jobs">Open jobs</a></div>{% endif %}
+
+<div class="player">
+  <section class="stack">
+    {% if video %}
+    <video data-player controls preload="metadata" src="/admin/media/video/{{ item_id }}">
+      {% if row %}<track kind="subtitles" src="/admin/media/transcript/{{ row.id }}.vtt" srclang="{{ row.language or 'und' }}" label="Transcript ({{ row.provider_id }})">{% endif %}
+    </video>
+    <p class="t-caption faint">{{ video.size | size }} on the server · last used {{ video.last_used | when }}{% if video_state == "outdated" %} · {{ badge("outdated") }} a sync saw a newer version{% endif %}</p>
+    {% else %}
+    <div class="nc-card nc-card--pad-lg nc-card--inset">
+      <p>The video isn't on this server{% if video_state in ("queued", "downloading") %}: it is being downloaded{% endif %}.</p>
+      <p class="muted">Lines of the transcript can't seek until it is. Downloading asks SKKU's content server for the file, without your login.</p>
+      {% if exportable and video_state not in ("queued", "downloading") %}<div class="row">{{ post("/admin/lecture/" ~ item_id ~ "/download", "Download the video", "nc-btn nc-btn--secondary") }}</div>{% endif %}
+    </div>
+    {% endif %}
+  </section>
+
+  <section class="nc-card nc-card--pad-sm">
+    {% if rows %}
+    <nav class="nc-tabs" aria-label="Transcripts">
+      {% for r in rows %}<a class="nc-tabs__tab" href="/admin/lecture/{{ item_id }}?transcript={{ r.id }}" aria-selected="{{ 'true' if row and r.id == row.id else 'false' }}"><span class="mono">{{ r.provider_id }}</span>{% if r.status == "outdated" %} {{ badge("outdated") }}{% endif %}{% if r.preferred %} {{ badge("pinned", "preferred") }}{% endif %}</a>{% endfor %}
+    </nav>
+    <div class="row row--between">
+      <span class="t-caption faint">{{ row.model }} · {{ row.language or "?" }} · {{ row.timestamps }} timestamps · made {{ row.created_at | when }}{% if row.reason %} · {{ row.reason }}{% endif %}</span>
+      <div class="row">
+        {% if not row.preferred %}{{ post("/admin/lecture/" ~ item_id ~ "/prefer", "Always read this one", fields={"transcript": row.id}) }}{% endif %}
+        {% for fmt in ("txt", "vtt", "srt", "json") %}<a class="nc-btn nc-btn--ghost nc-btn--sm" href="/admin/media/transcript/{{ row.id }}.{{ fmt }}"{% if fmt != "vtt" %} download{% endif %}>{{ fmt }}</a>{% endfor %}
+      </div>
+    </div>
+    <div class="transcript" lang="{{ row.language or '' }}">
+      {% for start, end, text in segments %}<button class="line" type="button" data-seek="{{ start }}"><span class="line__time">{{ start | stamp(hours) }}</span><span>{{ text }}</span></button>
+      {% else %}<p class="empty">This transcript has no text: nothing was said, or nothing was heard.</p>{% endfor %}
+    </div>
+    {% else %}
+    <p class="empty">No transcript yet.{% if exportable %} Choose a model above, or leave it on automatic.{% endif %}</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

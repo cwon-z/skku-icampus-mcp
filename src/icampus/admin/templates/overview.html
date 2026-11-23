@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% from "_ui.html" import badge, meter with context %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><h1 class="t-title-2">Overview</h1><p>What the collector last synced, what it keeps on disk, and what the transcription queue is doing.</p></div>
+</header>
+
+<section class="grid grid--4">
+  <article class="nc-card nc-card--pad-md nc-stat">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Sync</h2></div>{{ badge("ok" if sync.healthy else "failed", "healthy" if sync.healthy else "unhealthy") }}</div>
+    <div class="nc-card__body">
+      <div class="nc-stat__value-row"><span class="nc-stat__value">{{ sync.term or "–" }}</span></div>
+      <span class="nc-stat__footnote">{{ sync.summary }}{% if sync.running %} · syncing now{% endif %}</span>
+    </div>
+  </article>
+  <article class="nc-card nc-card--pad-md nc-stat">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Storage</h2></div></div>
+    <div class="nc-card__body">
+      <div class="nc-stat__value-row"><span class="nc-stat__value nc-num">{{ totals.all.bytes | size }}</span><span class="nc-stat__secondary">/ {{ totals.all.cap_bytes | size }}</span></div>
+      {{ meter(totals.all.bytes, totals.all.cap_bytes, size="md", label="Storage used") }}
+      <span class="nc-stat__footnote">{{ totals.all.count }} {{ "entry" if totals.all.count == 1 else "entries" }} · {{ totals.all.pinned_bytes | size }} pinned</span>
+    </div>
+  </article>
+  <article class="nc-card nc-card--pad-md nc-stat">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Transcription queue</h2></div></div>
+    <div class="nc-card__body">
+      <div class="nc-stat__value-row"><span class="nc-stat__value nc-num">{{ queue.queued + queue.downloading + queue.extracting + queue.transcribing }}</span><span class="nc-stat__secondary">active · {{ queue.waiting_hours }} h waiting</span></div>
+      <span class="nc-stat__footnote">{{ queue.done }} done · {{ queue.paused_budget }} paused for budget · {{ queue.failed }} failed</span>
+    </div>
+  </article>
+  <article class="nc-card nc-card--pad-md nc-stat">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Speech-to-text this month</h2></div></div>
+    <div class="nc-card__body">
+      {% set p = providers | selectattr("default") | first %}
+      {% if p %}
+      <div class="nc-stat__value-row"><span class="nc-stat__value nc-num">{{ p.month.used_hours }} h</span><span class="nc-stat__secondary">{% if p.month.cap_hours is not none %}/ {{ p.month.cap_hours }} h{% else %}no hour cap{% endif %}</span></div>
+      {% if p.month.cap_hours %}{{ meter(p.month.used_hours, p.month.cap_hours, size="md", label="Hours used") }}{% endif %}
+      <span class="nc-stat__footnote"><span class="mono">{{ p.id }}</span> · resets {{ p.month.resets }}</span>
+      {% else %}<span class="nc-stat__footnote">No provider is registered.</span>{% endif %}
+    </div>
+  </article>
+</section>
+
+<section class="grid grid--2">
+  <article class="nc-card nc-card--pad-md">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Sync status</h2><p class="nc-card__subtitle">As <span class="mono">/api/v1/status</span> reports it</p></div></div>
+    <dl class="pairs">
+      <dt>Next run</dt><dd class="mono">{{ sync.next_run | when }}</dd>
+      <dt>Login</dt><dd>{% if sync.blocked %}{{ badge("failed", "blocked") }} {{ sync.blocked.reason }}{% else %}{{ badge("ok") }}{% endif %}</dd>
+      {% for name, at in sync.datasets.items() %}<dt>{{ name }}</dt><dd class="mono">{{ at | when }}</dd>{% endfor %}
+    </dl>
+    <div class="nc-table-wrap"><table class="nc-table nc-table--dense">
+      <thead><tr><th>Run</th><th>Trigger</th><th>Started</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for run in sync.runs %}<tr><td class="mono">{{ run.id }}</td><td>{{ run.trigger }}</td><td class="mono">{{ run.started_at | when }}</td><td>{{ badge(run.status) }}</td></tr>
+      {% else %}<tr><td colspan="4" class="empty">No sync has run yet.</td></tr>{% endfor %}
+      </tbody>
+    </table></div>
+  </article>
+
+  <article class="nc-card nc-card--pad-md">
+    <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Storage by kind</h2><p class="nc-card__subtitle">Used against each cap</p></div><div class="nc-card__action"><a class="nc-btn nc-btn--ghost nc-btn--sm" href="/admin/cache">Open cache</a></div></div>
+    <div class="nc-table-wrap"><table class="nc-table nc-table--dense">
+      <thead><tr><th>Kind</th><th class="is-num">Entries</th><th class="is-num">Used</th><th class="is-num">Cap</th><th>Share</th></tr></thead>
+      <tbody>
+      {% for kind in kinds %}{% set t = totals[kind] %}
+      <tr><td><a href="/admin/cache?kind={{ kind }}">{{ kind }}</a></td><td class="is-num mono">{{ t.count }}</td><td class="is-num mono">{{ t.bytes | size }}</td>
+        <td class="is-num mono">{% if t.cap_bytes is not none %}{{ t.cap_bytes | size }}{% else %}never evicted{% endif %}</td>
+        <td><div class="meter-cell">{% if t.cap_bytes %}{{ meter(t.bytes, t.cap_bytes, label=kind ~ " used") }}{% endif %}</div></td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </article>
+</section>
+
+<section class="nc-card nc-card--pad-md">
+  <div class="nc-card__header"><div class="nc-card__titles"><h2 class="nc-card__title">Speech-to-text providers</h2><p class="nc-card__subtitle">Use this budget period against each cap · search runs on a {{ search }}{% if not queue.ffmpeg %} · ffmpeg is not installed{% endif %}</p></div><div class="nc-card__action"><a class="nc-btn nc-btn--ghost nc-btn--sm" href="/admin/stt">Open STT models</a></div></div>
+  <div class="nc-table-wrap"><table class="nc-table nc-table--dense">
+    <thead><tr><th>Provider</th><th>Health</th><th class="is-num">Hours used</th><th class="is-num">Cap</th><th>Share</th><th class="is-num">Cost</th><th>Resets</th></tr></thead>
+    <tbody>
+    {% for p in providers %}
+    <tr><td><span class="mono">{{ p.id }}</span>{% if p.default %} {{ badge("pinned", "default") }}{% endif %}{% if not p.enabled %} {{ badge("canceled", "disabled") }}{% endif %}</td>
+      <td>{{ badge(p.health.state) }}</td><td class="is-num mono">{{ p.month.used_hours }} h</td>
+      <td class="is-num mono">{% if p.month.cap_hours is not none %}{{ p.month.cap_hours }} h{% elif p.month.cap_usd is not none %}${{ p.month.cap_usd }}{% else %}–{% endif %}</td>
+      <td><div class="meter-cell">{% if p.month.cap_hours %}{{ meter(p.month.used_hours, p.month.cap_hours, label="Hours used") }}{% endif %}</div></td>
+      <td class="is-num mono">${{ "%.2f" | format(p.month.used_usd) }}</td><td class="mono">{{ p.month.resets }}</td></tr>
+    {% else %}<tr><td colspan="7" class="empty">No provider is registered. Add one under STT models.</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% from "_ui.html" import badge with context %}
+{{ badge(p.health.state) }}
+{% if result is defined and result %}
+<div class="t-caption {{ 'faint' if result.ok else '' }}">{% if result.ok %}Heard “{{ result.text }}” in {{ result.seconds }} s{% else %}{{ result.error }}{% endif %}</div>
+{% elif p.health.state in ("failing", "skipped") and p.health.last_error %}
+<div class="t-caption faint wrap">{{ p.health.last_error }}{% if p.health.skip_until %} · skipped until {{ p.health.skip_until | when }}{% endif %}</div>
+{% elif p.health.last_ok_at %}
+<div class="t-caption faint nowrap">Last worked {{ p.health.last_ok_at | when }}</div>
+{% endif %}

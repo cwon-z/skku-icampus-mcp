@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block body %}
+<main class="auth">
+  <section class="nc-card nc-card--pad-lg auth__panel">
+    <h1 class="t-title-2">{{ title }}</h1>
+    <p class="muted">{{ message }}</p>
+    <div class="row"><a class="nc-btn nc-btn--secondary" href="/admin/">Back to the overview</a></div>
+  </section>
+</main>
+{% endblock %}

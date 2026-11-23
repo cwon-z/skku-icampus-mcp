@@ -20,6 +20,8 @@ dependencies = [
     "pyjwt[crypto]>=2.10.1",
     "tzdata",
     "pypdf>=5",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
 ]
 
 [dependency-groups]

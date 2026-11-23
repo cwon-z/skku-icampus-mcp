@@ -2,65 +2,72 @@
 {% from "_ui.html" import badge, post with context %}
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
-<header class="page-head">
-  <div>
-    <nav class="nc-breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/admin/cache">Cache</a><span class="nc-breadcrumb__sep">/</span></li><li aria-current="page">{{ title }}</li></ol></nav>
-    <h1 class="t-title-2">{{ title }}</h1>
-    <p>{{ course }} · <span class="mono">{{ item_id }}</span>{% if progress %} · transcript {{ badge(progress.state) }}{% endif %}</p>
+<header class="top">
+  <div class="top-text">
+    <p class="eyebrow"><a href="/admin/cache">Cache</a> · {{ course or "lecture" }} · {{ item_id }}</p>
+    <h1 class="h1 h1--long">{{ title }}</h1>
+    {% if progress %}<p class="row t2">Transcript {{ badge(progress.state) }}</p>{% endif %}
   </div>
   {% if exportable %}
-  <form class="row" method="post" action="/admin/lecture/{{ item_id }}/transcribe">
+  <form class="actions" method="post" action="/admin/lecture/{{ item_id }}/transcribe">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <label class="nc-field nc-field--sm nc-select"><span class="nc-field__control"><select class="nc-field__input" name="model" aria-label="Model"><option value="">Automatic routing</option>{% for i in providers %}<option value="{{ i }}">{{ i }}</option>{% endfor %}</select></span></label>
-    {% if rows %}<label class="nc-check"><input class="nc-check__input" type="checkbox" name="force" value="1"><span class="nc-check__box"></span><span class="nc-check__label">Again, even if current</span></label>{% endif %}
-    <button class="nc-btn nc-btn--primary nc-btn--sm" type="submit">Transcribe</button>
+    {% if rows %}<label class="check"><input type="checkbox" name="force" value="1"><span>Again, even if current</span></label>{% endif %}
+    <span class="ctl"><span class="ctl-label">Model</span><select name="model" aria-label="Model"><option value="">Automatic routing</option>{% for i in providers %}<option value="{{ i }}">{{ i }}</option>{% endfor %}</select>{{ icon("chevron", 16, 1.8) }}</span>
+    <button class="btn btn-primary" type="submit">{{ icon("wave", 18, 1.8) }}Transcribe</button>
   </form>
   {% endif %}
 </header>
-{% if progress and progress.job %}<div class="notice{% if progress.job.state == 'failed' %} notice--danger{% endif %}">Job <span class="mono">{{ progress.job.id }}</span> is {{ progress.job.state | replace("_", " ") }}{% if progress.job.error %}: {{ progress.job.error }}{% endif %}. <a href="/admin/jobs">Open jobs</a></div>{% endif %}
+{% if progress and progress.job %}<div class="notice{% if progress.job.state == 'failed' %} notice--danger{% endif %}">{{ icon("alert-square" if progress.job.state == "failed" else "clock", 18, 1.8) }}<span>Job <span class="mono">{{ progress.job.id }}</span> is {{ progress.job.state | replace("_", " ") }}{% if progress.job.error %}: {{ progress.job.error }}{% endif %}. <a class="link" href="/admin/jobs">Open jobs</a></span></div>{% endif %}
 
 <div class="player">
-  <section class="stack">
+  <section class="stack" aria-label="Video and slides">
     {% if video %}
-    <video data-player controls preload="metadata" src="/admin/media/video/{{ item_id }}">
-      {% if row %}<track kind="subtitles" src="/admin/media/transcript/{{ row.id }}.vtt" srclang="{{ row.language or 'und' }}" label="Transcript ({{ row.provider_id }})">{% endif %}
-    </video>
-    <p class="t-caption faint">{{ video.size | size }} on the server · last used {{ video.last_used | when }}{% if video_state == "outdated" %} · {{ badge("outdated") }} a sync saw a newer version{% endif %}</p>
-    {% else %}
-    <div class="nc-card nc-card--pad-lg nc-card--inset">
-      <p>The video isn't on this server{% if video_state in ("queued", "downloading") %}: it is being downloaded{% endif %}.</p>
-      <p class="muted">Lines of the transcript can't seek until it is. Downloading asks SKKU's content server for the file, without your login.</p>
-      {% if exportable and video_state not in ("queued", "downloading") %}<div class="row">{{ post("/admin/lecture/" ~ item_id ~ "/download", "Download the video", "nc-btn nc-btn--secondary") }}</div>{% endif %}
+    <div class="screen">
+      <video data-player controls preload="metadata" src="/admin/media/video/{{ item_id }}">
+        {% if row %}<track kind="subtitles" src="/admin/media/transcript/{{ row.id }}.vtt" srclang="{{ row.language or 'und' }}" label="Transcript ({{ row.provider_id }})">{% endif %}
+      </video>
     </div>
-    {% endif %}
-    {% set slide_state, slide_list = slides %}
-    {% if slide_list %}
-    <div class="nc-card nc-card--pad-sm">
-      <div class="row row--between"><h2 class="nc-card__title">Slides <span class="mono faint">{{ slide_list | length }}</span></h2>{% if slide_state == "outdated" %}{{ badge("outdated") }}{% endif %}</div>
-      <div class="slides">
-        {% for sl in slide_list %}<button class="slide" type="button" data-seek="{{ sl.start }}" title="Slide {{ sl.n }}"><img src="/admin/media/slide/{{ item_id }}/{{ sl.n }}.jpg" alt="Slide {{ sl.n }}" loading="lazy"><span class="mono">{{ sl.start | stamp(hours) }}</span></button>{% endfor %}
+    <p class="t2 num">{{ video.size | size }} on the server · last used {{ video.last_used | when }}{% if video_state == "outdated" %} · {{ badge("outdated") }} a sync saw a newer version{% endif %}</p>
+    {% else %}
+    <div class="screen ink">
+      <div class="screen-empty">
+        <p class="lede">The video isn't on this server{% if video_state in ("queued", "downloading") %}: it is being downloaded{% endif %}.</p>
+        <p class="sub">Lines of the transcript can't seek until it is. Downloading asks SKKU's content server for the file, without your login.</p>
+        {% if exportable and video_state not in ("queued", "downloading") %}{{ post("/admin/lecture/" ~ item_id ~ "/download", "Download the video", "btn btn-paper", glyph="download") }}{% endif %}
       </div>
     </div>
     {% endif %}
-    {% if exportable and slide_state != "ready" %}
-    <div class="row">
-      <span class="t-caption faint">{% if slide_state == "extracting" %}Slide frames are being cut.{% elif slide_state == "failed" %}Slides failed: {{ slide_error }}{% elif slide_state == "outdated" %}These slides are from an older version of the video.{% else %}No slide frames yet.{% endif %}</span>
-      {% if slide_state != "extracting" %}{{ post("/admin/lecture/" ~ item_id ~ "/slides", "Extract slides") }}{% endif %}
+    {% set slide_state, slide_list = slides %}
+    {% if slide_list or exportable %}
+    <div class="card sec">
+      <div class="head">
+        <h2 class="eyebrow">Slides{% if slide_list %} <span class="count">{{ slide_list | length }}</span>{% endif %}</h2>
+        <div class="row">
+          {% if slide_list and slide_state == "outdated" %}{{ badge("outdated") }}{% endif %}
+          {% if exportable and slide_state not in ("ready", "extracting") %}{{ post("/admin/lecture/" ~ item_id ~ "/slides", "Extract slides", glyph="frames") }}{% endif %}
+        </div>
+      </div>
+      {% if slide_list %}
+      <div class="slides">
+        {% for sl in slide_list %}<button class="slide" type="button" data-seek="{{ sl.start }}" title="Slide {{ sl.n }}"><img src="/admin/media/slide/{{ item_id }}/{{ sl.n }}.jpg" alt="Slide {{ sl.n }}" loading="lazy"><span class="mono">{{ sl.start | stamp(hours) }}</span></button>{% endfor %}
+      </div>
+      {% endif %}
+      {% if exportable and slide_state != "ready" %}
+      <p class="t2{% if slide_state == 'failed' %} ok--bad{% endif %}">{% if slide_state == "extracting" %}Slide frames are being cut.{% elif slide_state == "failed" %}Slides failed: {{ slide_error }}{% elif slide_state == "outdated" %}These slides are from an older version of the video.{% else %}No slide frames yet.{% endif %}</p>
+      {% endif %}
     </div>
     {% endif %}
   </section>
 
-  <section class="nc-card nc-card--pad-sm">
+  <section class="card transcript-card" aria-label="Transcript">
     {% if rows %}
-    <nav class="nc-tabs" aria-label="Transcripts">
-      {% for r in rows %}<a class="nc-tabs__tab" href="/admin/lecture/{{ item_id }}?transcript={{ r.id }}" aria-selected="{{ 'true' if row and r.id == row.id else 'false' }}"><span class="mono">{{ r.provider_id }}</span>{% if r.status == "outdated" %} {{ badge("outdated") }}{% endif %}{% if r.preferred %} {{ badge("pinned", "preferred") }}{% endif %}</a>{% endfor %}
+    <nav class="tabs" aria-label="Transcripts">
+      {% for r in rows %}<a{% if row and r.id == row.id %} class="on" aria-current="true"{% endif %} href="/admin/lecture/{{ item_id }}?transcript={{ r.id }}"><span class="mono">{{ r.provider_id }}</span>{% if r.status == "outdated" %} {{ badge("outdated") }}{% endif %}{% if r.preferred %} {{ badge("pinned", "preferred") }}{% endif %}</a>{% endfor %}
     </nav>
+    <p class="t2">{{ row.model }} · {{ row.language or "?" }} · {{ row.timestamps }} timestamps · made {{ row.created_at | when }}{% if row.reason %} · {{ row.reason }}{% endif %}</p>
     <div class="row row--between">
-      <span class="t-caption faint">{{ row.model }} · {{ row.language or "?" }} · {{ row.timestamps }} timestamps · made {{ row.created_at | when }}{% if row.reason %} · {{ row.reason }}{% endif %}</span>
-      <div class="row">
-        {% if not row.preferred %}{{ post("/admin/lecture/" ~ item_id ~ "/prefer", "Always read this one", fields={"transcript": row.id}) }}{% endif %}
-        {% for fmt in ("txt", "vtt", "srt", "json") %}<a class="nc-btn nc-btn--ghost nc-btn--sm" href="/admin/media/transcript/{{ row.id }}.{{ fmt }}"{% if fmt != "vtt" %} download{% endif %}>{{ fmt }}</a>{% endfor %}
-      </div>
+      <div class="row">{% for fmt in ("txt", "vtt", "srt", "json") %}<a class="chip mono" href="/admin/media/transcript/{{ row.id }}.{{ fmt }}"{% if fmt != "vtt" %} download{% endif %}>{{ fmt }}</a>{% endfor %}</div>
+      {% if not row.preferred %}{{ post("/admin/lecture/" ~ item_id ~ "/prefer", "Always read this one", fields={"transcript": row.id}, glyph="pin") }}{% endif %}
     </div>
     <div class="transcript" lang="{{ row.language or '' }}">
       {% for start, end, text in segments %}<button class="line" type="button" data-seek="{{ start }}"><span class="line__time">{{ start | stamp(hours) }}</span><span>{{ text }}</span></button>

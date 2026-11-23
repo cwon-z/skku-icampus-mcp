@@ -202,9 +202,13 @@ transcript; clicking a line seeks to it.
 - Looking at any page reads the database and the disk only. Nothing in the UI sends a request to iCampus; the
   buttons that download a video or transcribe a lecture reach SKKU's content server without your login, like
   an export.
-- The look is the Nocturne design system. All of its tokens are CSS custom properties at the top of
-  `src/icampus/admin/static/theme.css`; the fonts (Inter, JetBrains Mono, SIL OFL) and htmx are served from the
-  package, so the UI makes no outside requests.
+- The look: paper-coloured pages, white cards, one black card per page for the numbers that matter, a single
+  blue for marks, red only for what needs you, and pixel numerals for counts. Light and dark follow the system;
+  the control at the foot of the sidebar picks one. Every colour, shadow, radius and font is a CSS custom
+  property in the first section of `src/icampus/admin/static/theme.css`, each colour written once as
+  `light-dark(light, dark)`: change the values there and the whole UI follows. The fonts (Geist, Geist Mono and
+  Galmuri11, all SIL OFL, licences beside them), the icons and htmx are served from the package, so the UI makes
+  no outside requests. It needs a browser from 2024 or later (`light-dark()`).
 
 ## Settings
 

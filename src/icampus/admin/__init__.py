@@ -13,6 +13,9 @@ The pages read the database, the cache index and the disk. Nothing here sends a 
 requests to SKKU at all are the ones a button names (download a video, transcribe), which go to the content
 server without cookies, as exports always have. Pages are rendered with autoescape and a Content-Security-Policy
 without inline script or style, since titles, file names and transcripts are text written by other people.
+
+How it looks is one stylesheet (static/theme.css, tokens first), three bundled fonts and the icons in icons.py:
+no page asks another host for anything.
 """
 
 import hashlib
@@ -39,6 +42,7 @@ from ..pipeline import ACTIVE
 from ..runtime import SPECS, coerce
 from ..stt.registry import Unavailable
 from ..transcripts import stamp
+from .icons import NOTICE, icon
 
 log = logging.getLogger(__name__)
 HERE = Path(__file__).parent
@@ -49,13 +53,15 @@ CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' 
        "media-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 HEADERS = {"Content-Security-Policy": CSP, "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
            "Referrer-Policy": "same-origin", "Cache-Control": "no-store"}
-NAV = [("overview", "/admin/", "Overview"), ("settings", "/admin/settings", "Settings"),
-       ("stt", "/admin/stt", "STT models"), ("jobs", "/admin/jobs", "Jobs"), ("cache", "/admin/cache", "Cache")]
+# The sidebar: (page, address, label, icon). Settings sits apart, at its foot.
+NAV = [("overview", "/admin/", "Overview", "home"), ("jobs", "/admin/jobs", "Jobs", "jobs"),
+       ("cache", "/admin/cache", "Cache", "cache"), ("stt", "/admin/stt", "STT models", "wave")]
 STATE_TONE = {"queued": "neutral", "downloading": "info", "extracting": "info", "transcribing": "info",
               "done": "success", "ready": "success", "ok": "success", "failed": "danger", "failing": "warning",
               "skipped": "danger", "paused_budget": "warning", "outdated": "warning", "canceled": "neutral",
               "pinned": "accent", "in use": "info", "kept": "neutral", "unknown": "neutral", "partial": "warning",
               "running": "info", "interrupted": "warning"}
+STATE_LABEL = {"ok": "OK", "paused_budget": "paused for budget"}  # the rest read well as they are
 
 
 class _Login(Exception):
@@ -179,7 +185,7 @@ def _size(n: Any) -> str:
 
 
 def _pips(used: Any, cap: Any, n: int = 24) -> list[bool]:
-    """A Nocturne meter: n pips, as many lit as the share used (one lit for anything above zero)."""
+    """A meter of n squares: as many lit as the share used (one lit for anything above zero)."""
     used, cap = float(used or 0), float(cap or 0)
     if cap <= 0:
         return [False] * n
@@ -196,8 +202,11 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
     templates = Environment(loader=FileSystemLoader(HERE / "templates"), autoescape=select_autoescape(default=True),
                             trim_blocks=True, lstrip_blocks=True)
     templates.filters.update(when=_when, size=_size, stamp=stamp,
+                             cap=lambda text: str(text)[:1].upper() + str(text)[1:],
                              tojson_pretty=lambda v: json.dumps(v, ensure_ascii=False, indent=1))
-    templates.globals.update(nav=NAV, tone=lambda state: STATE_TONE.get(state, "neutral"), pips=_pips)
+    templates.globals.update(nav=NAV, tone=lambda state: STATE_TONE.get(state, "neutral"), pips=_pips, icon=icon,
+                             notice_icon=NOTICE,
+                             state_label=lambda state: STATE_LABEL.get(state) or str(state).replace("_", " "))
     app.mount("/admin/static", StaticFiles(directory=HERE / "static"), name="admin-static")
     app.state.admin_sessions = sessions
     settings, store, cache, registry, pipeline, transcripts = (ctx.settings, ctx.store, ctx.cache, ctx.registry,
@@ -207,6 +216,10 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
 
     def render(name: str, request: Request, session: dict | None = None, status: int = 200, **data: Any) -> Response:
         flash = sessions.take_flash(session["sid"]) if session else []
+        if session and "page" in data:  # a whole page, with the sidebar: what in the queue wants a look
+            queue = data.get("queue") or pipeline.queue_summary()
+            data.setdefault("nav_counts", {"jobs": queue["failed"] + queue["paused_budget"]})
+            data.setdefault("nav_notes", {"jobs": "failed or paused for budget"})
         html = templates.get_template(name).render(request=request, session=session, flash=flash,
                                                    csrf=session["csrf"] if session else "", **data)
         return HTMLResponse(html, status_code=status, headers=HEADERS)
@@ -332,8 +345,13 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
                 "blocked": store.get_state("login_block"),
                 "datasets": {d: store.synced_at(d, expected.get(d)) for d in DATASETS},
                 "runs": store.recent_runs(5)}
+        names = course_names()
+        recent = pipeline.jobs(limit=3)  # the ones that run next, then the latest finished
+        for job in recent:
+            job["course"] = names.get(job["course_id"], job["course_id"])
         return render("overview.html", request, session, page="overview", sync=sync, totals=cache.totals(),
-                      queue=pipeline.queue_summary(), providers=[registry.describe(c) for c in registry.all()],
+                      queue=pipeline.queue_summary(), recent=recent,
+                      providers=[registry.describe(c) for c in registry.all()],
                       search="trigram index" if transcripts.fts else "substring scan (no FTS5 trigram)",
                       kinds=KINDS)
 

@@ -1,23 +1,23 @@
 {% extends "base.html" %}
 {% block title %}{{ meta.name or file_id }}{% endblock %}
 {% block content %}
-<header class="page-head">
-  <div>
-    <nav class="nc-breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/admin/cache?kind=attachment">Cache</a><span class="nc-breadcrumb__sep">/</span></li><li aria-current="page">{{ meta.name or file_id }}</li></ol></nav>
-    <h1 class="t-title-2">{{ meta.name or file_id }}</h1>
-    <p>The copy on this server, as downloaded {{ meta.fetched_at | when }}. Nothing is fetched to show it.</p>
+<header class="top">
+  <div class="top-text">
+    <p class="eyebrow"><a href="/admin/cache?kind=attachment">Cache</a> · attachment · {{ file_id }}</p>
+    <h1 class="h1 h1--long">{{ meta.name or file_id }}</h1>
   </div>
-  <a class="nc-btn nc-btn--secondary" href="/admin/media/attachment/{{ file_id }}" download>Download the file</a>
+  <div class="actions"><a class="btn btn-secondary" href="/admin/media/attachment/{{ file_id }}" download>{{ icon("download", 18, 1.8) }}Download the file</a></div>
 </header>
-<section class="nc-card nc-card--pad-md">
-  <dl class="pairs">
-    <dt>File id</dt><dd class="mono">{{ file_id }}</dd>
-    <dt>Type</dt><dd class="mono">{{ meta.content_type or "unknown" }}</dd>
-    <dt>Size</dt><dd class="mono">{{ meta.size | size }}</dd>
-    <dt>Text read as</dt><dd>{{ meta.extract or "unknown" }}</dd>
-    {% if entry and entry.meta.parent %}<dt>Attached to</dt><dd>{{ entry.meta.parent.type }}: {{ entry.meta.parent.title }}</dd>{% endif %}
+<p class="intro">The copy on this server, as downloaded {{ meta.fetched_at | when }}. Nothing is fetched to show it.</p>
+<section class="card sec">
+  <dl class="facts facts--4">
+    <div><dt>File id</dt><dd class="mono">{{ file_id }}</dd></div>
+    <div><dt>Type</dt><dd class="mono">{{ meta.content_type or "unknown" }}</dd></div>
+    <div><dt>Size</dt><dd class="num">{{ meta.size | size }}</dd></div>
+    <div><dt>Text read as</dt><dd>{{ meta.extract or "unknown" }}</dd></div>
+    {% if entry and entry.meta.parent %}<div class="span-2"><dt>Attached to</dt><dd>{{ entry.meta.parent.type }}: {{ entry.meta.parent.title }}</dd></div>{% endif %}
   </dl>
 </section>
-{% if text %}<pre class="pre">{{ text }}</pre>{% if more %}<p class="t-caption faint">Only the first 200,000 characters are shown.</p>{% endif %}
+{% if text %}<pre class="pre">{{ text }}</pre>{% if more %}<p class="hint">Only the first 200,000 characters are shown.</p>{% endif %}
 {% else %}<p class="empty">No text could be read from this file ({{ meta.extract or "unknown reason" }}). Download it to look at it.</p>{% endif %}
 {% endblock %}

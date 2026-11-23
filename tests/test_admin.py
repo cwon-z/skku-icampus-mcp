@@ -324,8 +324,13 @@ def test_overview_cache_and_lecture_pages(ui):
     for expected in ("Sync status", "Storage by kind", "Transcription queue", "Speech-to-text this month",
                      "never evicted", "trigram index"):
         assert expected in text, expected
-    assert overview.select_one(".nc-nav-item.is-active").get_text(strip=True) == "Overview"
-    assert len(overview.select(".nc-meter__pip")) >= 24  # storage is a meter of pips, not an inline-styled bar
+    assert overview.select_one(".nav.on[aria-current=page]").get_text(strip=True) == "Overview"
+    assert [a.get_text(strip=True) for a in overview.select(".side .nav")] == ["Overview", "Jobs", "Cache", "STT models",
+                                                                             "Settings"]
+    # shares are drawn as squares and <progress> bars: the policy allows no inline widths
+    assert len(overview.select(".meter i")) == 20 and overview.select("progress.bar[max]")
+    assert overview.select_one(".side form[action='/admin/logout'] button")["aria-label"] == "Sign out"
+    assert [b["data-theme-set"] for b in overview.select(".side [data-theme-set]")] == ["system", "light", "dark"]
 
     rows = BeautifulSoup(ui.get("/admin/cache").text, "html.parser").select("tbody tr")
     kinds = sorted(r.select_one("td").get_text(strip=True) for r in rows)
@@ -373,7 +378,7 @@ def test_settings_change_at_once_show_their_source_and_refuse_bad_values(ui):
     cache = ui.app.state.cache
     page = BeautifulSoup(ui.get("/admin/settings").text, "html.parser")
     keys = page.find("input", {"name": "video_cache_gb"}).find_parent("form").find("input", {"name": "_keys"})["value"]
-    assert "video_cache_gb" in keys and "from default" in page.get_text(" ", strip=True)
+    assert "video_cache_gb" in keys and "From default" in page.get_text(" ", strip=True)
     current = {i["name"]: i.get("value", "") for i in page.find("input", {"name": "video_cache_gb"}).find_parent(
         "form").find_all("input") if i.get("name") and i.get("type") != "hidden"}
 
@@ -383,11 +388,11 @@ def test_settings_change_at_once_show_their_source_and_refuse_bad_values(ui):
     assert ui.app.state.settings.source("video_cache_gb") == "ui"
     assert ui.app.state.settings.source("video_max_gb") == "default"  # saving a page doesn't pin the rest
     again = BeautifulSoup(ui.get("/admin/settings").text, "html.parser")
-    assert again.find("input", {"name": "video_cache_gb"})["value"] == "12.0" and "set here" in again.get_text(" ")
+    assert again.find("input", {"name": "video_cache_gb"})["value"] == "12.0" and "Set here" in again.get_text(" ")
 
     bad = ui.submit("/admin/settings", **{**current, "_keys": keys, "video_cache_gb": "-3", "attachment_max_mb": "9999"})
     assert bad.status_code == 422
-    errors = [h.get_text(strip=True) for h in BeautifulSoup(bad.text, "html.parser").select(".is-invalid .nc-field__hint")]
+    errors = [h.get_text(strip=True) for h in BeautifulSoup(bad.text, "html.parser").select(".field.bad .hint")]
     assert errors == ["Use a value from 0.1 to 4000", "Use a value from 1 to 200"]
     assert BeautifulSoup(bad.text, "html.parser").find("input", {"name": "video_cache_gb"})["value"] == "-3"  # kept to fix
     assert cache.cap("video") == 12 * 2**30
@@ -431,11 +436,11 @@ def test_providers_are_added_edited_tested_and_removed_and_the_key_is_write_only
     bad = ui.submit("/admin/stt", **{**form, "id": "Bad Id", "base_url": "https://lcms.skku.edu/v1", "priority": "soon",
                                    "capabilities": "{not json", "api_key_env": "ICAMPUS_PASSWORD"})
     assert bad.status_code == 422 and OTHER_SECRET not in bad.text
-    hints = " ".join(h.get_text() for h in BeautifulSoup(bad.text, "html.parser").select(".is-invalid .nc-field__hint"))
+    hints = " ".join(h.get_text() for h in BeautifulSoup(bad.text, "html.parser").select(".field.bad .hint"))
     assert "Use a whole number" in hints and "JSON object" in hints
     worse = ui.submit("/admin/stt", **{**form, "id": "Bad Id", "base_url": "https://lcms.skku.edu/v1",
                                      "api_key_env": "ICAMPUS_PASSWORD"})
-    hints = " ".join(h.get_text() for h in BeautifulSoup(worse.text, "html.parser").select(".is-invalid .nc-field__hint"))
+    hints = " ".join(h.get_text() for h in BeautifulSoup(worse.text, "html.parser").select(".field.bad .hint"))
     assert "lowercase" in hints and "never sent to an SKKU host" in hints and "never sent to a provider" in hints
     assert registry.get("Bad Id") is None and len(registry.all()) == 3
 
@@ -522,7 +527,7 @@ async def test_queueing_a_course_shows_the_plan_first(ui):
     [job] = pipeline.jobs()
     assert (job["item_id"], job["state"], job["trigger"]) == ("7002", "queued", "ui")
     table = ui.get("/admin/jobs/table").text
-    assert "hx-trigger=\"every 4s\"" in table and "Lecture 7002" in table and ">queued<" in table
+    assert "hx-trigger=\"every 4s\"" in table and "Lecture 7002" in table and "</i>Queued</span>" not in table and ">Queued</span>" in table
 
     assert ui.submit(f"/admin/jobs/{job['id']}/cancel").status_code == 303
     assert pipeline.jobs()[0]["state"] == "canceled" and "Retry" in ui.get("/admin/jobs?state=canceled").text
@@ -532,6 +537,34 @@ async def test_queueing_a_course_shows_the_plan_first(ui):
     assert ui.submit("/admin/jobs/999/retry").status_code == 404 and ui.submit("/admin/jobs/1/explode").status_code == 404
     unknown = ui.submit("/admin/jobs/queue", course="", week="", model="nobody", confirm="1")
     assert unknown.status_code == 303 and "Nothing queued" in flash(ui, "/admin/jobs")
+
+
+def test_the_sidebar_counts_the_jobs_that_want_a_look(ui):
+    def badge(path):
+        found = BeautifulSoup(ui.get(path).text, "html.parser").select_one(".side .nav-badge")
+        return found.get_text(" ", strip=True) if found else None
+    assert badge("/admin/") is None  # nothing failed, nothing paused: no badge at all
+    ui.submit("/admin/jobs/queue", course="1001", week="", model="", only_missing="1", confirm="1")
+    assert badge("/admin/jobs") is None  # a queued job is on its way, not waiting for anyone
+    ui.app.state.store.execute("UPDATE jobs SET state='failed', error='made up'")
+    for path in ("/admin/", "/admin/cache", "/admin/settings", "/admin/lecture/7001"):
+        assert badge(path) == "1 failed or paused for budget", path
+    tabs = BeautifulSoup(ui.get("/admin/jobs?state=failed").text, "html.parser").select(".tabs a")
+    assert [t.get_text(" ", strip=True) for t in tabs] == ["All 1", "Active 0", "Paused for budget 0", "Failed 1", "Done 0"]
+    assert [t.get_text(strip=True) for t in tabs if "on" in t.get("class", [])] == ["Failed1"]
+
+
+def test_every_icon_a_page_asks_for_exists():
+    """A missing icon is a KeyError while rendering, so a page would answer 500: check the names, not the pages."""
+    from icampus.admin.icons import NOTICE, PATHS, icon
+    from icampus.cache import KINDS
+    templates = Path(admin.__file__).parent / "templates"
+    asked = {name for page in templates.glob("*.html") for name in re.findall(r'icon\("([a-z-]+)"', page.read_text())}
+    asked |= {name for page in templates.glob("*.html") for name in re.findall(r'glyph="([a-z-]+)"', page.read_text())}
+    assert len(asked) > 15 and asked <= set(PATHS), sorted(asked - set(PATHS))
+    assert {glyph for *_, glyph in admin.NAV} | set(NOTICE.values()) | set(KINDS) <= set(PATHS)
+    drawn = str(icon("home", 18, 1.8))
+    assert drawn.startswith("<svg ") and 'width="18"' in drawn and "style=" not in drawn and "http" not in drawn
 
 
 def test_cache_actions(ui):
@@ -582,11 +615,16 @@ async def test_lecture_actions(ui):
 def test_templates_and_static_files_are_part_of_the_package():
     here = Path(admin.__file__).parent
     for name in ("templates/base.html", "templates/login.html", "templates/_ui.html", "static/theme.css",
-                 "static/htmx.min.js", "static/admin.js", "static/fonts/Inter-Variable.woff2",
-                 "static/fonts/JetBrainsMono-Variable.woff2", "static/fonts/OFL-Inter.txt"):
+                 "static/htmx.min.js", "static/admin.js", "static/fonts/Geist-Variable.woff2",
+                 "static/fonts/GeistMono-Variable.woff2", "static/fonts/Galmuri11-Bold.woff2",
+                 "static/fonts/OFL-Geist.txt", "static/fonts/OFL-Galmuri.txt"):
         assert (here / name).is_file(), name
     css = (here / "static/theme.css").read_text()
-    assert "--accent:" in css and "--bg-canvas:" in css and '[data-theme="light"]' in css
+    assert "--accent:" in css and "--canvas:" in css and '[data-theme="light"]' in css and '[data-theme="dark"]' in css
+    tokens = css.split("/* ── 2.")[0]
+    assert tokens.count("light-dark(") > 30 and "color-scheme: light dark" in tokens  # each colour once, both themes
+    fonts = set(re.findall(r'url\("fonts/([^"]+)"\)', css))  # every font the stylesheet names is in the package
+    assert fonts and all((here / "static/fonts" / name).is_file() for name in fonts)
     assert "http://" not in css and "https://" not in css and "@import" not in css  # no font or CDN requests
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b", css.split("/* ── 2.")[1])  # colours live in the token block only
     assert "https://" not in (here / "static/admin.js").read_text()
@@ -602,5 +640,6 @@ def test_the_wheel_ships_them(tmp_path):
     names = zipfile.ZipFile(next(tmp_path.glob("*.whl"))).namelist()
     for name in ("icampus/admin/templates/base.html", "icampus/admin/templates/cache.html",
                  "icampus/admin/static/theme.css", "icampus/admin/static/htmx.min.js",
-                 "icampus/admin/static/fonts/Inter-Variable.woff2", "icampus/stt/test_clip.ogg"):
+                 "icampus/admin/static/fonts/Geist-Variable.woff2", "icampus/admin/static/fonts/Galmuri11-Bold.woff2",
+                 "icampus/admin/static/fonts/OFL-Galmuri.txt", "icampus/stt/test_clip.ogg"):
         assert name in names, name

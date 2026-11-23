@@ -1,9 +1,11 @@
+{% from "_ui.html" import mark, theme_control with context %}
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
 <meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "selfRequestsOnly": true}'>
 <title>{% block title %}{% endblock %} · iCampus admin</title>
 <link rel="stylesheet" href="/admin/static/theme.css">
@@ -13,29 +15,31 @@
 <body hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'>
 {% block body %}
 <div class="shell">
-  <aside class="sidebar">
-    <div class="sidebar__brand">
-      <span class="t-title-3">iCampus</span>
-      <span class="t-caption faint">Collector admin</span>
-    </div>
-    <nav class="nc-nav-section" aria-label="Pages">
-      <div class="nc-nav-section__items">
-        {% for key, href, label in nav %}
-        <a class="nc-nav-item nc-nav-item--accent{% if page == key %} is-active{% endif %}" href="{{ href }}"{% if page == key %} aria-current="page"{% endif %}><span class="nc-nav-item__label">{{ label }}</span></a>
-        {% endfor %}
-      </div>
-    </nav>
-    <div class="sidebar__foot">
-      <span class="t-caption faint">Signed in with the <span class="mono">{{ session.label }}</span> token</span>
-      <div class="row">
-        <button class="nc-btn nc-btn--ghost nc-btn--sm" type="button" data-theme-toggle>Light / dark</button>
-        <form class="inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="nc-btn nc-btn--secondary nc-btn--sm" type="submit">Sign out</button></form>
+  <nav class="side" aria-label="Main">
+    <a class="lockup" href="/admin/" aria-label="iCampus admin, overview">{{ mark() }}<b>iCampus</b></a>
+    <ul class="nav-list">
+      {% for key, href, label, glyph in nav %}
+      <li><a class="nav{% if page == key %} on{% endif %}" href="{{ href }}"{% if page == key %} aria-current="page"{% endif %}>{{ icon(glyph) }}<span>{{ label }}</span>
+        {%- if nav_counts and nav_counts.get(key) %}<span class="nav-badge pixel" title="{{ nav_counts[key] }} {{ nav_notes[key] }}">{{ nav_counts[key] }}<span class="sr"> {{ nav_notes[key] }}</span></span>{% endif %}</a></li>
+      {% endfor %}
+    </ul>
+    <div class="side-foot">
+      <a class="nav{% if page == 'settings' %} on{% endif %}" href="/admin/settings"{% if page == 'settings' %} aria-current="page"{% endif %}>{{ icon("settings") }}<span>Settings</span></a>
+      {{ theme_control(fill=True) }}
+      <div class="user">
+        <span class="avatar pixel" aria-hidden="true">{{ session.label[:1] }}</span>
+        <span class="user-text"><span class="t1 clip">{{ session.label }}</span><span class="mono t2">API token</span></span>
+        <form class="inline" method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="signout" type="submit" aria-label="Sign out" title="Sign out">{{ icon("signout") }}</button></form>
       </div>
     </div>
-  </aside>
-  <main class="content">
-    {% for kind, text in flash %}<div class="notice notice--{{ kind }}" role="status">{{ text }}</div>{% endfor %}
+  </nav>
+  <main class="main">
+    {% for kind, text in flash %}<div class="notice notice--{{ kind }}" role="status">{{ icon(notice_icon.get(kind, "check"), 18, 1.8) }}<span>{{ text }}</span></div>{% endfor %}
     {% block content %}{% endblock %}
+    <footer class="foot">
+      <p>Signed in with the {{ session.label }} token · Times are Asia/Seoul</p>
+      <p><span>{{ icon("check", 14, 2) }}Looking at a page never contacts iCampus</span></p>
+    </footer>
   </main>
 </div>
 {% endblock %}

@@ -128,6 +128,8 @@ class Running:
     total: int | None = None
     task: asyncio.Task | None = field(default=None, repr=False)
     removed: bool = False  # taken out of the queue by hand while it ran
+    error: str | None = None  # how the try ended, for whoever waits on it: the message when it failed,
+    transient: bool = False  # and whether that failure may pass
     note: str | None = None
     progress_at: str | None = None  # when bytes last arrived
     seen: float = field(default_factory=time.monotonic)  # when the content server last answered or sent bytes
@@ -170,8 +172,10 @@ class Videos:
         self.active: dict[str, Running] = {}  # asset id -> the download running now
         self.heartbeat_at: str | None = None  # when the worker loop last looked at the queue
         self._working = False
+        self._stopped = False  # after stop(), until something is asked for or the worker loop starts again
         self._waiters: dict[str, list[asyncio.Future]] = {}  # asset id -> who waits for its next try to end
         self._reserved: dict[str, int] = {}  # asset id -> the bytes a running download will take
+        self._no_resume: set[str] = set()  # hosts seen answering a Range request with the whole file
         self._wake = asyncio.Event()
         self._transport = transport
         self._recover()  # a restart: what was downloading goes on from the queue, nothing is dropped
@@ -181,6 +185,7 @@ class Videos:
             if leftover.name not in wanted:
                 leftover.unlink(missing_ok=True)
         cache.adopter(self.adopt)
+        cache.on_delete("video", self._copy_gone)
 
     # --- the cache ---------------------------------------------------------
 
@@ -242,6 +247,17 @@ class Videos:
     def delete(self, asset_id: str) -> bool:
         return self.cache.delete("video", asset_id)
 
+    def _copy_gone(self, entry: Any) -> None:
+        """A copy leaves the cache (deleted, or evicted for room). A failure recorded while refreshing it has
+        nothing left to describe, and must not turn "not downloaded" into "failed"."""
+        self.store.execute("DELETE FROM video_jobs WHERE asset_id=? AND state='failed'", (entry.key,))
+
+    def current(self, lecture: dict) -> bool:
+        """Whether the copy on disk is of the version of the video the last sync saw."""
+        video = lecture["video"]
+        meta = self.meta(video["asset_id"])
+        return bool(meta) and not (video.get("updated_at") and meta.get("synced_updated_at") != video["updated_at"])
+
     def _make_room(self, needed: int, keep: str, on_disk: int = 0) -> None:
         """Room for a download of `needed` bytes, `on_disk` of which are here already, beside what the other
         running downloads will still bring."""
@@ -250,11 +266,15 @@ class Videos:
             raise VideoError(f"the video ({needed / 2**30:.1f} GB) is bigger than the whole video cache "
                              f"({self.settings.video_cache_gb:g} GB, ICAMPUS_VIDEO_CACHE_GB)")
         others = {asset: size for asset, size in self._reserved.items() if asset != keep}
-        if needed + sum(others.values()) > cap:
-            raise VideoError("the video cache has no room for this video beside the downloads that are running",
-                             transient=True)
+        # and what jobs waiting for their next try have on disk: not in the cache index, but under the same cap
+        parked = sum(self._on_disk(row["asset_id"]) for row in self.store.query(
+            "SELECT asset_id FROM video_jobs WHERE state='queued'") if row["asset_id"] != keep)
+        claimed = sum(others.values()) + parked
+        if needed + claimed > cap:
+            raise VideoError("the video cache has no room for this video beside the downloads that are running "
+                             "or waiting to be continued", transient=True)
         try:
-            self.cache.make_room("video", needed + sum(others.values()), keep={("video", keep)})
+            self.cache.make_room("video", needed + claimed, keep={("video", keep)})
         except CacheFull as exc:  # what is left is pinned or waiting for a transcription: room comes back later
             raise VideoError(str(exc), transient=True) from None
         coming = sum(max(0, size - self.active[asset].done) for asset, size in others.items() if asset in self.active)
@@ -299,8 +319,7 @@ class Videos:
         if job and job["state"] in OPEN:
             out.update(self._progress(job))
         elif meta:
-            outdated = bool(video.get("updated_at")) and meta.get("synced_updated_at") != video.get("updated_at")
-            out.update(state="outdated" if outdated else "ready",
+            out.update(state="ready" if self.current(lecture) else "outdated",
                        **{k: meta.get(k) for k in ("format", "content_type", "downloaded_at", "captions", "script")},
                        size_mb=round((meta.get("size") or 0) / MB))
             if job:  # refreshing this copy failed; the old one is still here
@@ -326,10 +345,11 @@ class Videos:
                                "queued_at": _shown(job["queued_at"]),
                                "attempts": job["attempts"] + int(job["state"] == "downloading")}
         if job["state"] == "queued":
+            now = _now()  # ahead of it: the jobs asked for earlier that could start now (not those waiting out a pause)
             out["queue_position"] = 1 + self.store.one(
-                "SELECT COUNT(*) AS n FROM video_jobs WHERE state='queued' AND (queued_at<? OR (queued_at=? AND id<?))",
-                (job["queued_at"], job["queued_at"], job["id"]))["n"]
-            if job["not_before"] and job["not_before"] > _now():
+                "SELECT COUNT(*) AS n FROM video_jobs WHERE state='queued' AND (not_before IS NULL OR not_before<=?) "
+                "AND (queued_at<? OR (queued_at=? AND id<?))", (now, job["queued_at"], job["queued_at"], job["id"]))["n"]
+            if job["not_before"] and job["not_before"] > now:
                 out["retry_at"] = _shown(job["not_before"])
         else:
             out["started_at"] = _shown(job["started_at"])
@@ -378,8 +398,10 @@ class Videos:
         active = [named(row) | {k: v for k, v in self._progress(row).items() if k in shown and v is not None}
                   for row in rows if row["state"] == "downloading"]
         failed = [named(row) | {"error": row["error"], "failed_at": _shown(row["finished_at"])}
-                  for row in rows if row["state"] == "failed"]
-        waiting = [row["item_id"] for row in rows if row["state"] == "queued"]
+                  for row in sorted((r for r in rows if r["state"] == "failed"), key=lambda r: r["finished_at"] or "")]
+        now = _now()
+        waiting = [row["item_id"] for row in rows if row["state"] == "queued"
+                   and not (row["not_before"] and row["not_before"] > now)]  # a retry's pause isn't "next"
         return {"queued": counts["queued"], "downloading": counts["downloading"], "failed": counts["failed"],
                 "ready": len(self.cache.entries("video")), "active": active, "next": waiting[:5],
                 "recently_failed": failed[-5:],
@@ -409,10 +431,16 @@ class Videos:
                 self._set(job["id"], **changes)
             self._kick()
             return self.status(lecture)
-        if job and not (retry or refresh):
-            return status  # failed: shown as that (or as the copy that is still here, with `last_error`)
         if status["state"] == "ready" and not refresh:
+            if job and retry:  # the copy is current: the failure of an earlier refresh has nothing left to say
+                self.store.execute("DELETE FROM video_jobs WHERE id=?", (job["id"],))
+                return self.status(lecture)
             return status
+        if job and not (retry or refresh):
+            failed_for = (json.loads(job["lecture"]).get("video") or {}).get("updated_at")
+            if failed_for == lecture["video"].get("updated_at"):
+                return status  # failed: shown as that (or as the outdated copy that is still here, with `last_error`)
+            # a sync has seen another version of the video since: that is a new download, not a retry
         now = _now()
         fresh = {"lecture": _snapshot(lecture), "item_id": lecture.get("item_id"), "state": "queued",
                  "keep_trying": int(keep_trying), "attempts": 0, "not_before": None, "error": None, "transient": 0,
@@ -434,13 +462,13 @@ class Videos:
         if job is None:
             return False
         self.store.execute("DELETE FROM video_jobs WHERE id=?", (job["id"],))
+        self._part(asset_id).unlink(missing_ok=True)  # here, not in the task: one that hasn't run yet never would
         live = self.active.get(asset_id)
         if live and live.task and not live.task.done():
             live.removed = True
-            live.task.cancel()  # it removes its .part on the way out, and the next job starts
+            live.task.cancel()  # when it has ended, the next job starts
         else:
-            self._part(asset_id).unlink(missing_ok=True)
-            self._release(asset_id)
+            self._release(asset_id, "the download was taken out of the queue", False)
         return True
 
     async def ensure(self, lecture: dict) -> Path:
@@ -448,19 +476,19 @@ class Videos:
         same queue as exports, so /videos/{item_id} shows its progress, and this waits for the end of its next
         try. Raises VideoError; the caller decides about trying again."""
         asset_id = lecture["video"]["asset_id"]
-        if self.start(lecture, retry=True, keep_trying=False)["state"] != "ready":
+        if not self.current(lecture):  # a current copy is used as it is, even while a fresh one is on its way
+            self.start(lecture, retry=True, keep_trying=False)
             waiter = asyncio.get_running_loop().create_future()
             self._waiters.setdefault(asset_id, []).append(waiter)
             try:
-                await waiter
+                error, transient = await waiter  # how the try ended, whatever was asked of the job since
             finally:
                 if waiter in (waiting := self._waiters.get(asset_id, [])):
                     waiting.remove(waiter)
-            status = self.status(lecture)
-            if status["state"] != "ready":
-                job = self._job(asset_id)
-                raise VideoError(status.get("error") or status.get("last_error") or "the download did not finish",
-                                 transient=bool(job and (job["transient"] or job["state"] in OPEN)))
+            if error is not None:
+                raise VideoError(error, transient=transient)
+            if not self.current(lecture):  # it arrived, but it is not the version this caller read about
+                raise VideoError("a sync saw another version of the video while its download waited", transient=True)
         self.touch(asset_id)
         path = self.path(asset_id)
         if path is None:
@@ -473,7 +501,7 @@ class Videos:
         """The worker: one loop for as long as the server runs. It starts what is due when the server comes up,
         when a download is asked for or ends, and every few seconds (a retry's pause running out), and it leaves
         a heartbeat for /api/v1/status. No request has to arrive for the queue to move."""
-        self._working = True
+        self._working, self._stopped = True, False
         try:
             while True:
                 self.heartbeat_at = _now()
@@ -493,6 +521,8 @@ class Videos:
         """Starts the downloads that are due, the one asked for first going first, while fewer than
         download_concurrency are running. A job waiting out a pause after a failed try doesn't hold up the ones
         behind it."""
+        if self._stopped:
+            return
         self._recover()
         room = self._slots() - len(self.active)
         if room <= 0:
@@ -514,6 +544,7 @@ class Videos:
 
     def _kick(self) -> None:
         """Something changed in the queue: start what can start now, and let the worker loop know."""
+        self._stopped = False
         self._wake.set()
         try:
             asyncio.get_running_loop()
@@ -524,16 +555,22 @@ class Videos:
         except Exception as exc:  # the job is in the queue either way; the worker loop comes round again
             log.error("video queue: %s", type(exc).__name__)
 
-    def _release(self, asset_id: str) -> None:
+    def _release(self, asset_id: str, error: str | None, transient: bool) -> None:
+        """Tells whoever waits for this download how its try ended (error None: it is here)."""
         for waiter in self._waiters.pop(asset_id, []):
             if not waiter.done():
-                waiter.set_result(None)
+                waiter.set_result((error, transient))
 
     def _finished(self, asset_id: str, live: Running, task: asyncio.Task) -> None:
         if self.active.get(asset_id) is live:
             del self.active[asset_id]
         self._reserved.pop(asset_id, None)
-        self._release(asset_id)
+        if live.removed:
+            self._release(asset_id, "the download was taken out of the queue", False)
+        elif task.cancelled():
+            self._release(asset_id, "the server is stopping", True)
+        else:
+            self._release(asset_id, live.error, live.transient)
         self._wake.set()
         if task.cancelled() and not live.removed:
             return  # the server is stopping: nothing new starts
@@ -545,6 +582,7 @@ class Videos:
     async def stop(self) -> None:
         """Server shutdown: running downloads stop where they are. The jobs stay in the database and what arrived
         stays on disk, so the next start goes on without anyone asking."""
+        self._stopped = True  # a download that ends by itself right now must not start the next one
         tasks = [live.task for live in self.active.values() if live.task]
         for task in tasks:
             task.cancel()
@@ -584,28 +622,37 @@ class Videos:
                           last_progress_at=live.progress_at or job["last_progress_at"])
             raise
         except VideoError as exc:
-            self._failed(job, str(exc), exc.transient)
+            self._failed(job, live, str(exc), exc.transient)
         except TimeoutError:
-            self._failed(job, f"the download took longer than {MAX_DOWNLOAD_S // 3600} hours", True)
+            self._failed(job, live, f"the download took longer than {MAX_DOWNLOAD_S // 3600} hours", True)
         except httpx.HTTPError as exc:  # the message can hold the redirect URL: keep only the type
-            self._failed(job, f"lcms.skku.edu: {type(exc).__name__}", True)
+            self._failed(job, live, f"lcms.skku.edu: {type(exc).__name__}", True)
         except OSError as exc:
-            self._failed(job, f"could not write the video to disk ({errno.errorcode.get(exc.errno, 'OSError')})", True)
+            name = errno.errorcode.get(exc.errno, "OSError")
+            self._failed(job, live, f"could not write the video to disk ({name})", True)
         except Exception as exc:
             log.warning("video %s: %s", asset_id, type(exc).__name__)
-            self._failed(job, type(exc).__name__, False)
+            self._failed(job, live, type(exc).__name__, False)
+        finally:
+            # With the try, not in the done-callback a moment later: by then the file is in the cache index, and
+            # another download making room meanwhile would count it twice.
+            self._reserved.pop(asset_id, None)
 
-    def _failed(self, job: dict, message: str, transient: bool) -> None:
+    def _failed(self, job: dict, live: Running, message: str, transient: bool) -> None:
         """A try failed. One that may pass is made again after a pause, as often as export_retries allows (never
         for a download whose caller retries by itself); anything else ends the job, visibly."""
         asset_id = job["asset_id"]
+        live.error, live.transient = message, transient
         current = self._job(asset_id)  # an export may have asked for it while it ran
         if current is None or current["id"] != job["id"]:
             self._part(asset_id).unlink(missing_ok=True)
             return  # taken out of the queue meanwhile
         attempts = job["attempts"] + 1
         retries = int(self.settings.export_retries) if current["keep_trying"] else 0
+        host = (json.loads(job["lecture"]).get("video") or {}).get("host", "lcms.skku.edu")
         if transient and attempts <= retries:
+            if host in self._no_resume:  # this server starts every download over: what arrived is of no use
+                self._part(asset_id).unlink(missing_ok=True)
             pause = RETRY_AFTER_S[min(attempts, len(RETRY_AFTER_S)) - 1]
             again = datetime.now(KST) + timedelta(seconds=pause)
             self._set(job["id"], state="queued", attempts=attempts, error=message, transient=1,
@@ -614,7 +661,7 @@ class Videos:
             return
         self._part(asset_id).unlink(missing_ok=True)
         if transient and retries:
-            message = f"{message} (gave up after {attempts} tries)"
+            message = live.error = f"{message} (gave up after {attempts} tries)"
         self._set(job["id"], state="failed", attempts=attempts, error=message, transient=int(transient),
                   not_before=None, downloaded_bytes=0, finished_at=_now())
         log.warning("video %s failed: %s", asset_id, message)
@@ -720,16 +767,19 @@ class Videos:
                         if total and total > cap:
                             raise VideoError(f"the video is {total / 2**30:.1f} GB; only videos up to "
                                              f"{self.settings.video_max_gb:g} GB are downloaded")
+                        if offset and not resumed:  # a Range request answered with the whole file
+                            self._no_resume.add(host)
                         if kept and not resumed:  # the whole file again. Said, so that it isn't a silent reset.
                             live.note = (f"the content server did not continue the interrupted download: this try "
                                          f"started over from zero ({kept // MB} MB had arrived before)")
                             log.info("video %s: the content server did not honour Range; starting over", asset_id)
                         live.restart(offset if resumed else 0, total)
-                        self._set(job["id"], total_bytes=total, downloaded_bytes=live.done, part_version=version,
-                                  validator=_validator(r.headers) if plain else None, boot=_BOOT,
-                                  last_progress_at=_now())
                         fd = os.open(part, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if resumed else os.O_TRUNC), 0o600)
                         with os.fdopen(fd, "ab" if resumed else "wb") as f:
+                            # the file first, then what the row says about it: never a row describing other bytes
+                            self._set(job["id"], total_bytes=total, downloaded_bytes=live.done, part_version=version,
+                                      validator=_validator(r.headers) if plain else None, boot=_BOOT,
+                                      last_progress_at=_now())
                             async for chunk in r.aiter_bytes():
                                 f.write(chunk)
                                 f.flush()  # into the kernel's cache, where it outlives this process
@@ -742,7 +792,9 @@ class Videos:
                     break
         except TimeoutError:
             raise VideoError(f"the content server sent nothing for {STALL_S:g} seconds", transient=True) from None
-        if exact is not None and live.done != exact:
+        # Complete? By the size the content server gave with the file; without one, at least not less than the
+        # size Commons describes (an answer with no length can end early without the connection saying so).
+        if live.done != exact if exact is not None else live.done < original:
             raise VideoError("the download was cut short; try again", transient=True)
         with open(part, "rb") as f:
             head = f.read(16)

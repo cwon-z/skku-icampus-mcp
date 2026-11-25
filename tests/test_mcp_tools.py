@@ -99,6 +99,10 @@ async def test_export_video_links_when_ready(monkeypatch):
     assert calls[-1][2] == {} and "link" not in body and "retry=True" in body["next"] and "ReadTimeout" in body["error"]
     answer = {"state": "queued", "item_id": "7002", "queue_position": 3}
     assert await server.export_video("7002", retry=True) == answer and calls[-1][2] == {"retry": True}
+    answer = {"state": "ready", "item_id": "7002", "size_mb": 100, "last_error": "an earlier refresh failed"}
+    assert "next" not in await server.export_video("7002")  # the copy is fine: nothing to retry
+    answer = {"state": "outdated", "item_id": "7002", "size_mb": 100, "last_error": "the refresh failed"}
+    assert "retry=True" in (await server.export_video("7002"))["next"]
     with pytest.raises(ToolError):
         await server.export_video("../7002")
     tools = {t.name: t.annotations for t in await server.mcp.list_tools()}

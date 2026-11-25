@@ -219,18 +219,26 @@ from zero without saying so. From outside that looked like a queue that stalls, 
   date) and continues only if the answer is a 206 from that byte, of the same total size, for the same video
   version, and the part was written during this run of the machine (the kernel's boot id: after a power cut the
   last bytes of a file can't be trusted). Anything else, including the 200 lcms answers with today, takes the
-  whole file again, and the status carries a note saying so.
+  whole file again, and the status carries a note saying so. A host seen answering a Range request with the
+  whole file is remembered while the server runs: after a failed try nothing is kept for it. What waiting jobs do
+  keep on disk counts against `video_cache_gb` when the next download makes room.
 - **Stalls and retries.** A try ends when the content server sends nothing for 60 seconds (describing the video,
   answering, or in the middle of the file), or after 6 hours. Failures that may pass (those, 5xx and 429, a
   download cut short, a full cache or disk) are tried again after 30 s, 2 min, 5 min, 15 min, 30 min, then every
   hour, `export_retries` (6) times; a job waiting out a pause does not hold up the ones behind it. Then, or at
   once for a failure retrying can't fix, the job is `failed` with the reason.
 - **No silent restart.** `POST /videos/{item_id}` on a failed job answers with the failure. Only `retry=true` (the
-  admin UI's download button, `export_video(retry=True)`) queues it again, at the back.
+  admin UI's download button, `export_video(retry=True)`) queues it again, at the back. Two things are not a
+  retry and need none: a video whose refresh failed while its copy is still current (the copy is the answer, and
+  `retry` only clears the old failure), and one a sync has seen a newer version of since it failed (a new
+  download). A failure recorded while refreshing a copy goes when that copy leaves the cache.
 - **Transcription jobs** go through the same queue but ask for one try only (`keep_trying` off): their retries
   stay with the transcription queue (`download_retries`), so a job that waits for a retry gives its prefetch slot
-  back. If the same video is also exported, the export's retries apply.
-- **What a status says.** `queue_position`, `attempts`, `last_error`, `retry_at`; while downloading
+  back. If the same video is also exported, the export's retries apply. A job uses a current copy as it is, even
+  while a fresh one is on its way, and one whose video changed while its download waited is tried again rather
+  than failed.
+- **What a status says.** `queue_position` (among the jobs that could start now: one waiting out a pause is not
+  ahead of anyone), `attempts`, `last_error`, `retry_at`; while downloading
   `downloaded_mb`, `total_mb` (from the Commons description, then `Content-Length`), `speed_mbps` (megabytes per
   second over the last 20 seconds), `eta_s`, `last_progress_at`, and `stalled` after 15 seconds without data.
   `/api/v1/status` has the whole queue under `exports`, with the worker's heartbeat. The size from the iCampus

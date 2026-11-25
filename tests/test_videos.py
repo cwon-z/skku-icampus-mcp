@@ -555,6 +555,180 @@ async def test_a_download_cut_short_keeps_what_arrived_for_the_next_try(tmp_path
     assert v.path("a1b2c3").read_bytes() == body
 
 
+async def test_what_waits_to_be_continued_counts_against_the_cache(tmp_path):
+    body = MP4 * 50
+    cap = int(1.5 * len(body))
+    commons = Commons(body=body, ranges=True)
+    commons.cut, commons.first = True, 150_000
+    v = videos(tmp_path, commons, video_cache_gb=cap / 2**30)
+    a, b = lecture("aaa111", "1"), lecture("bbb222", "2")
+    v.start(a)
+    v.start(b)
+    await v.drain()
+    on_disk = lambda: sum(f.stat().st_size for f in (tmp_path / "videos").iterdir() if f.suffix != ".json")
+    assert v.status(a)["state"] == "queued" and (tmp_path / "videos" / "aaa111.part").stat().st_size == 150_000
+    waiting = v.status(b)  # the second video and what the first has on disk don't both fit: it waits
+    assert waiting["state"] == "queued" and "waiting to be continued" in waiting["last_error"]
+    assert on_disk() <= cap and v.used_bytes() == 0
+    due_now(v)
+    await v.drain()
+    assert commons.asked == [None, "bytes=150000-", None] and v.status(b)["state"] == "ready" and on_disk() <= cap
+
+
+async def test_nothing_is_kept_for_a_server_seen_not_to_continue(tmp_path):
+    body = MP4 * 50
+    commons = Commons(body=body)  # like lcms: the whole file, whatever Range says
+    commons.hold, commons.first = asyncio.Event(), 70_000
+    first = videos(tmp_path, commons)
+    lec = lecture()
+    first.start(lec)
+    await until(lambda: first.active["a1b2c3"].done == 70_000)
+    await first.stop()
+
+    commons.hold, commons.cut = None, True
+    second = videos(tmp_path, commons)
+    await second.drain()  # asks for the rest, gets the file from its start, and that answer ends early
+    status = second.status(lec)
+    assert status["state"] == "queued" and "cut short" in status["last_error"] and status["downloaded_mb"] == 0
+    assert not list(tmp_path.glob("videos/*.part")) and rows(second)[0]["downloaded_bytes"] == 0  # no dead weight
+    due_now(second)
+    await second.drain()
+    assert commons.asked == [None, "bytes=70000-", None] and second.path("a1b2c3").read_bytes() == body
+
+
+async def test_an_answer_without_a_length_that_ends_early_is_not_taken_for_the_file(tmp_path):
+    body = MP4 * 50
+
+    class NoLength(Commons):
+        def __call__(self, request):
+            answer = super().__call__(request)
+            if request.url.path == "/index.php":
+                del answer.headers["content-length"]
+            return answer
+    commons = NoLength(body=body)
+    commons.cut, commons.first = True, 70_000
+    v = videos(tmp_path, commons)
+    lec = lecture()
+    status = await finish(v, lec)  # Commons described 200 600 bytes; 70 000 came
+    assert status["state"] == "queued" and "cut short" in status["last_error"] and v.path("a1b2c3") is None
+    due_now(v)
+    await v.drain()
+    assert v.path("a1b2c3").read_bytes() == body
+
+
+async def test_a_failed_refresh_does_not_outlive_what_it_was_about(tmp_path):
+    commons = Commons()
+    v = videos(tmp_path, commons)
+    lec = lecture()
+    await finish(v, lec)
+    commons.deleted = True
+    assert "no longer has" in (await finish(v, lec, refresh=True))["last_error"] and v.summary()["failed"] == 1
+    # asked for with retry while the copy is current: the old failure goes, nothing is downloaded again
+    again = v.start(lec, retry=True)
+    assert again["state"] == "ready" and "last_error" not in again and v.summary()["failed"] == 0
+    assert rows(v) == [] and commons.downloads == 1
+
+    await finish(v, lec, refresh=True)
+    assert v.summary()["failed"] == 1
+    v.delete("a1b2c3")  # the copy leaves the cache: the video is not downloaded, not "failed"
+    assert v.status(lec)["state"] == "not_downloaded" and rows(v) == []
+
+    commons.deleted = False
+    await finish(v, lec)
+    commons.deleted = True
+    await finish(v, lec, refresh=True)
+    commons.deleted = False
+    newer = lecture(updated="20260401120000")  # a sync sees a new version after that refresh failed
+    assert v.status(newer)["state"] == "outdated" and v.status(newer)["last_error"]
+    assert v.start(newer)["state"] == "downloading"  # exporting again fetches it: a new download, not a retry
+    await v.drain()
+    assert v.status(newer)["state"] == "ready" and "last_error" not in v.status(newer)
+
+    newest = lecture(updated="20260501120000")
+    commons.deleted = True
+    assert (await finish(v, newest))["state"] == "outdated"  # the refresh for this version fails
+    asked = len(commons.seen)
+    assert v.start(newest)["state"] == "outdated" and v.active == {} and len(commons.seen) == asked  # not started over
+    commons.deleted = False
+    assert v.start(newest, retry=True)["state"] == "downloading"
+    await v.drain()
+    assert v.status(newest)["state"] == "ready"
+
+
+async def test_a_current_copy_is_used_while_a_fresh_one_is_on_its_way(tmp_path):
+    commons = Commons()
+    v = videos(tmp_path, commons)
+    lec = lecture()
+    await finish(v, lec)
+    commons.hold = asyncio.Event()
+    assert v.start(lec, refresh=True)["state"] == "downloading"
+    assert (await asyncio.wait_for(v.ensure(lec), 1)).read_bytes() == MP4  # without waiting for the refresh
+    commons.hold.set()
+    await v.drain()
+    assert commons.downloads == 2
+
+
+async def test_a_newer_version_seen_while_waiting_is_a_reason_to_try_again_not_a_failure(tmp_path):
+    from icampus.store import Record
+
+    commons = Commons()
+    v = videos(tmp_path, commons)
+    old, new = lecture(), lecture(updated="20260401120000")
+    v.store.replace_scope("lectures", "course:1001", [Record(new["key"], "1001", None, new)], datetime.now(KST))
+    with pytest.raises(VideoError, match="another version") as failure:
+        await v.ensure(old)  # the caller read the row before the sync; the download took the version after it
+    assert failure.value.transient and v.status(new)["state"] == "ready"
+    assert (await v.ensure(new)).read_bytes() == MP4 and commons.downloads == 1
+
+
+async def test_nothing_starts_after_stop_until_something_is_asked_for(tmp_path):
+    commons = Commons()
+    commons.hold = asyncio.Event()
+    v = videos(tmp_path, commons)
+    a, b = lecture("aaa111", "1"), lecture("bbb222", "2")
+    v.start(a)
+    v.start(b)
+    await until(lambda: commons.open == 1)
+    await v.stop()
+    v.tick()  # what the done-callback of a download that ended by itself during shutdown would do
+    assert v.active == {} and [r["state"] for r in rows(v)] == ["queued", "queued"] and commons.order == ["aaa111"]
+    commons.hold = None
+    v.start(a)  # asked again: the queue is in use
+    await v.drain()
+    assert commons.order == ["aaa111", "aaa111", "bbb222"] and len(v.cached()) == 2
+
+
+async def test_cancel_right_after_a_retry_was_started_leaves_no_part(tmp_path):
+    commons = Commons(body=MP4 * 50, ranges=True)
+    commons.cut, commons.first = True, 70_000
+    v = videos(tmp_path, commons)
+    lec = lecture()
+    await finish(v, lec)  # cut short: it waits with what arrived
+    assert v.start(lec, retry=True)["state"] == "downloading"  # claimed, but its task has not run a step yet
+    assert v.cancel("a1b2c3")
+    await asyncio.sleep(0.05)
+    assert not list(tmp_path.glob("videos/*.part")) and v.active == {} and rows(v) == []
+    assert v.status(lec)["state"] == "not_downloaded"
+
+
+async def test_a_job_waiting_out_a_pause_is_not_counted_ahead_of_those_that_can_run(tmp_path):
+    commons = Commons()
+    commons.fail = [503]
+    v = videos(tmp_path, commons)
+    a, b, c = lecture("aaa111", "1"), lecture("bbb222", "2"), lecture("ccc333", "3")
+    assert (await finish(v, a))["retry_at"]  # the first one failed a try and waits 30 seconds
+    commons.hold = asyncio.Event()
+    v.start(b)
+    v.start(c)
+    await until(lambda: commons.open == 1)
+    assert v.status(c)["queue_position"] == 1 and v.summary()["next"] == ["3"] and v.summary()["queued"] == 2
+    commons.hold.set()
+    await v.drain()
+    due_now(v)
+    await v.drain()
+    assert [v.status(x)["state"] for x in (a, b, c)] == ["ready"] * 3
+
+
 async def test_a_job_that_failed_goes_to_the_back_when_it_is_asked_for_again(tmp_path):
     commons = Commons(deleted=True)
     v = videos(tmp_path, commons)

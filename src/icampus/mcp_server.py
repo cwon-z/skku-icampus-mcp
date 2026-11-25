@@ -282,7 +282,7 @@ def _export(status: dict) -> dict:
     item_id = status.get("item_id")
     if status.get("state") == "ready":
         status["link"] = _video_link(item_id)
-    if status.get("state") == "failed" or (status.get("last_error") and status.get("failed_at")):
+    if status.get("state") == "failed" or (status.get("state") == "outdated" and status.get("last_error")):
         status["next"] = f"export_video(item_id='{item_id}', retry=True) queues it again"
     return status
 

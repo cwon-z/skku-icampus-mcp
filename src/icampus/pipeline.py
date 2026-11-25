@@ -334,7 +334,7 @@ class Pipeline:
         hours = self.hours(lecture)
         out: dict[str, Any] = {"item_id": lecture["item_id"], "title": lecture.get("title"), "estimate_only": True,
                                "hours": round(hours, 2) or None, "language": language or "detected by the provider",
-                               "video_cached": self.videos.status(lecture)["state"] == "ready",
+                               "video_cached": self.videos.current(lecture),
                                "download_mb": round((lecture["video"].get("listed_size") or 0) / 2**20) or None}
         try:
             choices = self.registry.choose(model=model, course=course, language=language, hours=hours)
@@ -707,7 +707,7 @@ class Pipeline:
             self.cache.delete("audio", key)  # from an older version of the video
         if not audio.available():
             raise _Fail("ffmpeg is not installed on this server, so audio can't be extracted")
-        source = self.videos.path(asset_id) if self.videos.status(lecture)["state"] == "ready" else None
+        source = self.videos.path(asset_id) if self.videos.current(lecture) else None
         if source is None:
             other = next((e for e in self.cache.entries("audio") if e.meta.get("asset_id") == asset_id
                           and e.meta.get("version") == version), None)

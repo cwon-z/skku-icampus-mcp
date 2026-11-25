@@ -35,6 +35,13 @@ university's rules when you use it.
   involved. Videos stay in `var/videos` (up to `ICAMPUS_VIDEO_CACHE_GB`, 30 by default; the least recently
   used go first) and are reused until a sync sees a new version. YouTube and Zoom lectures aren't covered.
   Lecture videos are copyrighted: keep them for your own study.
+- **A download queue that runs by itself.** Exporting a video adds it to a queue in SQLite and returns. A worker
+  that starts with the server downloads the queue in the order the videos were asked for, one at a time
+  (`download_concurrency`), whether or not anyone asks again. A restart keeps the queue and what had arrived of
+  the video it interrupted; a try that stalls (no data for a minute) or fails in a way that may pass is made
+  again after 30 seconds, then with longer pauses (`export_retries`, 6), and after that the export is `failed`
+  with the reason. A failed export is never started over unasked: asking again reports the failure until you
+  ask with `retry`. `/api/v1/status` shows the queue and the worker's heartbeat.
 - **Transcripts, on request or by the batch.** A job downloads the video (as above), cuts out the sound with
   ffmpeg and sends it to a speech-to-text provider: ElevenLabs Scribe, or any server with OpenAI's
   `/audio/transcriptions` route (OpenAI, Groq, a self-hosted Whisper). Several providers can be registered; a
@@ -87,7 +94,7 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | Endpoint | Notes |
 |---|---|
 | `GET /health` | no auth |
-| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run |
+| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run; `exports`: the video download queue (queued, downloading, failed, ready, what is active, what failed last) and its worker's heartbeat |
 | `POST /api/v1/sync` | Returns 202 started, 409 running, 429 cooldown or 423 blocked. `?retry_login=true` needs an `admin` token |
 | `GET /api/v1/courses` | codes, instructors, current grade |
 | `GET /api/v1/tasks` | merged to-do list: `course, kind, status, due_within_days=14, past_days=0, include_done, include_inactive, limit` |
@@ -96,10 +103,11 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/files/{id}` | an announcement or assignment attachment and its text: `offset, max_chars=20000`. Downloads it on first use |
 | `GET /api/v1/files/{id}/content` | the file itself |
 | `GET /api/v1/lectures` | `course, week, kind, incomplete_only, available_only, upcoming_only, include_attendance, limit`. Hosted videos carry `transcript` (`state`: none, queued, …, ready, outdated; `model`) |
-| `GET /api/v1/videos` | lecture videos kept on the server, and how full the cache is |
-| `POST /api/v1/videos/{item_id}` | download a lecture video to the server unless it's cached (202 while it downloads, 200 when ready) |
-| `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued, downloading (with `downloaded_mb`), ready, outdated or failed |
-| `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy (admin token) |
+| `GET /api/v1/videos` | lecture videos kept on the server, and how full the cache is; `queue`: every download that hasn't finished, in the order they run |
+| `POST /api/v1/videos/{item_id}` | put a lecture video in the download queue unless it's cached (202 while it waits or downloads, 200 otherwise). Asking again only reads the status; `?retry=true` queues a failed one again |
+| `POST /api/v1/videos` | the same for several, `{"item_ids": [...], "retry": false}`: they join the queue in the order given |
+| `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued (`queue_position`; after a failed try `attempts`, `last_error`, `retry_at`), downloading (`downloaded_mb`, `total_mb`, `speed_mbps` in MB per second, `eta_s`, `last_progress_at`, `stalled`), ready (`size_mb`), outdated or failed (`error`, `attempts`, `retryable`) |
+| `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy and takes its download out of the queue (admin token) |
 | `GET /api/v1/lectures/stats` | per course and in total: videos, hours, exportable hours and GB, transcribed hours, cost of the rest per provider |
 | `GET /api/v1/stt/models` | the speech-to-text providers: description, cost per hour, word timestamps, languages, health, cap left |
 | `POST /api/v1/transcripts/{item_id}` | transcribe a lecture: `model, language, force, estimate_only`. 202 with the job, 200 when a transcript exists, 409 with `working_models` when the named model can't run |
@@ -135,13 +143,18 @@ A few fields to read carefully:
 ## MCP
 
 Tools: `sync_status`, `list_courses`, `list_tasks`, `list_announcements`, `read_announcement`,
-`read_assignment`, `read_attachment`, `list_lectures`, `export_video`, `get_grades`, `refresh`. All are read-only
-except `refresh`, which asks for a sync; `read_attachment`, whose first read of a file downloads it from iCampus
-(so clients may ask before running it) and which returns text, or the picture itself for images; and
-`export_video`, which saves a lecture video (`exportable` in `list_lectures`) to the server. Call it again to follow
-the download; when it is ready it returns a link, `<ICAMPUS_MCP_PUBLIC_URL>/videos/<item_id>`. The MCP server streams
-the file from the API behind the same auth as `/mcp`, so over Cloudflare Access the link opens in a signed-in
-browser. Without `ICAMPUS_MCP_PUBLIC_URL` the link is the API address (bearer token needed).
+`read_assignment`, `read_attachment`, `list_lectures`, `export_video`, `export_videos`, `get_grades`, `refresh`. All
+are read-only except `refresh`, which asks for a sync; `read_attachment`, whose first read of a file downloads it
+from iCampus (so clients may ask before running it) and which returns text, or the picture itself for images; and
+`export_video`, which puts a lecture video (`exportable` in `list_lectures`) in the server's download queue. The
+server works through that queue by itself; calling the tool again only reads the progress (place in the queue,
+megabytes, speed, ETA, the last error) and never restarts anything: a failed export says why and stays failed until
+`retry=True`. `export_videos` does the same for a list, which joins the queue in the order given, and `sync_status`
+shows the whole queue under `exports`. When a video is ready the tool returns a link,
+`<ICAMPUS_MCP_PUBLIC_URL>/videos/<item_id>`. The MCP server streams the file from the API behind the same auth as
+`/mcp`, so over Cloudflare Access the link opens in a signed-in browser. Without `ICAMPUS_MCP_PUBLIC_URL` the link is
+the API address (bearer token needed). The size `list_lectures` shows (`video_mb_estimate`) is what iCampus lists;
+the file itself can be several times smaller, and an export reports the real size as soon as it knows it.
 
 Transcript tools:
 
@@ -217,7 +230,7 @@ in the UI wins, and the page shows which is in force) or through `PUT /api/v1/se
 
 | Group | Settings |
 |---|---|
-| Storage | `video_cache_gb` (30), `video_max_gb` (4), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
+| Storage | `video_cache_gb` (30), `video_max_gb` (4), `download_concurrency` (1), `export_retries` (6), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
 | Sync | `sync_times`, `sync_jitter_min` (10), `manual_cooldown_min` (10), `stale_hours` (12) |
 | Transcription jobs | `prefetch_limit` (2), `keep_video_after_processing` (on), `download_retries` (3), `ffmpeg_threads` (1), `slides_enabled` (on), `slides_scene_threshold` (0.1), `slides_width` (960), `stt_auto_transcribe` (off), `stt_auto_courses`, `stt_auto_retranscribe` (off) |
 | Speech-to-text | `stt_default_provider`, `stt_fallback_order`, `stt_routing_rules`, `stt_default_language`, `stt_course_languages`, `stt_course_terms`, `stt_min_timestamps` (segment), `stt_chunk_minutes` (20), `stt_audio_bitrate_kbps` (24), `stt_fail_threshold` (3), `stt_skip_minutes` (15) |
@@ -241,6 +254,8 @@ The MCP container never gets your SSO password, a speech-to-text key or the data
 Upgrading an existing install needs nothing by hand: the database migrates in place, videos and attachments
 already on disk are indexed instead of downloaded again, and if the stored lecture rows come from an older
 version one sync runs at start (through the usual cooldown and login guard). The image now includes ffmpeg.
+Video downloads that were waiting when an older version stopped are not carried over (it kept them in memory):
+export them once more, and from then on the queue survives restarts.
 For transcripts, put `ELEVENLABS_API_KEY=...` in `.env` (or register another provider), then open `/admin/stt`
 and press *Test*.
 
@@ -252,7 +267,7 @@ MIT — see [LICENSE](LICENSE).
 
 | Path | What |
 |---|---|
-| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
+| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos and their download queue, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
 | `src/icampus/` (transcripts) | `cache.py` the cache manager, `runtime.py` the settings registry, `audio.py` ffmpeg, `frames.py` slide frames, `stt/` providers and their registry, `pipeline.py` the job queue, `transcripts.py` storage and search, `api_transcripts.py` |
 | `src/icampus/admin/` | the admin UI: `__init__.py` (sessions, CSRF, pages), `templates/`, `static/` (theme, htmx, fonts) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |

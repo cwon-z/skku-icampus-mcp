@@ -33,7 +33,7 @@ unclear. Provider setup has its own page: [stt-providers.md](stt-providers.md). 
                  │  cache.py     index + caps + LRU over video/audio/attachment/transcript │
  POST /transcripts ─► pipeline.py  jobs in SQLite: queued → downloading → extracting →    │
                  │       │           transcribing → done | failed | paused_budget | canceled│
-                 │       ├─ videos.py   the existing downloader and its one-at-a-time lock │
+                 │       ├─ videos.py   the downloader and its queue (part 6)              │
                  │       ├─ audio.py    ffmpeg: extract, find silences, cut chunks         │
                  │       ├─ stt/        registry, routing, budget, health; two adapters ───┼──► ElevenLabs / any
                  │       └─ transcripts.py  JSON under var/transcripts, rows, FTS5 search  │    OpenAI-compatible server
@@ -108,7 +108,8 @@ unclear. Provider setup has its own page: [stt-providers.md](stt-providers.md). 
   cap waits in `paused_budget` and resumes when the period rolls over or the cap is raised.
 - **Pipeline.** Jobs are rows in `jobs`, so the queue survives restarts (anything caught mid-stage goes back to
   `queued`, and finished stages are found on disk and skipped). Per job: (1) the video, through
-  `Videos.ensure()`, which shares the export lock and job record; (2) audio with ffmpeg, mono 16 kHz Opus at
+  `Videos.ensure()`, which puts it in the same download queue exports use (part 6) and waits for the end of its
+  next try; (2) audio with ffmpeg, mono 16 kHz Opus at
   24 kbps by default (format and bitrate per provider), one ffmpeg at a time with `-threads 1`; (3) chunks only if
   the provider's upload or duration limit requires them, cut in the middle of the silence nearest the target
   length, timestamps shifted back and joined; (4) transcribe, store, index.
@@ -200,6 +201,43 @@ Served by the API at `/admin`, because that service owns the data and the settin
   describe N of them, without cookies, and never requests a download address (fetching a material may count
   as opening it). Its report decides what, if anything, is built next.
 
+### Part 6: the video download queue (`videos.py`)
+
+Added after a day on which 5 of 23 queued exports finished. The queue used to be a dict of asyncio tasks behind a
+lock: a restart dropped every waiting job and deleted the partial file, a failed job stayed failed until the next
+request for it, and that request (`export_video`, which follows a download by asking for it again) started it over
+from zero without saying so. From outside that looked like a queue that stalls, resets and moves only when polled.
+
+- **Jobs are rows** in `video_jobs`: one per video that is waiting, downloading or failed, with what the download
+  needs from the synced lecture row. A finished job's row is deleted; the cache index is what says a video is here.
+- **One worker loop**, started in the app's lifespan like the transcription queue's. It starts what is due when the
+  server comes up, when something is asked for or ends, and every 5 seconds, and it records a heartbeat. Jobs run
+  in the order they were asked for (`ORDER BY queued_at, id`), `download_concurrency` (1) at a time; a job is
+  claimed with `UPDATE ... WHERE state='queued'`.
+- **Restarts.** At start every `downloading` row goes back to `queued` in its old place. What had arrived stays in
+  `<asset>.part`; the next try asks for the rest (`Range`, with `If-Range` when the first answer had an ETag or a
+  date) and continues only if the answer is a 206 from that byte, of the same total size, for the same video
+  version, and the part was written during this run of the machine (the kernel's boot id: after a power cut the
+  last bytes of a file can't be trusted). Anything else, including the 200 lcms answers with today, takes the
+  whole file again, and the status carries a note saying so.
+- **Stalls and retries.** A try ends when the content server sends nothing for 60 seconds (describing the video,
+  answering, or in the middle of the file), or after 6 hours. Failures that may pass (those, 5xx and 429, a
+  download cut short, a full cache or disk) are tried again after 30 s, 2 min, 5 min, 15 min, 30 min, then every
+  hour, `export_retries` (6) times; a job waiting out a pause does not hold up the ones behind it. Then, or at
+  once for a failure retrying can't fix, the job is `failed` with the reason.
+- **No silent restart.** `POST /videos/{item_id}` on a failed job answers with the failure. Only `retry=true` (the
+  admin UI's download button, `export_video(retry=True)`) queues it again, at the back.
+- **Transcription jobs** go through the same queue but ask for one try only (`keep_trying` off): their retries
+  stay with the transcription queue (`download_retries`), so a job that waits for a retry gives its prefetch slot
+  back. If the same video is also exported, the export's retries apply.
+- **What a status says.** `queue_position`, `attempts`, `last_error`, `retry_at`; while downloading
+  `downloaded_mb`, `total_mb` (from the Commons description, then `Content-Length`), `speed_mbps` (megabytes per
+  second over the last 20 seconds), `eta_s`, `last_progress_at`, and `stalled` after 15 seconds without data.
+  `/api/v1/status` has the whole queue under `exports`, with the worker's heartbeat. The size from the iCampus
+  listing is only shown while nothing better is known, as `listed_size_mb_estimate`.
+- **Order across calls.** First in, first out is by arrival at the API. Calls sent side by side arrive in no
+  particular order, so `POST /api/v1/videos` (MCP: `export_videos`) takes a list and queues it in that order.
+
 ## Schema changes
 
 `PRAGMA user_version` now means something: `MIGRATIONS` is a list of scripts, one per version, applied in order
@@ -210,6 +248,7 @@ at start. Every statement is `IF NOT EXISTS` and nothing is dropped or rewritten
 | 1 | (existing) `records`, `scopes`, `runs`, `state` |
 | 2 | `settings` (runtime overrides), `cache_entries` (the cache index) |
 | 3 | `stt_providers`, `stt_usage`, `jobs`, `transcripts`, `segments`, and the FTS table `segments_fts` when SQLite supports it |
+| 4 | `video_jobs` (the video download queue) |
 
 Slides need no schema change: their index is a cache entry of kind `frames`, and each directory's `index.json`
 says what it belongs to.

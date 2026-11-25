@@ -70,11 +70,11 @@ def _client(timeout: float | None) -> httpx.AsyncClient:
                              headers={"Authorization": f"Bearer {settings.api_token}"})
 
 
-async def _call(method: str, path: str, *, timeout: float = 30, **params: Any) -> dict:
+async def _call(method: str, path: str, *, timeout: float = 30, body: Any = None, **params: Any) -> dict:
     params = {k: v for k, v in params.items() if v is not None}
     async with _client(timeout) as client:
         try:
-            resp = await client.request(method, path, params=params)
+            resp = await client.request(method, path, params=params, json=body)
         except httpx.HTTPError as exc:
             raise ToolError(f"icampus API unreachable at {settings.api_url} ({type(exc).__name__})") from None
     try:
@@ -90,7 +90,10 @@ async def _call(method: str, path: str, *, timeout: float = 30, **params: Any) -
 @mcp.tool(annotations=READ)
 async def sync_status() -> dict:
     """When the data was last refreshed (per dataset), whether the last runs worked, and any login problem.
-    Call this first if answers look stale or empty."""
+    Call this first if answers look stale or empty. `exports` is the queue of lecture video downloads: how many
+    are queued, downloading, failed and ready, what is downloading now (`active`, with megabytes, speed and ETA),
+    which items are next, the last failures with their errors, and the worker's `heartbeat_at` (it looks at the
+    queue every few seconds; an old heartbeat or `running: false` means the queue is not being worked)."""
     return await _call("GET", "/api/v1/status")
 
 
@@ -190,13 +193,14 @@ async def read_attachment(file_id: str, offset: int = 0) -> list[dict | str | Im
 
 
 def _lecture(row: dict) -> dict:
-    """A lecture row for the model: the Commons details become a size and a flag that export_video and
-    transcribe_lecture work; the transcript's state shows once there is something to say about it."""
+    """A lecture row for the model: the Commons details become a flag that export_video and transcribe_lecture
+    work and the size iCampus lists, which is an estimate (the file can be several times smaller); the transcript's
+    state shows once there is something to say about it."""
     row = _row(row, STATUS_NOISE)
     if video := row.pop("video", None):
         row["exportable"] = True
         if video.get("listed_size"):
-            row["video_mb"] = round(video["listed_size"] / 2**20)
+            row["video_mb_estimate"] = round(video["listed_size"] / 2**20)
     transcript = row.pop("transcript", None) or {}
     if transcript.get("state", "none") != "none":
         row["transcript"] = transcript["state"]
@@ -211,7 +215,8 @@ async def list_lectures(course: str | None = None, week: int | None = None, kind
                         include_attendance: bool = False, limit: int = 60) -> dict:
     """Lecture videos/materials with a `status` (from their completion and attendance), soonest deadline first.
     By default: items already open, not completed, whose deadline (incl. late period) has not passed.
-    For quizzes and assignments list_tasks is better: it has the Canvas submission.
+    For quizzes and assignments list_tasks is better: it has the Canvas submission. `video_mb_estimate` is the size
+    iCampus lists for an exportable video; the real file is often smaller (export_video reports the real size).
 
     Args:
         course: course ID, code or part of the name.
@@ -239,23 +244,71 @@ def _video_link(item_id: str) -> str:
 # Not read-only: it downloads a file to the server (from SKKU's content server, without your login).
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
                                       open_world_hint=True))
-async def export_video(item_id: str) -> dict:
+async def export_video(item_id: str, retry: bool = False) -> dict:
     """Save a lecture video to the server and get a link to it (an `item_id` from list_lectures with `exportable`).
-    The first call starts the download, which takes a few minutes for a typical 100-700 MB lecture; call again to
-    see `downloaded_mb`. Once `state` is ready, `link` opens the file. The server keeps it, so later exports of the
-    same video are instant, until a sync sees a newer version (`outdated`; exporting again refreshes it) or the
-    cache needs the room. The download goes to SKKU's content server without your iCampus login, so it records no
-    viewing, progress or attendance. YouTube and Zoom lectures can't be exported. The video is for the user's own
-    use; don't offer to send it to anyone. Adding #t=<seconds> to the link opens it at that moment.
+    The first call puts the download in the server's queue. The server works through the queue by itself, one
+    video at a time in the order they were asked for (about 1 MB per second, so a 1 GB lecture takes some 20
+    minutes), and keeps going through restarts: nothing needs to be called for it to advance. Calling again only
+    reads the progress:
+    - `queued`: `queue_position` (1 = next). After a failed try also `attempts`, `last_error` and `retry_at`: the
+      server tries again by itself, with growing pauses.
+    - `downloading`: `downloaded_mb` of `total_mb`, `speed_mbps` (megabytes per second), `eta_s`,
+      `last_progress_at`, and `stalled` when nothing has arrived for a while (after a minute without data the
+      try is ended and made again). A `note` says so when a try had to start over from zero.
+    - `failed`: the server gave up, or the failure is one that retrying can't fix; `error` says why. It stays
+      failed until you call again with retry=True. Tell the user the error rather than retrying in a loop.
+    - `ready`: `link` opens the file, `size_mb` is its real size. The server keeps it, so later exports of the same
+      video are instant, until a sync sees a newer version (`outdated`; exporting again refreshes it) or the cache
+      needs the room.
+    To export many, call this once per video in the order wanted, then check now and then with sync_status
+    (`exports`) instead of polling each one. `listed_size_mb_estimate` is the size iCampus lists, shown until the
+    real one is known; the file is often smaller. The download goes to SKKU's content server without your iCampus
+    login, so it records no viewing, progress or attendance. YouTube and Zoom lectures can't be exported. The video
+    is for the user's own use; don't offer to send it to anyone. Adding #t=<seconds> to the link opens it at that
+    moment.
 
     Args:
         item_id: the lecture's numeric `item_id`.
+        retry: queue a failed download again (it goes to the back of the queue); for one that is waiting to be
+            tried again, try now.
     """
     if not item_id.isdigit():
         raise ToolError("item_id must be the numeric item_id from list_lectures")
-    body = await _call("POST", f"/api/v1/videos/{item_id}", timeout=30)
-    if body.get("state") == "ready":
-        body["link"] = _video_link(item_id)
+    return _export(await _call("POST", f"/api/v1/videos/{item_id}", timeout=30, retry=retry or None))
+
+
+def _export(status: dict) -> dict:
+    """An export's status for the model: the link once the file is here, and what to do about a failure."""
+    item_id = status.get("item_id")
+    if status.get("state") == "ready":
+        status["link"] = _video_link(item_id)
+    if status.get("state") == "failed" or (status.get("last_error") and status.get("failed_at")):
+        status["next"] = f"export_video(item_id='{item_id}', retry=True) queues it again"
+    return status
+
+
+# Not read-only, like export_video.
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True,
+                                      open_world_hint=True))
+async def export_videos(item_ids: list[str], retry: bool = False) -> dict:
+    """Export several lecture videos with one call, or read where each of them stands. The videos join the server's
+    queue in the order of `item_ids` and download one after another in that order (calls to export_video sent side
+    by side reach the server in no particular order). Each item answers as export_video does: `state`,
+    `queue_position`, progress, `error`, and `link` once it is ready. The queue runs on the server by itself, for
+    hours if need be, so there is nothing to keep calling: check back now and then with this tool (the same ids) or
+    with sync_status (`exports`). Before exporting a whole course, tell the user how many videos and roughly how
+    many GB that is (`video_mb_estimate` in list_lectures).
+
+    Args:
+        item_ids: numeric `item_id`s from list_lectures with `exportable`, in the order they should download.
+        retry: also queue the ones that failed again.
+    """
+    if not item_ids or len(item_ids) > 200 or not all(isinstance(i, str) and i.isdigit() for i in item_ids):
+        raise ToolError("item_ids must be 1 to 200 numeric item_ids from list_lectures")
+    body = await _call("POST", "/api/v1/videos", timeout=60, body={"item_ids": item_ids, "retry": retry})
+    body["items"] = [_export(item) for item in body.get("items", [])]
+    if not body.get("not_found"):
+        body.pop("not_found", None)
     return body
 
 

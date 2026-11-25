@@ -44,11 +44,17 @@ def seed(store: Store, lectures: list[dict], courses: list[dict] = COURSES) -> N
 
 
 class Commons:
-    """lcms.skku.edu as videos.py meets it. `fail` holds statuses to answer the next downloads with."""
+    """lcms.skku.edu as videos.py meets it. `fail` holds statuses to answer the next downloads with; `hold` (an
+    asyncio.Event) keeps every download waiting for its first byte until it is set."""
 
     def __init__(self, body: bytes = MP4):
         self.body, self.downloads, self.fail = body, [], []
         self.active = self.peak = 0
+        self.hold = None
+
+    async def _held(self):
+        await self.hold.wait()
+        yield self.body
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         assert "cookie" not in request.headers and "authorization" not in request.headers
@@ -58,6 +64,8 @@ class Commons:
         if self.fail:
             return httpx.Response(self.fail.pop(0), text="busy")
         self.downloads.append(path.rsplit("/", 1)[1])
+        if self.hold is not None:
+            return httpx.Response(200, content=self._held(), headers={"content-length": str(len(self.body))})
         return httpx.Response(200, content=self.body)
 
 

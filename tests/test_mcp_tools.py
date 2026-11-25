@@ -77,24 +77,53 @@ async def test_list_lectures_marks_exportable_videos(monkeypatch):
     monkeypatch.setattr(server, "_call", call)
     body = await server.list_lectures()
     hosted, youtube = body["items"]
-    assert hosted == {"item_id": "7002", "title": "Week 1", "status": "todo", "exportable": True, "video_mb": 100}
+    assert hosted == {"item_id": "7002", "title": "Week 1", "status": "todo", "exportable": True,
+                      "video_mb_estimate": 100}  # what iCampus lists, which can be several times the file
     assert "exportable" not in youtube
 
 
 async def test_export_video_links_when_ready(monkeypatch):
     calls = []
 
+    answer = {"state": "ready", "item_id": "7002", "size_mb": 100}
+
     async def call(method, path, *, timeout=30, **params):
-        calls.append((method, path))
-        return {"state": "ready", "item_id": "7002", "size_mb": 100}
+        calls.append((method, path, {k: v for k, v in params.items() if v is not None}))
+        return dict(answer)
     monkeypatch.setattr(server, "_call", call)
     monkeypatch.setattr(server.settings, "public_url", "https://mcp.example.com/")
     body = await server.export_video("7002")
-    assert calls == [("POST", "/api/v1/videos/7002")] and body["link"] == "https://mcp.example.com/videos/7002"
+    assert calls == [("POST", "/api/v1/videos/7002", {})] and body["link"] == "https://mcp.example.com/videos/7002"
+    answer = {"state": "failed", "item_id": "7002", "error": "lcms.skku.edu: ReadTimeout (gave up after 7 tries)"}
+    body = await server.export_video("7002")  # asking again reads the failure; it does not start the download over
+    assert calls[-1][2] == {} and "link" not in body and "retry=True" in body["next"] and "ReadTimeout" in body["error"]
+    answer = {"state": "queued", "item_id": "7002", "queue_position": 3}
+    assert await server.export_video("7002", retry=True) == answer and calls[-1][2] == {"retry": True}
     with pytest.raises(ToolError):
         await server.export_video("../7002")
     tools = {t.name: t.annotations for t in await server.mcp.list_tools()}
     assert tools["export_video"].read_only_hint is False
+
+
+async def test_export_videos_sends_the_order_in_one_call(monkeypatch):
+    calls = []
+
+    async def call(method, path, *, timeout=30, **params):
+        calls.append((method, path, params.get("body")))
+        return {"count": 2, "not_found": [], "items": [
+            {"item_id": "7003", "state": "ready", "size_mb": 100},
+            {"item_id": "7002", "state": "failed", "error": "Commons sent a web page instead of the video"}]}
+    monkeypatch.setattr(server, "_call", call)
+    monkeypatch.setattr(server.settings, "public_url", "https://mcp.example.com")
+    body = await server.export_videos(["7003", "7002"])
+    assert calls == [("POST", "/api/v1/videos", {"item_ids": ["7003", "7002"], "retry": False})]
+    assert body["items"][0]["link"] == "https://mcp.example.com/videos/7003" and "not_found" not in body
+    assert "retry=True" in body["items"][1]["next"] and "link" not in body["items"][1]
+    for bad in ([], ["7002", "../x"], [str(n) for n in range(201)]):
+        with pytest.raises(ToolError):
+            await server.export_videos(bad)
+    tools = {t.name: t.annotations for t in await server.mcp.list_tools()}
+    assert tools["export_videos"].read_only_hint is False
 
 
 async def test_video_link_streams_from_the_api_with_range(monkeypatch):

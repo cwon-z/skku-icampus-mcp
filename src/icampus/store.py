@@ -1,5 +1,6 @@
 """SQLite store. The synced records can be rebuilt by syncing again; settings, the cache index, STT providers,
-jobs and transcripts (later schema versions) cannot, so migrations only ever add to the file.
+jobs, transcripts and the video download queue (later schema versions) cannot, so migrations only ever add to the
+file.
 
 Records live in scopes (e.g. dataset "lectures", scope "course:1001"). A scope is only
 replaced after it synced successfully, so one failing course never hides another's data.
@@ -80,10 +81,23 @@ CREATE TABLE IF NOT EXISTS segments (
 CREATE INDEX IF NOT EXISTS segments_transcript ON segments(transcript_id, idx);
 """
 
+# Version 4: the queue of lecture video downloads (videos.py). One row per video that is waiting, downloading or
+# failed; a finished download's row goes, because the cache index is what says a video is here. `lecture` is what
+# the download needs from the synced row (ids, title, the Commons asset), never an address with a query string.
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS video_jobs (
+    id INTEGER PRIMARY KEY, asset_id TEXT NOT NULL UNIQUE, item_id TEXT, lecture TEXT NOT NULL,
+    state TEXT NOT NULL, keep_trying INTEGER NOT NULL DEFAULT 1, attempts INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT, error TEXT, transient INTEGER NOT NULL DEFAULT 0,
+    total_bytes INTEGER, downloaded_bytes INTEGER NOT NULL DEFAULT 0, part_version TEXT, validator TEXT, boot TEXT,
+    queued_at TEXT NOT NULL, started_at TEXT, last_progress_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS video_jobs_queue ON video_jobs(state, queued_at, id);
+"""
+
 # One script per schema version, applied in order; PRAGMA user_version records how far a file has come. Every
 # statement is safe to repeat (IF NOT EXISTS) and nothing is ever dropped: version 1 of this program set
 # user_version back to 1 at each start, so after a downgrade and a second upgrade the scripts run again.
-MIGRATIONS = [SCHEMA, SCHEMA_V2, SCHEMA_V3]
+MIGRATIONS = [SCHEMA, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4]
 
 
 @dataclass(frozen=True)

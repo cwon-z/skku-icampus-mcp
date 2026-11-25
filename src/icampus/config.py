@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # Lecture videos kept in var/videos; the least recently used go first once the total passes the cap.
     video_cache_gb: float = 30
     video_max_gb: float = 4  # bigger videos aren't downloaded
+    # The download queue (videos.py): how many videos download at once, and how often an export that failed in a
+    # way that may pass (the network, a stall, a full cache) is tried again by itself before it is given up.
+    download_concurrency: int = 1
+    export_retries: int = 6
     # The other kinds of file under var/ (cache.py). Each kind has a cap; cache_total_gb caps them all together.
     attachment_cache_gb: float = 2
     attachment_reuse_hours: int = 12  # a download whose version iCampus didn't give is reused this long

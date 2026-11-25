@@ -44,6 +44,12 @@ register(
     Spec("video_cache_gb", "float", "Storage", "Lecture videos kept on the server. Past this, the least recently used "
          "go first; pinned videos and ones a job still needs stay.", 0.1, 4000, unit="GB"),
     Spec("video_max_gb", "float", "Storage", "Bigger videos aren't downloaded.", 0.01, 100, unit="GB"),
+    Spec("download_concurrency", "int", "Storage", "How many lecture videos download at once. The queue runs in "
+         "the order the downloads were asked for; more than one only helps if the content server limits each "
+         "connection rather than each address.", 1, 4),
+    Spec("export_retries", "int", "Storage", "How often an exported video's download is tried again by itself "
+         "after a failure that may pass (the network, a stall, a full cache), with pauses growing from 30 seconds "
+         "to an hour. After that the export is failed and says why.", 0, 20),
     Spec("attachment_cache_gb", "float", "Storage", "Announcement and assignment attachments kept on the server. "
          "An evicted file is downloaded again on its next read, which iCampus records as another open.",
          0.01, 500, unit="GB"),
@@ -73,8 +79,9 @@ register(
          "larger than the video cache still fits.", 1, 10),
     Spec("keep_video_after_processing", "bool", "Transcription jobs", "Keep a video once its audio is extracted "
          "(it still leaves when the cache needs the room). Off: delete it right away, unless you pinned it."),
-    Spec("download_retries", "int", "Transcription jobs", "How often a failed video download is tried again, with "
-         "growing pauses. Commons can't resume, so each try starts from zero.", 0, 10),
+    Spec("download_retries", "int", "Transcription jobs", "How often a transcription job's failed video download "
+         "is tried again, with growing pauses (exports have export_retries). Commons was seen ignoring Range, so "
+         "a try that can't continue the last one starts from zero.", 0, 10),
     Spec("ffmpeg_threads", "int", "Transcription jobs", "Threads ffmpeg may use. One keeps the container well under "
          "its memory limit.", 1, 8),
     Spec("slides_enabled", "bool", "Transcription jobs", "While a lecture's video is on the server for "

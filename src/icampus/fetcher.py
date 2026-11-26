@@ -167,8 +167,8 @@ class Console:
         self.out = out or sys.stdout
         self.tty = bool(getattr(self.out, "isatty", lambda: False)())
         self._drawn = 0
-        with suppress(Exception):  # a title may hold characters the console's code page lacks
-            self.out.reconfigure(errors="replace")
+        with suppress(Exception):  # a title may hold characters the console's code page lacks; a log file is UTF-8
+            self.out.reconfigure(errors="replace", **({} if self.tty else {"encoding": "utf-8"}))
 
     def _write(self, text: str) -> None:
         with suppress(OSError, ValueError):

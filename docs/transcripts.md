@@ -248,8 +248,9 @@ from zero without saying so. From outside that looked like a queue that stalls, 
 
 ## Schema changes
 
-`PRAGMA user_version` now means something: `MIGRATIONS` is a list of scripts, one per version, applied in order
-at start. Every statement is `IF NOT EXISTS` and nothing is dropped or rewritten.
+`PRAGMA user_version` now means something: `MIGRATIONS` is a list of steps, one per version, applied in order
+at start. A step is a script whose every statement is `IF NOT EXISTS`, or (version 5, which adds columns) a
+function that looks at what is there first. Nothing is dropped or rewritten.
 
 | Version | Adds |
 |---|---|
@@ -257,6 +258,7 @@ at start. Every statement is `IF NOT EXISTS` and nothing is dropped or rewritten
 | 2 | `settings` (runtime overrides), `cache_entries` (the cache index) |
 | 3 | `stt_providers`, `stt_usage`, `jobs`, `transcripts`, `segments`, and the FTS table `segments_fts` when SQLite supports it |
 | 4 | `video_jobs` (the video download queue) |
+| 5 | `video_jobs.fetcher`, `lease_id`, `lease_expires_at`, `lease_info`: a download leased to a remote fetcher ([fetchers.md](fetchers.md)) |
 
 Slides need no schema change: their index is a cache entry of kind `frames`, and each directory's `index.json`
 says what it belongs to.

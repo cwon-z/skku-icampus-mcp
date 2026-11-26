@@ -78,19 +78,22 @@ changes over time, so re-check with `icampus probe` when something breaks.
   `https://canvas.skku.edu/` redirects once (to an `index.php` address with a query: never log it) and serves the
   original file as `application/octet-stream`, the size of `original_file_length`. No cookies are needed, so the
   request isn't tied to the account. It ignores `Range` (200, not 206), so an interrupted download can't be
-  continued there: `videos.py` keeps what arrived and asks for the rest with `Range` and `If-Range`, and when the
-  answer is a 200 it takes the whole file again and says so in the download's status. `services/mp4_download/<id>`
-  with a Referer leads to an HTML page instead.
+  continued there: the server keeps what arrived and asks for the rest with `Range` and `If-Range` (`commons.py`),
+  and when the answer is a 200 it takes the whole file again and says so in the download's status. A fetcher
+  keeps nothing and starts over. `services/mp4_download/<id>` with a Referer leads to an HTML page instead.
 - The size the LearningX list gives (`total_file_size`, kept as `listed_size`) is not the size of the original:
   for some videos it was 2.5 to 5 times larger (452 MB listed for a 180 MB file). `original_file_length` in the
   Commons description and the download's `Content-Length` are the real size, so the listed one is only ever shown
   as an estimate.
 - Seen on 25 November 2026: downloads ran at 0.6 to 1.1 MB per second, one connection at a time. Whether that is
-  a limit per connection or per address is not known; `download_concurrency` is there to find out.
+  a limit per connection or per address is not known; `download_concurrency` is there to find out, and
+  `icampus bench` measures it (1, 2 and 3 connections, nothing kept). From other machines and networks it may be
+  faster, which is what remote fetchers are for: [fetchers.md](fetchers.md) has the place for those numbers.
 - None of this moved `read_cnt`, and no LearningX progress or attendance is involved (that comes from the
   player inside the LearningX viewer). The bare player page `/em/<id>` answers 404 without LearningX's parameters.
 - Originals are mp4 files: movie ones say so, and an everlec original (no extension in its description) also
-  turned out to be a plain MP4 when exported. `videos.py` still checks the first bytes of each download (`ftyp` at
-  offset 4) and labels anything else "not mp4".
+  turned out to be a plain MP4 when exported. The first bytes of each download are still checked (`ftyp` at
+  offset 4): a download of the server's own that is anything else is kept and labelled "not mp4", and an upload
+  from a fetcher that is anything else is refused.
 - No captions or scripts: all 127 hosted videos checked in November 2026 had `exists_caption` and `exists_script`
   "N" and no `caption_track_list` (`icampus video-check --captions` checks again).

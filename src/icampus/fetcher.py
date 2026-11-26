@@ -45,7 +45,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from . import bench, commons, machine
@@ -73,7 +73,9 @@ def version() -> str:
 class FetcherSettings(BaseSettings):
     """ICAMPUS_FETCHER_*: the environment, a `.env` beside where the fetcher runs, or flags."""
 
-    model_config = SettingsConfigDict(env_prefix="ICAMPUS_FETCHER_", env_file=".env", extra="ignore")
+    # A variable that is there but empty counts as not set (`ICAMPUS_FETCHER_DIR=` is not "the current directory").
+    model_config = SettingsConfigDict(env_prefix="ICAMPUS_FETCHER_", env_file=".env", extra="ignore",
+                                      env_ignore_empty=True)
 
     server: str = ""  # the icampus API, e.g. http://<tailnet address>:9013
     token: SecretStr = SecretStr("")  # this fetcher's token (the server's ICAMPUS_FETCHER_TOKENS)
@@ -83,9 +85,17 @@ class FetcherSettings(BaseSettings):
     max_disk_gb: float = Field(0, ge=0)  # the most the work directory may hold; 0: whatever the disk has free
     keep_awake: bool = True  # no idle sleep while a job is active (never the display)
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value: Any, info: ValidationInfo) -> Any:
+        """The same for an empty value given any other way."""
+        if isinstance(value, str) and not value.strip():
+            return cls.model_fields[info.field_name].default
+        return value
+
     @property
     def work_dir(self) -> Path:
-        return (self.dir.expanduser() if self.dir else machine.cache_dir())
+        return self.dir.expanduser().absolute() if self.dir else machine.cache_dir()
 
     @property
     def fetcher_name(self) -> str:
@@ -303,9 +313,7 @@ class Fetcher:
                         f"than {LOCK_STALE_S:g} seconds ago). Run one per directory; --slots downloads several "
                         f"videos at once")
         self._lock = lock
-        for leftover in self.dir.glob("*.part"):
-            with suppress(OSError):
-                leftover.unlink()
+        self._sweep()
 
     def room(self) -> int:
         """The largest video there is room for now: the free disk space less a margin and less what the running
@@ -363,9 +371,19 @@ class Fetcher:
                         job.noted = time.monotonic()
                         self.console.event(job.line())
 
+    def _sweep(self) -> None:
+        """Deletes work files that belong to no job in hand. A file is deleted when its job ends; this is for
+        the one the system refused to let go of at that moment (Windows does while a scanner has it open)."""
+        active = {f"{job.asset_id}.part" for job in self.jobs.values()}
+        for leftover in self.dir.glob("*.part"):
+            if leftover.name not in active:
+                with suppress(OSError):
+                    leftover.unlink()
+
     async def _slot(self) -> None:
         wait = IDLE_MIN_S
         while True:
+            self._sweep()
             try:
                 job = await self._lease()
             except httpx.HTTPError as exc:
@@ -511,11 +529,11 @@ class Fetcher:
                     offset, wait = body["received_bytes"], 1.0
                 elif status in (404, 409):
                     raise Gone("the server took the job back")
-                elif status == 422:  # the file failed the server's checks: that try is over there already
+                elif status == 422 and body.get("refused"):  # it failed the server's checks: that try is over there
                     raise Gone(f"the server refused the file ({str(body.get('error') or 'no reason given')[:200]})")
                 elif status in (401, 403):
                     raise Gone("the server refused this fetcher's token")
-                elif status in (400, 413):
+                elif status in (400, 413, 422):  # the request itself was wrong: hand the job back
                     raise commons.VideoError(f"the server did not take the upload (HTTP {status})", transient=True)
                 else:  # the network, or the server in trouble: wait, then ask where to go on
                     await asyncio.sleep(wait)

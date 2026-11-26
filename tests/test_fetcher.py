@@ -410,6 +410,40 @@ def test_leftovers_are_deleted_at_start_and_nothing_else_is_touched(rig):
     assert oct((rig.tmp_path / "laptop" / "new").stat().st_mode & 0o777) == "0o700"
 
 
+async def test_a_work_file_the_system_would_not_let_go_of_is_deleted_before_the_next_job(rig, monkeypatch):
+    """What Windows does while a scanner has the file open: the delete fails. The video must not stay."""
+    real, refused = Path.unlink, []
+
+    def unlink(self, missing_ok=False):
+        if self.parent == rig.work and self.name == "asset7001.part" and not refused:  # the laptop's copy
+            refused.append(self)
+            raise PermissionError(13, "in use")
+        return real(self, missing_ok=missing_ok)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    rig.export("7001")
+    running = asyncio.create_task(rig.fetcher().run())
+    await until(lambda: rig.state("7001")["state"] == "ready")
+    await until(lambda: refused and rig.parts() == [])  # gone at the next look for work, a moment later
+    await stop(running)
+
+
+async def test_an_upload_request_the_server_calls_malformed_hands_the_job_back(rig):
+    class Picky(Flaky):
+        async def handle_async_request(self, request):
+            if request.method == "PUT":
+                self.calls.append((request.method, request.url.path))
+                return httpx.Response(422, json={"error": "invalid parameters"})  # not a refusal of the file
+            return await super().handle_async_request(request)
+    rig.net = Picky(rig.app)
+    rig.export("7001")
+    running = asyncio.create_task(rig.fetcher().run())
+    await until(lambda: rig.row("7001")["attempts"] == 1)
+    row = rig.row("7001")
+    assert (row["state"], row["error"]) == ("queued", "mbp: the server did not take the upload (HTTP 422)")
+    await until(lambda: rig.parts() == [])
+    await stop(running)
+
+
 def test_one_fetcher_per_work_directory(rig, monkeypatch):
     first, second = rig.fetcher(), rig.fetcher()
     first.prepare()
@@ -467,6 +501,14 @@ def test_settings_come_from_the_environment_a_dotenv_or_flags(tmp_path, monkeypa
     for bad in (0, 5):
         with pytest.raises(ValueError):
             fm.FetcherSettings(slots=bad)
+    # a variable that is there but empty is "not set": above all, never the current directory as work directory
+    for name in ("DIR", "NAME", "SLOTS", "MAX_DISK_GB", "KEEP_AWAKE"):
+        monkeypatch.setenv(f"ICAMPUS_FETCHER_{name}", "")
+    blank = fm.FetcherSettings()
+    assert blank.work_dir == machine.cache_dir() and (blank.slots, blank.max_disk_gb, blank.keep_awake) == (2, 0, True)
+    assert fm.FetcherSettings(dir="~/somewhere/else").work_dir == Path.home() / "somewhere" / "else"
+    assert fm.FetcherSettings(dir="work").work_dir == tmp_path / "work"
+    monkeypatch.delenv("ICAMPUS_FETCHER_SLOTS")
     assert fm.problems(fm.FetcherSettings(server="ftp://x")) == [
         "ICAMPUS_FETCHER_SERVER must be an http(s) address, e.g. http://<tailnet address>:9013"]
     assert fm.public_plain_http("http://8.8.8.8:9013") and not fm.public_plain_http("https://8.8.8.8")

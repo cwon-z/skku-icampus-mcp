@@ -43,8 +43,9 @@ openssl rand -hex 24
 ICAMPUS_FETCHER_TOKENS=macbook:<token>,thinkpad:<token>
 ```
 
-Then `docker compose up -d`. The names before the colons only label the tokens (the settings page shows them);
-use the name you give the fetcher. A token can't be in `ICAMPUS_API_TOKENS` as well.
+Then `docker compose up -d`. A fetcher is who its token says it is: the name before the colon is what the server
+knows the machine by (how many jobs it holds, whose lease a call may speak for), so give each machine its own
+token. A token can't be in `ICAMPUS_API_TOKENS` as well.
 
 ### 2. Install, on the laptop
 
@@ -73,15 +74,16 @@ ICAMPUS_FETCHER_TOKEN=<this machine's token>
 |---|---|---|---|
 | `ICAMPUS_FETCHER_SERVER` | `--server` | | the icampus API, as you reach it over Tailscale |
 | `ICAMPUS_FETCHER_TOKEN` | `--token` | | this machine's token from `ICAMPUS_FETCHER_TOKENS` |
-| `ICAMPUS_FETCHER_NAME` | `--name` | the machine's name | what statuses call this fetcher: letters, digits, spaces, dots, hyphens; 40 at most |
+| `ICAMPUS_FETCHER_NAME` | `--name` | the machine's name | what statuses call this fetcher: letters, digits, spaces, dots, hyphens; 40 at most; not `server` |
 | `ICAMPUS_FETCHER_SLOTS` | `--slots` | 1 | videos downloaded at a time, 1 to 4 |
-| `ICAMPUS_FETCHER_DIR` | `--dir` | the per-user cache directory | where a video lies while it is downloaded and uploaded |
+| `ICAMPUS_FETCHER_DIR` | `--dir` | the per-user cache directory | where a video lies while it is downloaded and uploaded. A directory of the fetcher's own: a new or empty one |
 | `ICAMPUS_FETCHER_MAX_DISK_GB` | `--max-disk-gb` | 0 (no limit) | the most the work directory may hold; a video that doesn't fit is left for the server or another fetcher |
 | `ICAMPUS_FETCHER_KEEP_AWAKE` | `--keep-awake`, `--no-keep-awake` | on | no idle sleep while a job is active |
 
 The default work directory is `~/Library/Caches/skku-icampus-fetcher` on macOS,
 `%LOCALAPPDATA%\skku-icampus-fetcher` on Windows and `~/.cache/skku-icampus-fetcher` elsewhere. Run one fetcher
-per directory; `--slots` is how one fetcher downloads several videos at once.
+per directory; `--slots` is how one fetcher downloads several videos at once. The fetcher deletes leftover
+downloads in its work directory, so it refuses one that already holds other files.
 
 ### 4. `icampus-fetcher check`
 
@@ -145,7 +147,7 @@ Whether the server also downloads is the `local_downloads` setting (admin UI, Se
 | `local_downloads` | |
 |---|---|
 | `on` (default) | The server downloads as it always has, `download_concurrency` at a time, and fetchers take what waits behind. |
-| `fallback` | The server downloads only while no fetcher has been heard from for two minutes. |
+| `fallback` | The server downloads only while no fetcher has been heard from for two minutes. While one is around, the server still takes a video no fetcher around can: one too big for their disks, or one that isn't an MP4. |
 | `off` | The server never downloads. The queue waits for a fetcher. |
 
 Whoever takes a job, the queue runs in the order the videos were asked for, and a job a fetcher has is never
@@ -227,7 +229,8 @@ server then takes its job back when the lease runs out, about 90 seconds later.
 
 - **A job is a lease.** The fetcher asks for work (`POST /lease`); when nothing is due it asks again after 2 to
   30 seconds. A job is its for 90 seconds from its last word about it, and it reports progress every 5 seconds,
-  during the download and during the upload.
+  during the download and during the upload. One token holds four jobs at most. A lease nobody ever spoke for
+  (the fetcher had stopped waiting for the answer) goes back into the queue without a failed try.
 - **The server knows the file before the fetcher has it.** When it gives a job away, the server asks the content
   server itself (no cookies) how big the file is, refuses one over `video_max_gb`, and keeps room for it in the
   video cache. The room is given back when the job fails, runs out, or is finished.
@@ -237,9 +240,18 @@ server then takes its job back when the lease runs out, about 90 seconds later.
   the hash against the bytes it received, and that the file is an MP4. Then the file becomes a cached video
   through the same code as a download of the server's own: the same file, sidecar and cache entry, and
   transcription jobs that were waiting for it go on. A failed check fails that try, and the upload is deleted.
+  A request that brings nothing for 30 seconds is ended (the upload can go on from what arrived), and an upload
+  that gets nowhere for ten minutes is given up.
+- **A video that isn't an MP4** is refused as an upload, once. From then on that job is left to the server's own
+  download, which keeps such a file and labels it. With `local_downloads` off it waits.
 - **Failures** are reported in the same words, and with the same "may pass" flag, as the server's own tries
   (`commons.failure`). The queue's retry policy decides what follows: a pause and another try by whoever is
   free, `export_retries` times, then `failed`.
+- **A fetcher whose tries keep failing rests.** A laptop that can't reach the content server would otherwise
+  cost every job in the queue a try. After a failed job the fetcher itself waits before it looks for work again
+  (5 seconds, growing to 5 minutes). After three failed tries in a row the server gives that token no work for a
+  minute, then 5, 15 and 60; an upload that arrives clears the count. A resting fetcher doesn't count as "around"
+  for `fallback`.
 - **Ctrl+C, logout, shutdown.** The fetcher tells the server "fetcher stopped", so the job is back in the queue
   at once, and deletes its file. Killed without a chance to say so, its lease runs out instead.
 - **Sleep, a closed lid, a lost network.** Heartbeats stop. After 90 seconds the server takes the job back: it
@@ -252,8 +264,8 @@ server then takes its job back when the lease runs out, about 90 seconds later.
 - **A restart of the server** costs nothing: leases and what was uploaded are kept, and every lease gets a full
   90 seconds from the start. The fetcher keeps downloading meanwhile and goes on when the server answers again.
   It gives a job up after ten minutes without an answer.
-- **A start of the fetcher** deletes `*.part` files an earlier run left in its work directory, and nothing else.
-  A second fetcher on the same directory refuses to start.
+- **A start of the fetcher** deletes the `<asset id>.part` files an earlier run left in its work directory, and
+  nothing else. A second fetcher on the same directory refuses to start.
 - **Disk.** A fetcher says how much room it has when it asks for work (free space less 1 GB, and
   `MAX_DISK_GB`). A video that doesn't fit stays in its place in the queue for someone else, with no failed try.
 
@@ -262,7 +274,8 @@ server then takes its job back when the lease runs out, about 90 seconds later.
 - `GET /api/v1/videos/{item_id}`, `export_video`: while a video downloads, `by` is `server` or the fetcher's
   name and `phase` is `downloading` or `uploading`, with `speed_mbps` and `eta_s` of that phase.
 - `GET /api/v1/status`, `sync_status`: under `exports`, each active download with `by` and `phase`, and
-  `fetchers`: name, platform, version, `last_seen`, `online`, `active_jobs`, `speed_mbps`.
+  `fetchers`: name, `token` (the token's label), platform, version, `last_seen`, `online`, `active_jobs`,
+  `speed_mbps`, and `failed_in_a_row` with `resting_until` while it is given no work.
 - Admin UI, *Jobs*: the Fetchers panel shows the same, refreshed every few seconds.
 
 ## The routes
@@ -272,9 +285,9 @@ no longer the job's gets 409, and the fetcher drops that job.
 
 | Route | |
 |---|---|
-| `POST /lease` | `{name, version, platform, slots_free, free_bytes}` → 204, or `{job_id, lease_id, asset_id, host, title, expected_bytes, max_bytes, lease_ttl_s}` |
+| `POST /lease` | `{name, version, platform, slots_free, free_bytes}` → `{job_id, lease_id, asset_id, host, title, expected_bytes, max_bytes, lease_ttl_s}`, or 204: nothing is due, the token holds four jobs, or it is resting |
 | `POST /jobs/{job_id}/progress` | `{lease_id, phase, done_bytes, total_bytes, speed_bps}` → `{continue}`; renews the lease |
-| `PUT /jobs/{job_id}/file` | a piece: `Content-Range: bytes <first>-<last>/<size>`, `X-Lease-Id`, and `X-File-SHA256` on the last → `{received_bytes, complete}`; 416 with `received_bytes` when the piece is out of step; 422 when the file fails a check |
+| `PUT /jobs/{job_id}/file` | a piece: `Content-Range: bytes <first>-<last>/<size>`, `X-Lease-Id`, and `X-File-SHA256` on the last → `{received_bytes, complete}`; 416 with `received_bytes` when the piece is out of step; 422 with `refused` when the file fails a check or can't be kept |
 | `GET /jobs/{job_id}/file` | `X-Lease-Id` → `{received_bytes, complete}` |
 | `POST /jobs/{job_id}/fail` | `{lease_id, message, transient}` → what the queue did with it |
 | `GET /bench-targets` | a few `{asset_id, host}`; the one route an ordinary API token may call too |
@@ -307,6 +320,7 @@ with the system calls replaced by recorders. By hand, on each system:
 - `run` picks up a queued export; the server ends with a `ready` video that plays; the work directory is empty
   afterwards.
 - Ctrl+C in the middle of a download: the job is `queued` again at once with "fetcher stopped".
+- A work directory that holds other files is refused; the default one is made and used without a word.
 - The status line with a Korean title, and after resizing the window.
 
 **macOS**

@@ -100,7 +100,7 @@ everywhere else.
 | Endpoint | Notes |
 |---|---|
 | `GET /health` | no auth |
-| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run; `exports`: the video download queue (queued, downloading, failed, ready, what is active and who has it, what failed last), its worker's heartbeat, and `fetchers` (name, platform, version, `last_seen`, `online`, `active_jobs`, `speed_mbps`) |
+| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run; `exports`: the video download queue (queued, downloading, failed, ready, what is active and who has it, what failed last), its worker's heartbeat, and `fetchers` (name, `token`, platform, version, `last_seen`, `online`, `active_jobs`, `speed_mbps`, `resting_until`) |
 | `POST /api/v1/sync` | Returns 202 started, 409 running, 429 cooldown or 423 blocked. `?retry_login=true` needs an `admin` token |
 | `GET /api/v1/courses` | codes, instructors, current grade |
 | `GET /api/v1/tasks` | merged to-do list: `course, kind, status, due_within_days=14, past_days=0, include_done, include_inactive, limit` |
@@ -236,13 +236,15 @@ The fetcher reads `ICAMPUS_FETCHER_SERVER`, `ICAMPUS_FETCHER_TOKEN`, `ICAMPUS_FE
 `ICAMPUS_FETCHER_SLOTS` (1 to 4), `ICAMPUS_FETCHER_DIR`, `ICAMPUS_FETCHER_MAX_DISK_GB` and
 `ICAMPUS_FETCHER_KEEP_AWAKE` from the environment, a `.env` beside where it runs, or flags.
 
-- A fetcher token opens the fetcher routes and nothing else. A fetcher gets no SKKU login, no session, no
-  speech-to-text key and no access to the data volume: an asset id and a host are all it needs.
+- A fetcher token opens the fetcher routes and nothing else, and a fetcher is who its token says it is. It gets
+  no SKKU login, no session, no speech-to-text key and no access to the data volume: an asset id and a host are
+  all it needs.
 - A video lies on the laptop only while it is downloaded and uploaded, in the per-user cache directory, named by
   its asset id, never in a folder that iCloud, OneDrive or Dropbox copies.
 - A job is a lease that heartbeats keep. Closing the laptop puts the job back in the queue within about two
   minutes; Ctrl+C does at once. The server checks an upload's size, SHA-256 and that it is an MP4 before it
-  becomes a cached video.
+  becomes a cached video. A fetcher whose tries keep failing is given no work for a while, so it can't use up
+  the queue's retries.
 - `local_downloads` (Settings, Storage) says whether the server also downloads: `on`, `fallback` (only while no
   fetcher is around) or `off`.
 - The API stays on its private address: a fetcher reaches it over your tailnet, and nothing public was added.

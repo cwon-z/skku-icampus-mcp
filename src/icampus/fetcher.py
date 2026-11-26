@@ -58,6 +58,11 @@ IDLE_MIN_S, IDLE_MAX_S = 2.0, 30.0  # the wait between two looks for work grows 
 PIECE = 8 * MB  # an upload goes in pieces of this size, so a network blip costs one piece at most
 LOST_AFTER_S = 600.0  # a job is given up when the server hasn't answered about it for this long
 DISK_MARGIN = 1 << 30  # leave this much free on the disk
+AFTER_FAILURE_S = (5.0, 300.0)  # after a failed job the next look for work waits, longer each time in a row
+LEASE_ANSWER_S = 45.0  # how long a request for work may take: the server asks the content server before it answers
+UPLOAD_STUCK_S = 600.0  # an upload that gets nowhere for this long is given up, and the job handed back
+UPLOAD_RETRY_S = (1.0, 15.0)  # the wait before asking the server again after a piece went wrong: first, and at most
+MARKER = ".icampus-fetcher"  # in a work directory: this directory is the fetcher's own
 LOCK_BEAT_S, LOCK_STALE_S = 10.0, 30.0
 NOTE_EVERY_S = 60.0  # without a terminal: how often a running job's progress is written
 
@@ -108,6 +113,11 @@ class FetcherSettings(BaseSettings):
 
 class Gone(Exception):
     """The server says the job is no longer this fetcher's (taken out of the queue, or the lease ran out): drop it."""
+
+
+class Refused(Gone):
+    """The server took the upload and found it wanting. That try has failed there already; here the job is
+    dropped, and the next look for work waits as after any failure."""
 
 
 class Fatal(Exception):
@@ -295,9 +305,10 @@ class Fetcher:
     # --- the work directory ------------------------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """The work directory: made for this user only, refused inside a folder a cloud service copies, held by
-        one fetcher at a time, and emptied of what an earlier run left (there is no continuing a download: the
-        content server starts every file from its beginning)."""
+        """The work directory: made for this user only, refused inside a folder a cloud service copies, the
+        fetcher's own (it deletes leftover downloads there, so it won't take a directory that holds other
+        people's files), held by one fetcher at a time, and emptied of what an earlier run left (there is no
+        continuing a download: the content server starts every file from its beginning)."""
         if service := machine.synced_by(self.dir):
             raise Fatal(f"the work directory {self.dir} is inside a folder that {service} copies to the cloud. "
                         f"Lecture videos must not go there: choose another with ICAMPUS_FETCHER_DIR, or leave it "
@@ -305,7 +316,14 @@ class Fetcher:
         lock = DirLock(self.dir)
         try:
             self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            marker = self.dir / MARKER
+            others = [p.name for p in self.dir.iterdir() if p.name not in (MARKER, lock.path.name)]
+            if not marker.exists() and others:
+                raise Fatal(f"the work directory {self.dir} holds other files. Give the fetcher a directory of its "
+                            f"own (a new or empty one): it deletes leftover downloads in it")
             taken = lock.take()
+            marker.write_text("The work directory of icampus-fetcher. Files here are deleted by it.\n",
+                              encoding="ascii")
         except OSError as exc:
             raise Fatal(f"the work directory {self.dir} can't be used ({type(exc).__name__})") from None
         if not taken:
@@ -375,13 +393,13 @@ class Fetcher:
         """Deletes work files that belong to no job in hand. A file is deleted when its job ends; this is for
         the one the system refused to let go of at that moment (Windows does while a scanner has it open)."""
         active = {f"{job.asset_id}.part" for job in self.jobs.values()}
-        for leftover in self.dir.glob("*.part"):
-            if leftover.name not in active:
+        for leftover in self.dir.glob("*.part"):  # only what the fetcher itself names that way: <asset id>.part
+            if leftover.name not in active and commons.SAFE_ID.fullmatch(leftover.stem):
                 with suppress(OSError):
                     leftover.unlink()
 
     async def _slot(self) -> None:
-        wait = IDLE_MIN_S
+        wait, after_failure = IDLE_MIN_S, AFTER_FAILURE_S[0]
         while True:
             self._sweep()
             try:
@@ -393,12 +411,19 @@ class Fetcher:
                 wait = min(IDLE_MAX_S, wait * 2)
                 continue
             wait = IDLE_MIN_S
-            await self._do(job)
+            if await self._do(job):
+                after_failure = AFTER_FAILURE_S[0]
+            else:
+                # Whatever broke the job may break the next one too (this machine can't reach the content server,
+                # say), and every try it takes and fails is one the job has fewer: not at once, and less often.
+                self.idle = f"the last job failed; looking for work again in {after_failure:.0f} s"
+                await asyncio.sleep(after_failure)
+                after_failure = min(AFTER_FAILURE_S[1], after_failure * 3)
 
     async def _lease(self) -> Job | None:
         """Asks for the next job. None: nothing is due (or the server isn't ready). Fatal: the server refuses
         this fetcher."""
-        r = await self.api.post(f"{API}/lease", json={
+        r = await self.api.post(f"{API}/lease", timeout=httpx.Timeout(LEASE_ANSWER_S, connect=10), json={
             "name": self.name, "version": version(), "platform": machine.describe(),
             "slots_free": self.settings.slots - len(self.jobs), "free_bytes": self.room()})
         if r.status_code == 204:
@@ -428,8 +453,10 @@ class Fetcher:
             return None
         return job
 
-    async def _do(self, job: Job) -> None:
-        """One job from lease to the end, whatever the end is. The file is deleted on every way out."""
+    async def _do(self, job: Job) -> bool:
+        """One job from lease to the end, whatever the end is. The file is deleted on every way out. False when
+        the job failed here (not when it was uploaded, or when the server took it back)."""
+        failed = False
         part = self.dir / f"{job.asset_id}.part"
         self.jobs[job.job_id] = job
         self.awake.hold()
@@ -445,12 +472,15 @@ class Fetcher:
                 self.console.event(f"dropped {fit(job.title or job.asset_id, 50)}: the server took the job back")
             elif isinstance(exc := job.work.exception(), Gone):
                 self.console.event(f"dropped {fit(job.title or job.asset_id, 50)}: {exc}")
+                failed = isinstance(exc, Refused)
             else:
                 if not isinstance(exc, (commons.VideoError, httpx.HTTPError, OSError)):
                     log.warning("job %s: %s", job.job_id, type(exc).__name__)
                 message, transient = commons.failure(exc)
                 self.console.event(f"failed {fit(job.title or job.asset_id, 50)}: {message}")
                 await self._fail(job, message, transient)
+                failed = True
+            return not failed
         except asyncio.CancelledError:  # the fetcher is stopping: the job goes back into the queue now
             job.work.cancel()
             await asyncio.gather(job.work, return_exceptions=True)
@@ -503,55 +533,74 @@ class Fetcher:
 
     async def _upload(self, job: Job, part: Path, size: int, sha256: str) -> None:
         """Sends the file in pieces. After anything but a plain yes the server is asked how much it has, and the
-        upload goes on from there, for as long as the lease holds (the heartbeat decides when it no longer does)."""
+        upload goes on from there, for as long as the lease holds (the heartbeat decides when it no longer does)
+        and something still moves: an upload that gets nowhere for UPLOAD_STUCK_S seconds is given up."""
         url = f"{API}/jobs/{job.job_id}/file"
         lease = {"X-Lease-Id": job.lease_id}
-        offset, wait = 0, 1.0
+        offset, wait, moved = 0, UPLOAD_RETRY_S[0], time.monotonic()
+
+        async def ask() -> int | None:
+            """How much the server has, None when it didn't say. Returns `size` once it has finished the video."""
+            with suppress(httpx.HTTPError, ValueError, KeyError, TypeError):
+                r = await self.api.get(url, headers=lease, timeout=10)
+                if r.status_code in (404, 409):
+                    raise Gone("the server took the job back")
+                if r.status_code == 200:
+                    told = r.json()
+                    job.finished = job.finished or bool(told.get("complete"))
+                    return int(told["received_bytes"])
+            return None
+
         with open(part, "rb") as f:
-            while True:
+            while not job.finished:
+                if time.monotonic() - moved > UPLOAD_STUCK_S:
+                    raise commons.VideoError(f"the upload got nowhere for {UPLOAD_STUCK_S / 60:.0f} minutes",
+                                             transient=True)
+                if offset >= size:  # all of it is there: the server is still checking it. Ask until it has
+                    await asyncio.sleep(min(wait, 3 * UPLOAD_RETRY_S[0]))
+                    wait = min(UPLOAD_RETRY_S[1], wait * 2)
+                    had = await ask()
+                    offset = had if had is not None and had < size else offset
+                    continue
                 f.seek(offset)
                 data = f.read(PIECE)
+                last = offset + len(data) >= size
                 headers = {**lease, "Content-Range": f"bytes {offset}-{offset + len(data) - 1}/{size}",
                            "Content-Length": str(len(data)), "Content-Type": "application/octet-stream"}
-                if offset + len(data) >= size:
+                if last:
                     headers["X-File-SHA256"] = sha256
-                try:
+                try:  # the server checks the whole file before it answers the last piece: that one may take long
                     r = await self.api.put(url, content=self._pieces(job, data), headers=headers,
-                                           timeout=httpx.Timeout(60, connect=10))
+                                           timeout=httpx.Timeout(300 if last else 60, connect=10))
                     body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
                     status = r.status_code
                 except (httpx.HTTPError, ValueError):
                     status, body = 0, {}
+                before = offset
                 if status == 200 and body.get("complete"):
-                    job.up.done = size
-                    return
+                    break
                 if status in (200, 416) and isinstance(body.get("received_bytes"), int):
-                    offset, wait = body["received_bytes"], 1.0
+                    offset, wait = body["received_bytes"], UPLOAD_RETRY_S[0]
                 elif status in (404, 409):
                     raise Gone("the server took the job back")
                 elif status == 422 and body.get("refused"):  # it failed the server's checks: that try is over there
-                    raise Gone(f"the server refused the file ({str(body.get('error') or 'no reason given')[:200]})")
+                    raise Refused(f"the server refused the file ({str(body.get('error') or 'no reason given')[:200]})")
                 elif status in (401, 403):
                     raise Gone("the server refused this fetcher's token")
                 elif status in (400, 413, 422):  # the request itself was wrong: hand the job back
                     raise commons.VideoError(f"the server did not take the upload (HTTP {status})", transient=True)
                 else:  # the network, or the server in trouble: wait, then ask where to go on
                     await asyncio.sleep(wait)
-                    wait = min(15.0, wait * 2)
-                    with suppress(httpx.HTTPError, ValueError, KeyError, TypeError):
-                        r = await self.api.get(url, headers=lease, timeout=10)
-                        if r.status_code in (404, 409):
-                            raise Gone("the server took the job back")
-                        if r.status_code == 200:
-                            told = r.json()
-                            if told.get("complete"):  # the last piece had arrived; only its answer was lost
-                                job.finished = True
-                                return
-                            offset = int(told["received_bytes"])
-                if not 0 <= offset < size:
+                    wait = min(UPLOAD_RETRY_S[1], wait * 2)
+                    had = await ask()
+                    offset = had if had is not None else offset
+                if not 0 <= offset <= size:
                     raise commons.VideoError("the upload got out of step with the server", transient=True)
+                if offset > before:
+                    moved = time.monotonic()
                 if job.up.done != offset:
                     job.up.restart(offset, size)
+        job.up.done = size
 
     @staticmethod
     async def _pieces(job: Job, data: bytes):

@@ -6,6 +6,9 @@ id, a host and a title, and never reads a course, a file or a transcript. It get
 from here, because the content server needs none. The one route an ordinary API token may also call is
 `bench-targets`, for `icampus bench` on the server itself.
 
+A fetcher is who its token says it is: the token's label decides how many jobs it may hold, whose lease a call may
+speak for, and under what it is listed. The `name` it sends is what statuses call it, nothing more.
+
 The queue's rules stay in videos.py: who gets which job, how long a lease lasts, what an upload must pass before
 it becomes a cached video, and what a failed try costs. A call that names a lease which is no longer the job's is
 answered 409, and the fetcher drops that job.
@@ -17,7 +20,7 @@ from typing import Annotated, AsyncIterator, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.requests import ClientDisconnect
 
 from .videos import UPLOAD_PIECE_MAX, OutOfStep, Refused, StaleLease
@@ -36,6 +39,13 @@ class LeaseRequest(BaseModel):
     slots_free: int = Field(1, ge=0, le=16, description="0 only checks the token: nothing is leased")
     free_bytes: int | None = Field(None, ge=0, description="the largest video this fetcher has room for; a "
                                                            "bigger one is left for the server or another fetcher")
+
+    @field_validator("name")
+    @classmethod
+    def _not_the_server(cls, name: str) -> str:
+        if name.strip().casefold() == "server":  # what a status calls this server's own downloads
+            raise ValueError("a fetcher can't be called 'server'")
+        return name.strip()
 
 
 class Progress(BaseModel):
@@ -62,24 +72,28 @@ async def _drain(body: AsyncIterator[bytes]) -> None:
 
 
 def register(app: FastAPI, ctx: SimpleNamespace) -> None:
-    fetcher = [Depends(ctx.fetcher_auth)]
+    Owner = Annotated[str, Depends(ctx.fetcher_auth)]  # the label of the fetcher token that calls
     videos = ctx.videos
     stale = HTTPException(409, "this lease is no longer the job's (it ran out, or the job was taken out of the "
                                "queue): drop the job")
 
-    @app.post("/api/v1/fetchers/lease", dependencies=fetcher, tags=["fetchers"],
+    @app.post("/api/v1/fetchers/lease", tags=["fetchers"],
               responses={204: {"description": "nothing is due for this fetcher"}})
-    async def lease(ask: LeaseRequest):
+    async def lease(ask: LeaseRequest, request: Request, owner: Owner):
         """Take the next due download: 200 with `{job_id, lease_id, asset_id, host, title, expected_bytes,
-        max_bytes, lease_ttl_s}`, or 204 when nothing is due. The job is this fetcher's for `lease_ttl_s` seconds
-        from its last call about it. `expected_bytes` is the size Commons gave this server for the file (null
-        when it gave none); the upload must have exactly that size."""
-        job = await videos.lease(ask.name, platform=ask.platform, version=ask.version, slots_free=ask.slots_free,
-                                 free_bytes=ask.free_bytes)
+        max_bytes, lease_ttl_s}`, or 204 when nothing is due (or this fetcher holds as many as it may, or its
+        tries have kept failing and it is given none for a while). The job is this fetcher's for `lease_ttl_s`
+        seconds from its last call about it. `expected_bytes` is the size Commons gave this server for the file
+        (null when it gave none); the upload must have exactly that size."""
+        job = await videos.lease(owner, name=ask.name, platform=ask.platform, version=ask.version,
+                                 slots_free=ask.slots_free, free_bytes=ask.free_bytes)
+        if job and await request.is_disconnected():  # it hung up while Commons was asked: nobody has the job
+            videos.give_back(job["job_id"], job["lease_id"], owner)
+            job = None
         return job if job else Response(status_code=204)
 
-    @app.post("/api/v1/fetchers/jobs/{job_id}/progress", dependencies=fetcher, tags=["fetchers"])
-    async def progress(job_id: int, report: Progress) -> dict:
+    @app.post("/api/v1/fetchers/jobs/{job_id}/progress", tags=["fetchers"])
+    async def progress(job_id: int, report: Progress, owner: Owner) -> dict:
         """Say where the job stands, every 5 to 10 seconds: that is the heartbeat that keeps the lease. In phase
         `uploading`, `done_bytes` counts what was sent. `continue: false` means the job is gone: stop, and delete
         the file (`complete: true` beside it: because the upload was taken and the video is here)."""
@@ -87,13 +101,13 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             return {"continue": False, "complete": True}
         try:
             go_on = videos.heartbeat(job_id, report.lease_id, phase=report.phase, done=report.done_bytes,
-                                     total=report.total_bytes, speed=report.speed_bps)
+                                     total=report.total_bytes, speed=report.speed_bps, owner=owner)
         except StaleLease:
             raise stale from None
         return {"continue": go_on}
 
-    @app.put("/api/v1/fetchers/jobs/{job_id}/file", dependencies=fetcher, tags=["fetchers"])
-    async def upload(job_id: int, request: Request, content_range: Annotated[str, Header()],
+    @app.put("/api/v1/fetchers/jobs/{job_id}/file", tags=["fetchers"])
+    async def upload(job_id: int, request: Request, owner: Owner, content_range: Annotated[str, Header()],
                      x_lease_id: LeaseHeader,
                      x_file_sha256: Annotated[str | None, Header(pattern=r"^[0-9a-fA-F]{64}$")] = None):
         """Send a piece of the downloaded file: the body is the bytes `Content-Range: bytes <first>-<last>/<size>`
@@ -112,7 +126,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             if last - first + 1 > UPLOAD_PIECE_MAX:
                 raise HTTPException(413, f"a piece can be at most {UPLOAD_PIECE_MAX // 2**20} MB")
             return await videos.receive(job_id, x_lease_id, start=first, length=last - first + 1, total=size,
-                                        sha256=x_file_sha256, body=body)
+                                        sha256=x_file_sha256, body=body, owner=owner)
         except StaleLease:
             await _drain(body)
             if (had := videos.finished(x_lease_id)) is not None:  # sent again after its answer was lost
@@ -132,24 +146,24 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         except ClientDisconnect:  # the fetcher is gone mid-piece; what arrived stays, and it asks where to go on
             return Response(status_code=400)
 
-    @app.get("/api/v1/fetchers/jobs/{job_id}/file", dependencies=fetcher, tags=["fetchers"])
-    async def uploaded(job_id: int, x_lease_id: LeaseHeader) -> dict:
+    @app.get("/api/v1/fetchers/jobs/{job_id}/file", tags=["fetchers"])
+    async def uploaded(job_id: int, x_lease_id: LeaseHeader, owner: Owner) -> dict:
         """How many bytes of this job's upload the server has: where the next piece must start. `complete: true`
         when the whole file was taken and finished (the answer to the last piece may have been lost)."""
         if (had := videos.finished(x_lease_id)) is not None:
             return {"received_bytes": had, "complete": True}
         try:
-            return {"received_bytes": videos.received(job_id, x_lease_id), "complete": False}
+            return {"received_bytes": videos.received(job_id, x_lease_id, owner), "complete": False}
         except StaleLease:
             raise stale from None
 
-    @app.post("/api/v1/fetchers/jobs/{job_id}/fail", dependencies=fetcher, tags=["fetchers"])
-    async def fail(job_id: int, report: Failure) -> dict:
+    @app.post("/api/v1/fetchers/jobs/{job_id}/fail", tags=["fetchers"])
+    async def fail(job_id: int, report: Failure, owner: Owner) -> dict:
         """Give the job back after a failed try. `transient` says whether trying again could work; what happens
         next (a pause and another try by whoever is free, or giving up) is decided by the queue, exactly as for a
         download of the server's own."""
         try:
-            return videos.fail_lease(job_id, report.lease_id, report.message, report.transient)
+            return videos.fail_lease(job_id, report.lease_id, report.message, report.transient, owner)
         except StaleLease:
             raise stale from None
 

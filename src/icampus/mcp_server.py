@@ -95,8 +95,9 @@ async def sync_status() -> dict:
     `phase`, megabytes, speed and ETA), which items are next, the last failures with their errors, and the
     worker's `heartbeat_at` (it looks at the queue every few seconds; an old heartbeat or `running: false` means
     the queue is not being worked). `fetchers` lists the user's other machines that download for the server:
-    name, platform, version, `last_seen`, `online`, `active_jobs` and their current speed. With
-    `worker.local_downloads` "off", or "fallback" while a fetcher is online, the server leaves downloads to them."""
+    name, platform, version, `last_seen`, `online`, `active_jobs` and their current speed; `resting_until` means
+    its tries kept failing and it gets no work until then. With `worker.local_downloads` "off", or "fallback"
+    while a fetcher is online, the server leaves downloads to them."""
     return await _call("GET", "/api/v1/status")
 
 

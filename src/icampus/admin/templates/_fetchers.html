@@ -10,7 +10,7 @@
     <tbody>
     {% for f in downloads.fetchers %}
     <tr>
-      <td><span class="row"><span class="mono t1">{{ f.name }}</span>{{ badge("ok", "online") if f.online else badge("canceled", "not heard from") }}</span></td>
+      <td><span class="row"><span class="mono t1">{{ f.name }}</span>{% if f.resting_until %}{{ badge("failing", "resting") }}{% elif f.online %}{{ badge("ok", "online") }}{% else %}{{ badge("canceled", "not heard from") }}{% endif %}</span>{% if f.token != f.name %}<div class="t2">token <span class="mono">{{ f.token }}</span></div>{% endif %}{% if f.resting_until %}<div class="t2">{{ f.failed_in_a_row }} failed tries in a row: no work for it until {{ f.resting_until | when }}</div>{% endif %}</td>
       <td class="t2">{{ f.platform or "–" }}</td>
       <td class="mono t2">{{ f.version or "–" }}</td>
       <td class="when">{{ f.last_seen | when }}</td>

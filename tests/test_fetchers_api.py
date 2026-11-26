@@ -192,7 +192,7 @@ def test_lease_heartbeat_and_a_resumed_upload_end_like_a_download_of_the_servers
     exports = c.get("/api/v1/status").json()["exports"]
     assert exports["downloading"] == 1 and exports["active"][0]["by"] == "mbp"
     assert exports["active"][0]["phase"] == "downloading" and exports["active"][0]["speed_mbps"] == 3.0
-    assert exports["fetchers"] == [{"name": "mbp", "platform": "macOS 15 arm64", "version": "0.1.0",
+    assert exports["fetchers"] == [{"name": "mbp", "token": "mbp", "platform": "macOS 15 arm64", "version": "0.1.0",
                                     "last_seen": exports["fetchers"][0]["last_seen"], "online": True,
                                     "active_jobs": 1, "speed_mbps": 3.0}]
 
@@ -559,6 +559,7 @@ async def test_a_transcription_job_waiting_for_the_video_goes_on_when_the_upload
         if end == "fail":
             v.fail_lease(job["job_id"], job["lease_id"], "lcms.skku.edu: ConnectError", True)
         elif end == "quiet":
+            v.heartbeat(job["job_id"], job["lease_id"], phase="downloading", done=10)
             v.store.execute("UPDATE video_jobs SET lease_expires_at='2000-01-01' WHERE id=?", (job["job_id"],))
             v.tick()
         else:
@@ -806,3 +807,189 @@ def test_a_version_4_database_gets_the_lease_columns_and_keeps_its_queue(tmp_pat
     assert again.upgraded_from == 1 and again.one("SELECT fetcher FROM video_jobs")["fetcher"] == "mbp"
     again.close()
     assert Store(path).upgraded_from is None
+
+
+# --- what an independent review found -----------------------------------------------------------------------------
+
+async def test_in_fallback_the_server_takes_what_no_fetcher_around_can(tmp_path):
+    """A fetcher that is there but has no room for the video must not keep it waiting for ever."""
+    commons = Commons()
+    v = queue(tmp_path, commons, local_downloads="fallback")
+    v.start(LECTURES[0])
+    v.start(LECTURES[1])
+    assert await v.lease("mbp", free_bytes=1000) is None  # around, and too small for either
+    assert v._local() is False and [r["attempts"] for r in rows(v.store)] == [0, 0]
+    v.tick()
+    await v.drain()
+    assert commons.downloads == ["asset7001", "asset7002"]  # so the server did them, in order
+    v.start(LECTURES[2])
+    assert v.active == {}  # one the fetcher hasn't said no to is still left for it
+    job = await v.lease("mbp", free_bytes=10**9)
+    assert job["asset_id"] == "asset7003" and (await upload(v, job))["complete"]
+    assert v._too_big["mbp"] == {} or all(a == "asset7003" for a in v._too_big["mbp"])  # nothing kept of jobs that are gone
+
+
+async def test_a_fetcher_whose_tries_keep_failing_is_given_no_work_for_a_while(tmp_path):
+    """Otherwise a laptop that can't reach the content server uses up one try of every job in the queue."""
+    commons = Commons()
+    v = queue(tmp_path, commons, local_downloads="fallback")
+    assert await v.lease("mbp") is None  # it is around; nothing to do yet
+    for lec in LECTURES:
+        v.start(lec)
+    for n in range(vm.FETCHER_STRIKES):
+        job = await v.lease("mbp")
+        assert job["asset_id"] == f"asset{7001 + n}"
+        v.fail_lease(job["job_id"], job["lease_id"], "lcms.skku.edu: ConnectError", True)
+    assert await v.lease("mbp") is None  # three in a row: it rests
+    listed = v.fetcher_list()[0]
+    assert listed["failed_in_a_row"] == 3 and listed["online"] is True
+    assert timedelta(seconds=50) < datetime.fromisoformat(listed["resting_until"]) - datetime.now(KST) <= timedelta(seconds=60)
+    assert [r["attempts"] for r in rows(v.store)] == [1, 1, 1, 0, 0]  # the two behind lost nothing
+
+    v.tick()  # fallback: a fetcher that is resting is not there to take work, so the server does
+    await v.drain()
+    assert commons.downloads == ["asset7004", "asset7005"]
+    due_now(v.store)
+    assert (await v.lease("thinkpad"))["asset_id"] == "asset7001"  # and another fetcher is not held back by it
+
+    v._rest["mbp"] = datetime.now(KST) - timedelta(seconds=1)  # the rest is over
+    job = await v.lease("mbp")
+    assert job["asset_id"] == "asset7002" and (await upload(v, job))["complete"]
+    assert "mbp" not in v._streak and "failed_in_a_row" not in v.fetcher_list()[0]  # a delivery wipes the slate
+    job = await v.lease("mbp")
+    v.fail_lease(job["job_id"], job["lease_id"], "x", True)
+    due_now(v.store)
+    assert v._streak["mbp"] == 1 and await v.lease("mbp") is not None  # one failure is not a streak
+
+
+async def test_a_lease_nobody_took_up_goes_back_without_a_failed_try(tmp_path):
+    """The answer that gave the job away never arrived (the fetcher had stopped waiting): nothing was tried."""
+    v = queue(tmp_path, Commons())
+    v.start(LECTURES[0])
+    job = await v.lease("mbp")
+    v.store.execute("UPDATE video_jobs SET lease_expires_at='2000-01-01'")
+    v.tick()
+    row = rows(v.store)[0]
+    assert (row["state"], row["attempts"], row["error"], row["not_before"], row["fetcher"]) == ("queued", 0, None, None, None)
+    assert v._reserved == {} and v.leases == {} and v._streak == {"mbp": 1}  # but it counts against the fetcher
+    with pytest.raises(StaleLease):
+        v.received(job["job_id"], job["lease_id"])
+
+    again = await v.lease("mbp")  # the same job, at once
+    assert again["asset_id"] == "asset7001" and again["lease_id"] != job["lease_id"]
+    v.give_back(again["job_id"], again["lease_id"], "mbp")  # what the route does when the caller has hung up
+    row = rows(v.store)[0]
+    assert (row["state"], row["attempts"], row["lease_id"]) == ("queued", 0, None) and v._reserved == {}
+    v.give_back(again["job_id"], again["lease_id"], "mbp")  # twice is harmless
+    v.give_back(999, "nothing")
+
+
+async def test_a_request_for_work_is_answered_in_bounded_time(tmp_path, monkeypatch):
+    class Silent(Commons):
+        async def _never(self):
+            await asyncio.sleep(3600)
+            yield b""
+
+        def __call__(self, request):
+            return httpx.Response(200, content=self._never())
+
+    monkeypatch.setattr(vm, "LEASE_DESCRIBE_S", 0.05)
+    monkeypatch.setattr(vm, "LEASE_BUDGET_S", 0.12)
+    v = queue(tmp_path, Silent())
+    for lec in LECTURES:
+        v.start(lec)
+    started = asyncio.get_running_loop().time()
+    assert await v.lease("mbp") is None
+    assert asyncio.get_running_loop().time() - started < 1  # not five videos times a minute each
+    tried = [r for r in rows(v.store) if r["attempts"]]
+    assert 1 <= len(tried) <= 3 and all("sent nothing for 0.05 seconds" in r["error"] for r in tried)
+    assert v.leases == {} and v._reserved == {} and "mbp" not in v._streak  # the content server's fault, not the fetcher's
+
+
+def test_a_fetcher_is_who_its_token_says_whatever_it_calls_itself(c):
+    store, videos = c.app.state.store, c.app.state.videos
+    assert c.post("/api/v1/videos", json={"item_ids": [str(7001 + n) for n in range(5)]}).status_code == 202
+    names = ["mbp", "another name", "민수의 노트북", "x", "y"]
+    taken = [lease(c, name=name) for name in names]
+    assert [r.status_code for r in taken] == [200, 200, 200, 200, 204]  # four at most per token, under any names
+    listed = c.get("/api/v1/status").json()["exports"]["fetchers"]
+    assert len(listed) == 1 and listed[0]["token"] == "mbp" and listed[0]["active_jobs"] == 4
+    assert listed[0]["name"] == "y"  # what it last called itself
+    assert len(store.get_state("fetchers")) == 1  # and not a record per invented name
+    for bad in ("server", " Server ", "SERVER"):
+        assert lease(c, name=bad).status_code == 422  # that is what a status calls this server's own downloads
+    assert c.get("/api/v1/videos/7003").json()["by"] == "민수의 노트북"
+
+    # another token can't speak for a lease that isn't its own, even with the lease id
+    job = taken[0].json()
+    for call in (lambda: beat(c, job, token=THINKPAD), lambda: have(c, job, token=THINKPAD),
+                 lambda: put(c, job, MP4, sha=SHA, token=THINKPAD), lambda: fail(c, job, token=THINKPAD)):
+        assert call().status_code == 409
+    assert beat(c, job).json() == {"continue": True} and "thinkpad" not in videos.fetchers
+
+
+def test_a_speed_of_almost_nothing_does_not_break_the_status(c):
+    job = leased(c)
+    for speed in (1e-320, 1e-9, 0.5, 0.0):
+        assert beat(c, job, done_bytes=10, total_bytes=len(MP4), speed_bps=speed).status_code == 200
+        status = c.get("/api/v1/videos/7001")
+        assert status.status_code == 200 and status.json()["eta_s"] is None
+        assert c.get("/api/v1/status").status_code == 200 and c.get("/api/v1/videos").status_code == 200
+    assert beat(c, job, done_bytes=12, total_bytes=len(MP4), speed_bps=1000).status_code == 200
+    assert c.get("/api/v1/videos/7001").json()["eta_s"] == 4
+
+
+def test_a_disk_error_during_an_upload_fails_the_try_instead_of_the_request(c, tmp_path, monkeypatch):
+    videos = c.app.state.videos
+    job = leased(c)
+    really_open = vm.os.open
+
+    def full(path, flags, mode=0o777, **kwargs):
+        if str(path).endswith(".part"):
+            raise OSError(28, "No space left on device")
+        return really_open(path, flags, mode, **kwargs)
+    monkeypatch.setattr(vm.os, "open", full)
+    r = put(c, job, MP4, sha=SHA)
+    assert r.status_code == 422 and r.json()["refused"] is True
+    assert r.json()["error"] == "could not write the video to disk (ENOSPC)"
+    status = c.get("/api/v1/videos/7001").json()
+    assert (status["state"], status["attempts"]) == ("queued", 1) and "could not write" in status["last_error"]
+    assert videos.leases == {} and videos._reserved == {} and videos._streak == {}  # not the fetcher's failure
+
+
+async def test_an_upload_request_that_brings_nothing_is_ended(tmp_path, monkeypatch):
+    """A laptop that falls asleep in the middle of a piece: the request must not hold the file open for ever."""
+    monkeypatch.setattr(vm, "UPLOAD_IDLE_S", 0.05)
+    v = queue(tmp_path, Commons())
+    v.start(LECTURES[0])
+    job = await v.lease("mbp")
+
+    async def stuck():
+        yield MP4[:1000]
+        await asyncio.sleep(3600)
+    answer = await asyncio.wait_for(v.receive(job["job_id"], job["lease_id"], start=0, length=len(MP4), total=len(MP4),
+                                              sha256=SHA, body=stuck()), 2)
+    assert answer == {"received_bytes": 1000, "complete": False}
+    assert not v.leases["asset7001"].lock.locked()  # the next request gets its turn
+    done = await v.receive(job["job_id"], job["lease_id"], start=1000, length=len(MP4) - 1000, total=len(MP4),
+                           sha256=SHA, body=pieces(MP4[1000:]))
+    assert done["complete"] and v.path("asset7001").read_bytes() == MP4  # and what arrived was kept and counted
+
+
+async def test_a_video_that_is_no_mp4_goes_to_the_servers_own_download_not_round_the_fetchers(tmp_path):
+    body = b"PK\x03\x04" + b"z" * 500
+    commons = Commons(body)
+    v = queue(tmp_path, commons, local_downloads="fallback")
+    assert await v.lease("mbp") is None and await v.lease("thinkpad") is None  # two fetchers are around
+    v.start(LECTURES[0])
+    job = await v.lease("mbp")
+    with pytest.raises(Refused, match="left to the server's own download"):
+        await upload(v, job, body)
+    due_now(v.store)
+    assert await v.lease("mbp") is None and await v.lease("thinkpad") is None  # no fetcher is handed it again
+    v.tick()  # fetchers are around, and this one is beyond them: the server does it, and keeps it as it always has
+    await v.drain()
+    status = v.status(LECTURES[0])
+    assert status["state"] == "ready" and status["format"].startswith("not mp4") and commons.downloads == ["asset7001"]
+    v.tick()
+    assert v._server_only == {}  # nothing is kept about a job that is done

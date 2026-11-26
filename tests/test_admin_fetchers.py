@@ -93,6 +93,19 @@ def test_the_jobs_page_shows_who_fetches_and_what_is_being_downloaded(ui):
     assert BeautifulSoup(ui.get("/admin/lecture/7001").text, "html.parser").select_one("video[data-player]")
 
 
+def test_the_panel_says_which_token_a_fetcher_is_and_when_it_rests(ui):
+    from datetime import datetime, timedelta
+
+    from icampus.config import KST
+    videos = ui.app.state.videos
+    fetcher(ui, "POST", "/lease", json={"name": "Minsus MacBook", "version": "0.1.0", "platform": "macOS"})
+    row = text(ui.get("/admin/jobs/fetchers"), "tbody tr")
+    assert "Minsus MacBook Online" in row and "token mbp" in row  # called one thing, known by its token
+    videos._streak["mbp"], videos._rest["mbp"] = 3, datetime.now(KST) + timedelta(minutes=1)
+    row = text(ui.get("/admin/jobs/fetchers"), "tbody tr")
+    assert "Minsus MacBook Resting" in row and "3 failed tries in a row: no work for it until" in row
+
+
 def test_the_panel_is_a_page_like_the_others(ui, tmp_path):
     with TestClient(ui.app, base_url="https://admin.test", follow_redirects=False) as anon:
         assert anon.get("/admin/jobs/fetchers").headers["location"] == "/admin/login"  # a session, like every page

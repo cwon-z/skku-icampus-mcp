@@ -65,7 +65,12 @@ FETCHER_SEEN_S = 120.0  # local_downloads=fallback: the server downloads once no
 FETCHER_SLOTS = 4  # the most jobs one fetcher may hold at a time
 FETCHERS_SAVE_S = 15.0  # how often a fetcher's "last seen" goes into the database
 FETCHER_KEPT_DAYS = 30  # a fetcher not heard from for this long leaves the list
+FETCHER_STRIKES = 3  # failed tries in a row after which a fetcher is given no work for a while,
+FETCHER_REST_S = (60, 300, 900, 3600)  # for this long, growing with every further failure
+LEASE_DESCRIBE_S = 15.0  # when a job is leased, the content server gets this long to describe the video,
+LEASE_BUDGET_S = 20.0  # and a request for work is answered within about this long, whatever it met
 UPLOAD_PIECE_MAX = 64 * MB  # the most one upload request may carry
+UPLOAD_IDLE_S = 30.0  # an upload request that brings nothing for this long is ended; the upload can go on later
 UPLOADED_KEPT_S = 900.0  # how long a finished lease is remembered, for a fetcher that missed the answer
 # What the server keeps of its own description of a leased video: what finishing the upload needs. Never the
 # uploader's name or a download address.
@@ -135,6 +140,13 @@ def _safe_message(text: str) -> str:
     return _ADDRESS.sub("(address removed)", line)[:200] or "failed"
 
 
+def _eta(left: int | None, speed: float | None) -> int | None:
+    """Seconds until `left` bytes have arrived at `speed` bytes per second, when that is a number worth showing."""
+    if left is None or not speed or speed < 1:
+        return None
+    return min(round(left / speed), 10**7)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as f:
@@ -175,8 +187,10 @@ class Lease:
     about the file when it gave the job away."""
     job_id: int
     asset_id: str
-    fetcher: str
+    fetcher: str  # the name the fetcher goes by, for statuses and messages
     lease_id: str
+    owner: str = ""  # who it is: the label of the token it called with
+    confirmed: bool = False  # it has called about this lease, so the answer that gave the job away arrived
     info: dict = field(default_factory=dict)  # the server's own description of the video (LEASE_INFO)
     lecture: dict = field(default_factory=dict)  # the lecture as it was synced when the job was given away
     exact: int | None = None  # the size the file must have, when Commons said
@@ -207,9 +221,15 @@ class Videos:
         self.dir = settings.data_dir / "videos"
         self.active: dict[str, Running] = {}  # asset id -> the download running now
         self.leases: dict[str, Lease] = {}  # asset id -> the download a fetcher is doing
-        self.fetchers: dict[str, dict] = {}  # name -> platform, version, last_seen
+        # A fetcher is who its token says it is: everything here is kept by the token's label. The name a
+        # fetcher gives itself is only what statuses call it.
+        self.fetchers: dict[str, dict] = {}  # token label -> name, platform, version, last_seen
         self._fetchers_saved = 0.0
-        self._too_big: dict[str, dict[str, int]] = {}  # fetcher -> asset id -> the bytes it had no room for
+        self._free: dict[str, int | None] = {}  # token label -> the room it last said it has
+        self._too_big: dict[str, dict[str, int]] = {}  # token label -> asset id -> the bytes it had no room for
+        self._streak: dict[str, int] = {}  # token label -> its failed tries in a row
+        self._rest: dict[str, datetime] = {}  # token label -> until when it is given no work
+        self._server_only: dict[str, str] = {}  # asset id -> why no fetcher is given this job
         self._uploaded: dict[str, tuple[float, int]] = {}  # lease id -> when its upload was finished, and its size
         self.heartbeat_at: str | None = None  # when the worker loop last looked at the queue
         self._working = False
@@ -352,13 +372,25 @@ class Videos:
     def _slots(self) -> int:
         return max(1, int(self.settings.download_concurrency))
 
+    def _around(self) -> list[str]:
+        """The fetchers that are there to take work: heard from within FETCHER_SEEN_S seconds, and not resting
+        after failures."""
+        return [owner for owner, entry in self.fetchers.items() if self._online(entry) and not self._resting(owner)]
+
     def _local(self) -> bool:
-        """Whether the server may start a download itself now (`local_downloads`): always, never, or only while
-        no fetcher has been heard from for FETCHER_SEEN_S seconds."""
+        """Whether the server may start any waiting download itself now (`local_downloads`): always, never, or
+        only while no fetcher is around."""
         mode = self.settings.local_downloads
         if mode == "fallback":
-            return not any(self._online(entry) for entry in self.fetchers.values())
+            return not self._around()
         return mode != "off"
+
+    def _beyond_fetchers(self, asset_id: str, owners: list[str]) -> bool:
+        """Whether none of these fetchers can take the job: it is kept from fetchers altogether, or each of them
+        said it has less room than the video needs. With local_downloads=fallback the server then does it."""
+        if asset_id in self._server_only or not commons.SAFE_ID.fullmatch(asset_id):
+            return True
+        return all(self._too_big.get(owner, {}).get(asset_id, 0) > (self._free.get(owner) or 0) for owner in owners)
 
     # --- status ----------------------------------------------------------
 
@@ -418,13 +450,13 @@ class Videos:
                     here = self._on_disk(job["asset_id"])
                     out["uploaded_mb"], left = round(here / MB), (total - here if total and total >= here else None)
                 out["speed_mbps"] = round(speed / MB, 2) if speed is not None else None
-                out["eta_s"] = round(left / speed) if speed and left is not None else None
+                out["eta_s"] = _eta(left, speed)
                 if time.monotonic() - lease.beat >= STALL_SHOWN_S:
                     out["stalled"] = True  # nothing heard from the fetcher; LEASE_TTL_S of that ends its lease
             if live:
                 speed = live.speed()
                 out["speed_mbps"] = round(speed / MB, 2) if speed is not None else None  # megabytes per second
-                out["eta_s"] = round((total - done) / speed) if speed and total and total >= done else None
+                out["eta_s"] = _eta(total - done if total and total >= done else None, speed)
                 if time.monotonic() - live.seen >= STALL_SHOWN_S:
                     out["stalled"] = True
                 if live.note:
@@ -597,14 +629,22 @@ class Videos:
             return
         self._recover()
         self._expire()
+        self._forget()
         room = self._slots() - len(self.active)
-        if room <= 0 or not self._local():
+        if room <= 0 or self.settings.local_downloads == "off":
             return
+        # fallback, and fetchers are around: the server leaves the queue to them, except for a job none of them
+        # can take, which would otherwise wait for ever
+        around = [] if self._local() else self._around()
         loop = asyncio.get_running_loop()
         due = self.store.query("SELECT * FROM video_jobs WHERE state='queued' AND (not_before IS NULL OR not_before<=?)"
-                               " ORDER BY queued_at, id LIMIT ?", (_now(), room))
+                               " ORDER BY queued_at, id LIMIT ?", (_now(), 100 if around else room))
         for row in due:
             job = dict(row)
+            if len(self.active) >= self._slots():
+                break
+            if around and not self._beyond_fetchers(job["asset_id"], around):
+                continue
             now = _now()
             claimed = self._claim(job["id"], now)
             if not claimed or job["asset_id"] in self.active:
@@ -822,29 +862,60 @@ class Videos:
         """Heard from within FETCHER_SEEN_S seconds."""
         return datetime.now(KST) - datetime.fromisoformat(entry["last_seen"]) < timedelta(seconds=FETCHER_SEEN_S)
 
-    def _heard(self, name: str, *, platform: str | None = None, version: str | None = None) -> None:
+    def _resting(self, owner: str) -> bool:
+        """Given no work for now, because its tries kept failing."""
+        until = self._rest.get(owner)
+        return until is not None and datetime.now(KST) < until
+
+    def _heard(self, owner: str, *, name: str | None = None, platform: str | None = None,
+               version: str | None = None) -> None:
         """A fetcher called. Its "last seen" is kept in the database too (now and then), so a restart still knows
         who was around: with local_downloads=fallback the server must not start downloading just because it
         restarted."""
-        known = self.fetchers.get(name)
+        known = self.fetchers.get(owner)
         entry = {**(known or {}), "last_seen": _now()}
-        entry.update({k: v for k, v in (("platform", platform), ("version", version)) if v is not None})
-        self.fetchers[name] = entry
-        new = known is None or any(known.get(k) != entry.get(k) for k in ("platform", "version"))
+        entry.update({k: v for k, v in (("name", name), ("platform", platform), ("version", version)) if v is not None})
+        self.fetchers[owner] = entry
+        new = known is None or any(known.get(k) != entry.get(k) for k in ("name", "platform", "version"))
         if new or time.monotonic() - self._fetchers_saved >= FETCHERS_SAVE_S:
             self._fetchers_saved = time.monotonic()
             self.store.set_state("fetchers", self.fetchers)
 
+    def _strike(self, owner: str) -> None:
+        """A try of this fetcher's failed. After FETCHER_STRIKES in a row it is given no work for a while, so a
+        fetcher that can't reach the content server (or keeps falling asleep) doesn't use up every job's tries."""
+        if not owner:
+            return
+        streak = self._streak[owner] = self._streak.get(owner, 0) + 1
+        if streak >= FETCHER_STRIKES:
+            pause = FETCHER_REST_S[min(streak - FETCHER_STRIKES, len(FETCHER_REST_S) - 1)]
+            self._rest[owner] = datetime.now(KST) + timedelta(seconds=pause)
+            log.warning("fetcher %s: %d failed tries in a row; no work for it for %d s", owner, streak, pause)
+
+    def _forget(self) -> None:
+        """What was noted about jobs that are gone."""
+        if not (self._server_only or any(self._too_big.values())):
+            return
+        queue = {row["asset_id"] for row in self.store.query("SELECT asset_id FROM video_jobs")}
+        self._server_only = {asset: why for asset, why in self._server_only.items() if asset in queue}
+        self._too_big = {owner: {asset: size for asset, size in sizes.items() if asset in queue}
+                         for owner, sizes in self._too_big.items()}
+
     def fetcher_list(self) -> list[dict]:
-        """The fetchers heard from lately: what each runs on, when it last called, how many downloads it holds and
-        how fast those are going together."""
+        """The fetchers heard from lately: what each is called and runs on, which token it is, when it last
+        called, how many downloads it holds and how fast those are going together."""
         out = []
-        for name, entry in sorted(self.fetchers.items()):
-            held = [lease for lease in self.leases.values() if lease.fetcher == name]
+        for owner, entry in sorted(self.fetchers.items(), key=lambda kv: (kv[1].get("name") or kv[0], kv[0])):
+            held = [lease for lease in self.leases.values() if lease.owner == owner]
             speeds = [speed for lease in held if (speed := lease.live_speed()) is not None]
-            out.append({"name": name, "platform": entry.get("platform") or None, "version": entry.get("version") or None,
-                        "last_seen": _shown(entry["last_seen"]), "online": self._online(entry),
-                        "active_jobs": len(held), "speed_mbps": round(sum(speeds) / MB, 2) if speeds else None})
+            row = {"name": entry.get("name") or owner, "token": owner, "platform": entry.get("platform") or None,
+                   "version": entry.get("version") or None, "last_seen": _shown(entry["last_seen"]),
+                   "online": self._online(entry), "active_jobs": len(held),
+                   "speed_mbps": round(sum(speeds) / MB, 2) if speeds else None}
+            if self._resting(owner):  # its tries kept failing: it gets no work until then
+                row.update(failed_in_a_row=self._streak.get(owner, 0),
+                           resting_until=self._rest[owner].isoformat(timespec="seconds"))
+            out.append(row)
         return out
 
     def _lease_until(self) -> str:
@@ -862,7 +933,7 @@ class Videos:
         was down. A job that was claimed but not yet described goes back into the queue."""
         long_ago = (datetime.now(KST) - timedelta(days=FETCHER_KEPT_DAYS)).isoformat()
         stored = self.store.get_state("fetchers") or {}
-        self.fetchers = {name: entry for name, entry in stored.items()
+        self.fetchers = {owner: entry for owner, entry in stored.items()
                          if isinstance(entry, dict) and str(entry.get("last_seen") or "") > long_ago}
         for row in self.store.query("SELECT * FROM video_jobs WHERE state='downloading' AND fetcher IS NOT NULL"):
             job = dict(row)
@@ -873,11 +944,12 @@ class Videos:
             if not job["lease_id"] or not isinstance(info, dict):  # nothing was uploaded for it yet
                 self._set(job["id"], state="queued", **_NO_LEASE)
                 continue
+            owner = info.pop("owner", None) or job["fetcher"]
             original, lecture = commons.original_size(info), json.loads(job["lecture"])
             self.leases[job["asset_id"]] = Lease(
                 job_id=job["id"], asset_id=job["asset_id"], fetcher=job["fetcher"], lease_id=job["lease_id"],
-                info=info, lecture=lecture, exact=original or None, total=original or None,
-                done=job["downloaded_bytes"], progress_at=job["last_progress_at"],
+                owner=owner, confirmed=True, info=info, lecture=lecture, exact=original or None,
+                total=original or None, done=job["downloaded_bytes"], progress_at=job["last_progress_at"],
                 hashed=-1)  # -1: its upload is hashed from the disk at the end
             self._reserved[job["asset_id"]] = self._expected(lecture, original)
             self._set(job["id"], lease_expires_at=self._lease_until())
@@ -888,6 +960,13 @@ class Videos:
         if self.leases.get(lease.asset_id) is lease:
             del self.leases[lease.asset_id]
             self._reserved.pop(lease.asset_id, None)
+
+    def _give_back(self, job: dict, lease: Lease) -> None:
+        """The job goes back into its place in the queue as if it had never been given away: no failed try, no
+        pause. For a job that turned out not to be for this fetcher, or that nobody ever took up."""
+        self._end_lease(lease)
+        self._set(job["id"], state="queued", started_at=None, **_NO_LEASE)
+        self._wake.set()
 
     def _lease_failed(self, job: dict, lease: Lease, message: str, transient: bool, *,
                       keep_part: bool = False) -> None:
@@ -901,20 +980,29 @@ class Videos:
 
     def _expire(self) -> None:
         """Takes back the jobs of fetchers that went quiet (a closed lid, a lost network): each counts as a failed
-        try and goes back into the queue, for the server or another fetcher."""
+        try and goes back into the queue, for the server or another fetcher. A lease nobody ever called about
+        (the answer that gave the job away never arrived) goes back without a failed try."""
         rows = self.store.query("SELECT * FROM video_jobs WHERE state='downloading' AND fetcher IS NOT NULL "
                                 "AND (lease_expires_at IS NULL OR lease_expires_at<?)", (_now(),))
         for row in rows:
             job = dict(row)
             lease = self.leases.get(job["asset_id"])
             if lease is None or lease.job_id != job["id"]:
-                lease = Lease(job_id=job["id"], asset_id=job["asset_id"], fetcher=job["fetcher"], lease_id="")
+                lease = Lease(job_id=job["id"], asset_id=job["asset_id"], fetcher=job["fetcher"], lease_id="",
+                              owner=job["fetcher"], confirmed=True)
+            self._strike(lease.owner)
+            if not lease.confirmed:
+                log.info("video %s: the fetcher %s never took up its lease; back into the queue", job["asset_id"],
+                         job["fetcher"])
+                self._give_back(job, lease)
+                continue
             self._lease_failed(job, lease, f"the fetcher {job['fetcher']} went quiet: nothing was heard from it "
                                            f"for {LEASE_TTL_S:g} seconds", True)
 
-    def _leased(self, job_id: int, lease_id: str) -> tuple[dict, Lease] | None:
+    def _leased(self, job_id: int, lease_id: str, owner: str | None = None) -> tuple[dict, Lease] | None:
         """The job and its lease, for a call that names both. None when there is no such job any more (it was
-        taken out of the queue, or it is finished); StaleLease when the job is no longer this lease's."""
+        taken out of the queue, or it is finished); StaleLease when the job is no longer this lease's, or the
+        lease was given to another token than the one that calls."""
         row = self.store.one("SELECT * FROM video_jobs WHERE id=?", (job_id,))
         if row is None:
             return None
@@ -922,8 +1010,10 @@ class Videos:
         lease = self.leases.get(job["asset_id"])
         current = job["lease_id"] if job["state"] == "downloading" else None
         if (not current or lease is None or lease.ended or lease.lease_id != current
-                or not hmac.compare_digest(current.encode(), lease_id.encode())):
+                or not hmac.compare_digest(current.encode(), lease_id.encode())
+                or (owner is not None and lease.owner != owner)):
             raise StaleLease()
+        lease.confirmed = True
         return job, lease
 
     def finished(self, lease_id: str) -> int | None:
@@ -932,38 +1022,44 @@ class Videos:
         of that its lease is stale."""
         for old in [key for key, (when, _) in self._uploaded.items() if time.monotonic() - when > UPLOADED_KEPT_S]:
             del self._uploaded[old]
-        found = next((size for key, (_, size) in self._uploaded.items()
-                      if hmac.compare_digest(key.encode(), lease_id.encode())), None)
-        return found
+        return next((size for key, (_, size) in self._uploaded.items()
+                     if hmac.compare_digest(key.encode(), lease_id.encode())), None)
 
     def _renew(self, job: dict, lease: Lease, **fields: Any) -> None:
         """The fetcher is there: its lease runs LEASE_TTL_S seconds from now."""
         lease.beat = lease.renewed = time.monotonic()
-        self._heard(lease.fetcher)
+        self._heard(lease.owner or lease.fetcher)
         self._set(job["id"], lease_expires_at=self._lease_until(), **fields)
 
-    async def lease(self, fetcher: str, *, platform: str = "", version: str = "", slots_free: int = 1,
-                    free_bytes: int | None = None) -> dict | None:
-        """Gives the next due job to a fetcher, or None when there is none for it. The job is claimed first, with
-        the same update and in the same order as tick() claims one for this server. Then the server describes the
+    async def lease(self, owner: str, *, name: str | None = None, platform: str = "", version: str = "",
+                    slots_free: int = 1, free_bytes: int | None = None) -> dict | None:
+        """Gives the next due job to a fetcher, or None when there is none for it. `owner` is the label of the
+        token it called with (who it is); `name` is what statuses call it. The job is claimed first, with the
+        same update and in the same order as tick() claims one for this server. Then the server describes the
         video itself (no cookies), so the size the upload must have and the largest video allowed are the
         server's own knowledge, and makes room for it. A job the content server refuses to describe has failed a
         try, as it would have here, and the next one is looked at."""
         if slots_free <= 0 or self._stopped:
             return None  # only asking whether its token works, or the server is on its way out
-        self._heard(fetcher, platform=platform, version=version)
+        name = name or owner
+        self._heard(owner, name=name, platform=platform, version=version)
+        self._free[owner] = free_bytes
         self._expire()
-        if sum(1 for held in self.leases.values() if held.fetcher == fetcher) >= FETCHER_SLOTS:
+        if self._resting(owner) or sum(1 for held in self.leases.values() if held.owner == owner) >= FETCHER_SLOTS:
             return None
         cap = int(self.settings.video_max_gb * 2**30)
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        too_big = self._too_big.setdefault(fetcher, {})
+        too_big = self._too_big.setdefault(owner, {})
         passed: set[str] = set()
-        for _ in range(5):  # a job that can't be given away must not hide the ones behind it for long
+        started = time.monotonic()
+        # A job that can't be given away must not hide the ones behind it, but the fetcher is waiting for an
+        # answer: a few tries, and not for long.
+        while len(passed) < 5 and time.monotonic() - started < LEASE_BUDGET_S:
             due = self.store.query("SELECT * FROM video_jobs WHERE state='queued' AND (not_before IS NULL OR "
                                    "not_before<=?) ORDER BY queued_at, id LIMIT 50", (_now(),))
             job = next((dict(row) for row in due if row["asset_id"] not in passed
                         and row["asset_id"] not in self.active and row["asset_id"] not in self.leases
+                        and row["asset_id"] not in self._server_only
                         and commons.SAFE_ID.fullmatch(row["asset_id"])
                         and not (free_bytes is not None and too_big.get(row["asset_id"], 0) > free_bytes)), None)
             if job is None:
@@ -972,14 +1068,14 @@ class Videos:
             passed.add(asset_id)
             lecture = self._lecture(job)
             host = lecture["video"].get("host", commons.HOST)
-            lease = Lease(job_id=job["id"], asset_id=asset_id, fetcher=fetcher, lease_id=secrets.token_urlsafe(24),
-                          lecture=lecture)
-            if not self._claim(job["id"], _now(), fetcher=fetcher, lease_id=lease.lease_id,
+            lease = Lease(job_id=job["id"], asset_id=asset_id, fetcher=name, owner=owner,
+                          lease_id=secrets.token_urlsafe(24), lecture=lecture)
+            if not self._claim(job["id"], _now(), fetcher=name, lease_id=lease.lease_id,
                                lease_expires_at=self._lease_until()):
                 continue  # this server took it in the meantime
             self.leases[asset_id] = lease
             try:
-                async with commons.attempt(self._transport, stall_s=STALL_S) as content:
+                async with commons.attempt(self._transport, stall_s=min(STALL_S, LEASE_DESCRIBE_S)) as content:
                     info = await content.describe(host, asset_id, max_bytes=cap)
                 if lease.ended:
                     continue  # taken out of the queue while Commons was asked
@@ -989,16 +1085,13 @@ class Videos:
                     # Not for this machine: back into its place for the server or another fetcher, and no failed
                     # try. Remembered, so this fetcher isn't handed it again at every call.
                     too_big[asset_id] = expected
-                    self._end_lease(lease)
-                    self._set(job["id"], state="queued", started_at=job["started_at"], **_NO_LEASE)
-                    self._wake.set()
+                    self._give_back(job, lease)
                     continue
                 self._reserved[asset_id] = expected
                 self._make_room(expected, keep=asset_id)
             except asyncio.CancelledError:  # the request was dropped: nobody has the job, and nothing failed
                 if not lease.ended:
-                    self._end_lease(lease)
-                    self._set(job["id"], state="queued", started_at=job["started_at"], **_NO_LEASE)
+                    self._give_back(job, lease)
                 raise
             except Exception as exc:
                 if not isinstance(exc, (VideoError, httpx.HTTPError, OSError)):
@@ -1011,19 +1104,30 @@ class Videos:
             self._part(asset_id).unlink(missing_ok=True)
             lease.info = {k: info.get(k) for k in LEASE_INFO}
             lease.exact = lease.total = original or None
-            self._renew(job, lease, total_bytes=original or None, lease_info=json.dumps(lease.info),
-                        downloaded_bytes=0, part_version=None, validator=None, boot=None, last_progress_at=_now())
-            log.info("video %s: leased to the fetcher %s", asset_id, fetcher)
+            self._renew(job, lease, total_bytes=original or None, downloaded_bytes=0, part_version=None,
+                        validator=None, boot=None, last_progress_at=_now(),
+                        lease_info=json.dumps({**lease.info, "owner": owner}))
+            log.info("video %s: leased to the fetcher %s", asset_id, name)
             return {"job_id": job["id"], "lease_id": lease.lease_id, "asset_id": asset_id, "host": host,
                     "title": lecture.get("title"), "expected_bytes": original or None, "max_bytes": cap,
                     "lease_ttl_s": int(LEASE_TTL_S)}
         return None
 
+    def give_back(self, job_id: int, lease_id: str, owner: str | None = None) -> None:
+        """A lease whose answer could not be delivered (the fetcher had hung up): the job is back in the queue at
+        once, with no failed try."""
+        try:
+            found = self._leased(job_id, lease_id, owner)
+        except StaleLease:
+            return
+        if found:
+            self._give_back(*found)
+
     def heartbeat(self, job_id: int, lease_id: str, *, phase: str, done: int, total: int | None = None,
-                  speed: float | None = None) -> bool:
+                  speed: float | None = None, owner: str | None = None) -> bool:
         """A fetcher says where its job stands, which renews its lease. False when the job is gone (it was taken
         out of the queue): the fetcher stops and deletes its file. Raises StaleLease."""
-        found = self._leased(job_id, lease_id)
+        found = self._leased(job_id, lease_id, owner)
         if found is None:
             return False
         job, lease = found
@@ -1038,41 +1142,42 @@ class Videos:
         self._renew(job, lease, downloaded_bytes=downloaded, last_progress_at=lease.progress_at)
         return True
 
-    def received(self, job_id: int, lease_id: str) -> int:
+    def received(self, job_id: int, lease_id: str, owner: str | None = None) -> int:
         """How many bytes of a fetcher's upload are here, so it can go on from there. Raises StaleLease."""
-        found = self._leased(job_id, lease_id)
+        found = self._leased(job_id, lease_id, owner)
         if found is None:
             raise StaleLease()
         job, lease = found
         self._renew(job, lease)
         return self._on_disk(job["asset_id"])
 
-    def fail_lease(self, job_id: int, lease_id: str, message: str, transient: bool) -> dict:
+    def fail_lease(self, job_id: int, lease_id: str, message: str, transient: bool, owner: str | None = None) -> dict:
         """A fetcher reports that its try failed. The message is the fetcher's (cleaned here), the pauses and the
         number of tries are this queue's. Raises StaleLease."""
-        found = self._leased(job_id, lease_id)
+        found = self._leased(job_id, lease_id, owner)
         if found is None:
             raise StaleLease()
         job, lease = found
-        self._heard(lease.fetcher)
+        self._heard(lease.owner or lease.fetcher)
+        self._strike(lease.owner)
         self._lease_failed(job, lease, f"{lease.fetcher}: {_safe_message(message)}", bool(transient))
         after = self._job(job["asset_id"]) or {}
         return {"state": after.get("state"), "attempts": after.get("attempts"),
                 "retry_at": _shown(after.get("not_before"))}
 
     async def receive(self, job_id: int, lease_id: str, *, start: int, length: int, total: int,
-                      sha256: str | None, body: AsyncIterator[bytes]) -> dict:
+                      sha256: str | None, body: AsyncIterator[bytes], owner: str | None = None) -> dict:
         """Takes a piece of a fetcher's upload: `length` bytes that start at byte `start` of a file of `total`.
         The piece must start where the file here ends (OutOfStep says where that is), so an upload cut off by
         the network goes on from what arrived. With the last piece the file is checked against what this server
         knows of it: the size Commons gave when the job was leased, the SHA-256 the fetcher sends against the
         bytes here, and the first bytes of an MP4. Then it is finished like a download of the server's own.
         A failed check fails the try (Refused). Raises StaleLease."""
-        found = self._leased(job_id, lease_id)
+        found = self._leased(job_id, lease_id, owner)
         if found is None:
             raise StaleLease()
         async with found[1].lock:
-            found = self._leased(job_id, lease_id)  # it may have ended while this waited for its turn
+            found = self._leased(job_id, lease_id, owner)  # it may have ended while this waited for its turn
             if found is None:
                 raise StaleLease()
             job, lease = found
@@ -1094,26 +1199,39 @@ class Videos:
                     self._make_room(total, keep=asset_id, on_disk=have)
                 except VideoError as exc:
                     self._refuse(job, lease, str(exc), exc.transient)
-            self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             part = self._part(asset_id)
             wrote, too_long = 0, False
-            with os.fdopen(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as f:
-                async for chunk in body:
-                    if lease.ended:
-                        break  # taken back or out of the queue while the piece was arriving
-                    if wrote + len(chunk) > length:
-                        too_long = True
-                        break
-                    f.write(chunk)
-                    f.flush()
-                    wrote += len(chunk)
-                    if lease.hashed == have + wrote - len(chunk):
-                        lease.digest.update(chunk)
-                        lease.hashed += len(chunk)
-                    if time.monotonic() - lease.renewed >= PERSIST_S:
-                        self._renew(job, lease)
-                if too_long:  # more than the piece was said to hold: none of it is kept
-                    f.truncate(have)
+            pieces = body.__aiter__()
+            try:
+                self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with os.fdopen(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as f:
+                    while True:
+                        try:  # a request that brings nothing must not hold the file open for ever
+                            async with asyncio.timeout(UPLOAD_IDLE_S):
+                                chunk = await anext(pieces)
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError:
+                            break  # what arrived stays; the fetcher, if it is still there, goes on from it
+                        if lease.ended:
+                            break  # taken back or out of the queue while the piece was arriving
+                        if wrote + len(chunk) > length:
+                            too_long = True
+                            break
+                        f.write(chunk)
+                        f.flush()
+                        wrote += len(chunk)
+                        if lease.hashed == have + wrote - len(chunk):
+                            lease.digest.update(chunk)
+                            lease.hashed += len(chunk)
+                        if time.monotonic() - lease.renewed >= PERSIST_S:
+                            self._renew(job, lease)
+                    if too_long:  # more than the piece was said to hold: none of it is kept
+                        f.truncate(have)
+            except OSError as exc:  # the disk, not the fetcher: the try failed here, and it is told so
+                if lease.ended:
+                    raise StaleLease() from None
+                self._refuse(job, lease, commons.failure(exc)[0], True, strike=False)
             if lease.ended:
                 raise StaleLease()
             if too_long:
@@ -1123,31 +1241,45 @@ class Videos:
             if here < total:
                 return {"received_bytes": here, "complete": False}
             # all of it is here: is it the file?
-            if lease.hashed != here:  # some of it arrived before a restart: read it back
-                own = await asyncio.to_thread(_sha256, part)
-                if lease.ended:
-                    raise StaleLease()
-            else:
-                own = lease.digest.hexdigest()
+            try:
+                if lease.hashed != here:  # some of it arrived before a restart: read it back
+                    own = await asyncio.to_thread(_sha256, part)
+                    if lease.ended:
+                        raise StaleLease()
+                else:
+                    own = lease.digest.hexdigest()
+                mp4 = commons.is_mp4(part)
+            except OSError as exc:
+                self._refuse(job, lease, commons.failure(exc)[0], True, strike=False)
             if not sha256 or not hmac.compare_digest(own, sha256.strip().lower()):
                 self._refuse(job, lease, "the uploaded file is not the one the fetcher downloaded (SHA-256 "
                                          "mismatch)" if sha256 else "the upload came without its SHA-256", True)
-            if not commons.is_mp4(part):
-                self._refuse(job, lease, "the uploaded file is not an MP4", True)
+            if not mp4:
+                # What the content server has for this video is no MP4 (or the fetcher sent something else). The
+                # server's own download keeps such a file and labels it, so the job stays with the server from now
+                # on instead of going round the fetchers.
+                self._server_only[asset_id] = "not an MP4"
+                self._refuse(job, lease, "the uploaded file is not an MP4; this video is left to the server's own "
+                                         "download from now on", True)
             try:
                 self._finish(lease.lecture or self._lecture(job), lease.info, part, here, True)
             except OSError as exc:
-                self._refuse(job, lease, commons.failure(exc)[0], True)
+                self._refuse(job, lease, commons.failure(exc)[0], True, strike=False)
             self.store.execute("DELETE FROM video_jobs WHERE id=?", (job["id"],))  # done: the cache has it now
             self._end_lease(lease)
             self._uploaded[lease.lease_id] = (time.monotonic(), here)
+            self._streak.pop(lease.owner, None)  # a fetcher that delivers is a fetcher that works
+            self._rest.pop(lease.owner, None)
             self._release(asset_id, None, False)
             self._wake.set()
             log.info("video %s uploaded by the fetcher %s (%.0f MB)", asset_id, lease.fetcher, here / MB)
             return {"received_bytes": here, "complete": True}
 
-    def _refuse(self, job: dict, lease: Lease, message: str, transient: bool) -> None:
-        """An upload failed a check: the try has failed, and the fetcher is told why."""
+    def _refuse(self, job: dict, lease: Lease, message: str, transient: bool, *, strike: bool = True) -> None:
+        """An upload failed a check, or could not be kept: the try has failed, and the fetcher is told why.
+        `strike` is off when the fault is the server's (its disk)."""
+        if strike:
+            self._strike(lease.owner)
         self._lease_failed(job, lease, f"{lease.fetcher}: {message}", transient)
         raise Refused(message)
 

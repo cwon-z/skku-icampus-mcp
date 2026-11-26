@@ -75,11 +75,13 @@ class Flaky(httpx.AsyncBaseTransport):
         self.blips: dict[str, list[str]] = {}
         self.down = False
         self.calls: list[tuple[str, str]] = []
+        self.when: list[float] = []  # when each of those calls was made
         self.ranges: list[str] = []
         self.headers: list[httpx.Headers] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.calls.append((request.method, request.url.path))
+        self.when.append(time.monotonic())
         self.headers.append(request.headers)
         if self.down:
             raise httpx.ConnectError("no route to host")
@@ -158,6 +160,8 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(fm, "IDLE_MAX_S", 0.03)
     monkeypatch.setattr(fm, "PIECE", 1000)
     monkeypatch.setattr(fm, "LOCK_BEAT_S", 0.05)
+    monkeypatch.setattr(fm, "AFTER_FAILURE_S", (0.01, 0.02))
+    monkeypatch.setattr(fm, "UPLOAD_RETRY_S", (0.02, 0.05))
     return Rig(tmp_path, Lcms())
 
 
@@ -187,7 +191,8 @@ async def test_the_fetcher_takes_a_queued_export_downloads_it_uploads_it_and_kee
     running = asyncio.create_task(rig.fetcher().run())
     await until(watch)
     assert seen and seen <= {("mbp", "downloading"), ("mbp", "uploading")}  # the status says who, and which phase
-    assert rig.parts() == [] and rig.awake.held == 0  # deleted once the server confirmed; free to sleep again
+    # the server has confirmed the second upload: as soon as that answer is back, the file goes and sleep is free
+    await until(lambda: rig.parts() == [] and rig.awake.held == 0, timeout=2)
     await stop(running)
 
     # the server ends up with what a download of its own leaves: the file, its sidecar, the cache entry
@@ -200,7 +205,7 @@ async def test_the_fetcher_takes_a_queued_export_downloads_it_uploads_it_and_kee
     assert rig.store.query("SELECT * FROM video_jobs") == [] and rig.videos._reserved == {}
     assert rig.lcms.files == ["asset7001", "asset7002"]  # one at a time, in the order asked; the server fetched none
     assert rig.awake.log == ["started", "stopped", "started", "stopped"]  # awake only while a job was active
-    assert list(rig.work.iterdir()) == []  # not even the lock is left
+    assert [p.name for p in rig.work.iterdir()] == [".icampus-fetcher"]  # only the note that the directory is its own
     uploads = [r for r in rig.net.ranges]
     assert uploads[:2] == [f"bytes 0-999/{len(MP4)}", f"bytes 1000-1999/{len(MP4)}"] and len(uploads) == 10
 
@@ -267,7 +272,7 @@ async def test_after_a_sleep_the_fetcher_finds_its_lease_gone_and_starts_over(ri
     rig.lcms.hold = asyncio.Event()
     rig.export("7001")
     running = asyncio.create_task(rig.fetcher().run())
-    await until(lambda: rig.parts() == ["asset7001.part"])
+    await until(lambda: rig.parts() == ["asset7001.part"] and rig.videos.leases["asset7001"].confirmed)
     first = rig.row("7001")["lease_id"]
     rig.store.execute("UPDATE video_jobs SET lease_expires_at='2000-01-01'")  # asleep for longer than the lease
     rig.videos.tick()
@@ -345,6 +350,76 @@ async def test_a_failed_download_is_reported_in_the_servers_own_words(rig):
     await stop(running)
 
 
+async def test_after_a_failed_job_the_fetcher_waits_before_it_takes_another(rig, monkeypatch):
+    """A machine that can't download would otherwise take one job after the other and cost each of them a try."""
+    monkeypatch.setattr(fm, "AFTER_FAILURE_S", (0.4, 0.4))
+    rig.lcms.fail = [503]
+    rig.export("7001")
+    rig.export("7002")
+    running = asyncio.create_task(rig.fetcher().run())
+    await until(lambda: rig.state("7002")["state"] == "ready")
+    await stop(running)
+    failed = next(i for i, call in enumerate(rig.net.calls) if call[1].endswith("/fail"))
+    next_lease = next(i for i, call in enumerate(rig.net.calls) if i > failed and call[1].endswith("/lease"))
+    assert rig.net.when[next_lease] - rig.net.when[failed] >= 0.35
+    assert rig.row("7001")["attempts"] == 1 and rig.lcms.files == ["asset7001", "asset7002"]
+
+
+def scripted(tmp_path, answers: dict[str, list]):
+    """A fetcher whose server answers from a script: per method a list of (status, json), the last one for ever."""
+    asked: list[tuple[str, str | None]] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        asked.append((request.method, request.headers.get("content-range")))
+        mine = answers[request.method]
+        status, body = mine[min(sum(1 for method, _ in asked if method == request.method), len(mine)) - 1]
+        return httpx.Response(status, json=body)
+    conf = fm.FetcherSettings(_env_file=None, server="http://icampus.test", token=MBP, name="mbp", dir=tmp_path / "w")
+    f = fm.Fetcher(conf, api_transport=httpx.MockTransport(server), awake=machine.KeepAwake(False),
+                   console=fm.Console(io.StringIO()))
+    part = tmp_path / "abc.part"
+    part.write_bytes(MP4)
+    job = fm.Job(job_id=1, lease_id="lease-of-a-made-up-job", asset_id="abc", host="lcms.skku.edu", title="",
+                 expected=len(MP4), max_bytes=2**40)
+    return f, job, part, asked
+
+
+async def test_an_upload_waits_while_the_server_is_still_checking_the_file(tmp_path, monkeypatch):
+    """After a restart the server reads a big upload back from disk before it answers the last piece, which can
+    outlast the request. It then has every byte and no verdict yet: that is not "out of step"."""
+    monkeypatch.setattr(fm, "PIECE", len(MP4))
+    monkeypatch.setattr(fm, "UPLOAD_RETRY_S", (0.02, 0.05))
+    size = len(MP4)
+    f, job, part, asked = scripted(tmp_path, {
+        "PUT": [(504, {})],                                           # the last piece: the answer never came
+        "GET": [(200, {"received_bytes": size, "complete": False}),   # all of it is there, still being checked
+                (200, {"received_bytes": size, "complete": False}),
+                (200, {"received_bytes": size, "complete": True})]})  # and now it is the video
+    async with f.client() as f.api:
+        await asyncio.wait_for(f._upload(job, part, size, "0" * 64), 20)
+    assert [method for method, _ in asked] == ["PUT", "GET", "GET", "GET"] and job.finished and job.up.done == size
+
+
+async def test_an_upload_that_gets_nowhere_is_given_up(tmp_path, monkeypatch):
+    monkeypatch.setattr(fm, "UPLOAD_STUCK_S", 0.3)
+    monkeypatch.setattr(fm, "UPLOAD_RETRY_S", (0.02, 0.05))
+    for answers in ({"PUT": [(500, {})], "GET": [(500, {})]},                                 # the server is in trouble
+                    {"PUT": [(504, {})], "GET": [(200, {"received_bytes": len(MP4), "complete": False})]}):  # no verdict
+        f, job, part, asked = scripted(tmp_path, answers)
+        async with f.client() as f.api:
+            with pytest.raises(fm.commons.VideoError, match="got nowhere") as failure:
+                await asyncio.wait_for(f._upload(job, part, len(MP4), "0" * 64), 20)
+        assert failure.value.transient and len(asked) >= 2  # handed back, for the queue to decide
+    f, job, part, asked = scripted(tmp_path, {"PUT": [(409, {})]})
+    async with f.client() as f.api:
+        with pytest.raises(fm.Gone):
+            await f._upload(job, part, len(MP4), "0" * 64)
+    f, job, part, asked = scripted(tmp_path, {"PUT": [(422, {"error": "not an MP4", "refused": True})]})
+    async with f.client() as f.api:
+        with pytest.raises(fm.Refused, match="the server refused the file \\(not an MP4\\)"):
+            await f._upload(job, part, len(MP4), "0" * 64)
+
+
 async def test_a_file_the_server_refuses_is_dropped_without_a_second_report(rig):
     theirs = Lcms(b"PK\x03\x04" + b"z" * (len(MP4) - 4))  # this machine is served something else of the same size
     rig.export("7001")
@@ -352,8 +427,8 @@ async def test_a_file_the_server_refuses_is_dropped_without_a_second_report(rig)
     await until(lambda: rig.row("7001")["attempts"] == 1)
     await until(lambda: rig.parts() == [] and rig.awake.held == 0)
     row = rig.row("7001")
-    assert row["state"] == "queued" and row["error"] == "mbp: the uploaded file is not an MP4"
-    assert "the server refused the file (the uploaded file is not an MP4)" in rig.out.getvalue()
+    assert row["state"] == "queued" and row["error"].startswith("mbp: the uploaded file is not an MP4")
+    assert "the server refused the file (the uploaded file is not an MP4" in rig.out.getvalue()
     assert not [c for c in rig.net.calls if c[1].endswith("/fail")] and rig.videos.path("asset7001") is None
     await stop(running)
 
@@ -402,12 +477,21 @@ def test_leftovers_are_deleted_at_start_and_nothing_else_is_touched(rig):
     (rig.work / "asset7001.part").write_bytes(b"half a lecture")
     (rig.work / "notes.txt").write_text("mine")
     f = rig.fetcher()
-    f.prepare()
-    assert sorted(p.name for p in rig.work.iterdir()) == ["fetcher.lock", "notes.txt"]
-    assert oct(rig.work.stat().st_mode & 0o777) in ("0o700", "0o755")  # made private when the fetcher makes it
-    fresh = rig.fetcher(dir=rig.tmp_path / "laptop" / "new")
-    fresh.prepare()
-    assert oct((rig.tmp_path / "laptop" / "new").stat().st_mode & 0o777) == "0o700"
+    with pytest.raises(fm.Fatal, match="holds other files"):  # it deletes downloads there: not among your files
+        f.prepare()
+    assert sorted(p.name for p in rig.work.iterdir()) == ["asset7001.part", "notes.txt"]  # and it touched nothing
+
+    own = rig.fetcher(dir=rig.tmp_path / "laptop" / "new")
+    own.prepare()  # a directory it makes is its own, and private
+    made = rig.tmp_path / "laptop" / "new"
+    assert oct(made.stat().st_mode & 0o777) == "0o700" and (made / ".icampus-fetcher").is_file()
+    own._lock.release()
+    for name in ("asset7001.part", "5f3a-0B_9.part", "ubuntu-26.04.iso.part", "notes.txt"):
+        (made / name).write_bytes(b"x")
+    again = rig.fetcher(dir=made)
+    again.prepare()  # what an earlier run left is deleted; a file it would never have named that way is not
+    assert sorted(p.name for p in made.iterdir()) == [".icampus-fetcher", "fetcher.lock", "notes.txt",
+                                                    "ubuntu-26.04.iso.part"]
 
 
 async def test_a_work_file_the_system_would_not_let_go_of_is_deleted_before_the_next_job(rig, monkeypatch):

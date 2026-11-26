@@ -46,12 +46,13 @@ import httpx
 
 from . import commons
 from .cache import Cache, CacheFull
-from .commons import MAX_DOWNLOAD_S, MB, SPEED_WINDOW_S, VideoError
+from .commons import MAX_DOWNLOAD_S, MB, VideoError
 from .config import KST, Settings
 from .store import Store
 
 log = logging.getLogger(__name__)
 STALL_S = commons.STALL_S  # a try ends when the content server sends nothing for this long
+SPEED_WINDOW_S = commons.SPEED_WINDOW_S  # the speed in a status is the average over this long
 STALL_SHOWN_S = 15.0  # from here on a status says `stalled`
 RETRY_AFTER_S = (30, 120, 300, 900, 1800, 3600)  # the pause before the nth retry of an export
 TICK_S = 5.0  # how often the worker looks at the queue when nothing wakes it

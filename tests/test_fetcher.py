@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from helpers import MP4, TOKEN, lecture, seed, settings
-from icampus import bench, commons, machine
+from icampus import bench, machine
 from icampus import fetcher as fm
 from icampus.api import create_app
 from icampus.store import Store

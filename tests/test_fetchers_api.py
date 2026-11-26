@@ -451,6 +451,26 @@ async def test_two_fetchers_never_get_the_same_job_and_the_order_is_kept(tmp_pat
     assert 1 <= mine <= vm.FETCHER_SLOTS and v.summary()["downloading"] == 5
 
 
+async def test_a_job_that_is_someones_cannot_be_claimed_again(tmp_path):
+    """The claim is one UPDATE that only finds a waiting row: whoever comes second gets nothing, whether that is
+    this server after a fetcher or a fetcher after this server."""
+    commons = Commons()
+    commons.hold = asyncio.Event()
+    v = queue(tmp_path, commons, local_downloads="on")
+    v.start(LECTURES[0])  # the server's own worker has it
+    mine = rows(v.store)[0]
+    assert mine["state"] == "downloading" and not v._claim(mine["id"], vm._now(), fetcher="mbp", lease_id="x")
+    assert rows(v.store)[0]["fetcher"] is None
+    v.start(LECTURES[1])
+    job = await v.lease("mbp")  # a fetcher has the second
+    assert not v._claim(job["job_id"], vm._now())  # the server's claim on it finds nothing
+    assert not v._claim(job["job_id"], vm._now(), fetcher="thinkpad", lease_id="y")  # nor does another fetcher's
+    theirs = rows(v.store)[1]
+    assert (theirs["fetcher"], theirs["lease_id"]) == ("mbp", job["lease_id"])
+    commons.hold.set()
+    await v.drain()
+
+
 async def test_one_fetcher_holds_only_so_many_jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(vm, "FETCHER_SLOTS", 2)
     v = queue(tmp_path, Commons())

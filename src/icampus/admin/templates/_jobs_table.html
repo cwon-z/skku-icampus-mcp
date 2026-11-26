@@ -11,7 +11,7 @@
     <td><span class="mono">{{ j.provider or j.model }}</span>{% if j.chosen %}<div class="t2">{{ j.chosen }}</div>{% endif %}</td>
     <td>
       {% set p = j.progress or {} %}
-      {% if p.stage == "downloading" and p.total_mb %}<span class="share"><span class="t2 num">{{ p.downloaded_mb }} / {{ p.total_mb }} MB</span>{{ bar(p.downloaded_mb, p.total_mb, "Downloaded") }}</span>
+      {% if p.stage == "downloading" and p.total_mb %}<span class="share"><span class="t2 num">{{ p.downloaded_mb }} / {{ p.total_mb }} MB{% if p.by and p.by != "server" %} · by {{ p.by }}{% if p.phase == "uploading" %}, uploading{% endif %}{% endif %}</span>{{ bar(p.downloaded_mb, p.total_mb, "Downloaded") }}</span>
       {% elif p.stage == "extracting" %}<span class="share"><span class="t2 num">{{ p.percent or 0 }}%</span>{{ bar(p.percent or 0, 100, "Extracted") }}</span>
       {% elif p.stage == "transcribing" and p.pieces %}<span class="share"><span class="t2 num">piece {{ p.piece }} of {{ p.pieces }}</span>{{ bar(p.piece - 1, p.pieces, "Pieces done") }}</span>
       {% elif p.note %}<span class="t2">{{ p.note }}</span>{% endif %}

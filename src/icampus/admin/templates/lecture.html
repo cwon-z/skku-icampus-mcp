@@ -31,7 +31,7 @@
     {% else %}
     <div class="screen ink">
       <div class="screen-empty">
-        <p class="lede">The video isn't on this server{% if video_state == "downloading" %}: it is being downloaded{% if download.total_mb %} ({{ download.downloaded_mb }} of {{ download.total_mb }} MB){% endif %}{% elif video_state == "queued" %}: it is number {{ download.queue_position }} in the download queue{% elif video_state == "failed" %}: its download failed{% endif %}.</p>
+        <p class="lede">The video isn't on this server{% if video_state == "downloading" %}: it is being {{ "uploaded" if download.phase == "uploading" else "downloaded" }}{% if download.by and download.by != "server" %} by the fetcher {{ download.by }}{% endif %}{% if download.total_mb %} ({{ download.uploaded_mb if download.phase == "uploading" else download.downloaded_mb }} of {{ download.total_mb }} MB){% endif %}{% elif video_state == "queued" %}: it is number {{ download.queue_position }} in the download queue{% elif video_state == "failed" %}: its download failed{% endif %}.</p>
         {% if download.error or download.last_error %}<p class="sub">{{ "The download failed" if video_state == "failed" else "The last try failed" }}: {{ download.error or download.last_error }}{% if download.retry_at %} · next try {{ download.retry_at | when }}{% endif %}</p>{% endif %}
         <p class="sub">Lines of the transcript can't seek until it is. Downloading asks SKKU's content server for the file, without your login.</p>
         {% if exportable and video_state not in ("queued", "downloading") %}{{ post("/admin/lecture/" ~ item_id ~ "/download", "Download the video", "btn btn-paper", glyph="download") }}{% endif %}

@@ -350,7 +350,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         for job in recent:
             job["course"] = names.get(job["course_id"], job["course_id"])
         return render("overview.html", request, session, page="overview", sync=sync, totals=cache.totals(),
-                      queue=pipeline.queue_summary(), recent=recent,
+                      queue=pipeline.queue_summary(), recent=recent, downloads=ctx.videos.summary(),
                       providers=[registry.describe(c) for c in registry.all()],
                       search="trigram index" if transcripts.fts else "substring scan (no FTS5 trigram)",
                       kinds=KINDS)
@@ -682,10 +682,11 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         wanted = request.query_params.get("transcript") or ""
         row = next((r for r in rows if str(r["id"]) == wanted), None) or transcripts.preferred(item_id)
         video = cache.get("video", lecture["video"]["asset_id"]) if lecture else None
+        download = ctx.videos.status(lecture) if lecture else {"state": "gone"}
         return render("lecture.html", request, session, page="cache", item_id=item_id,
                       title=(lecture or rows[0]).get("title") or item_id,
                       course=course_names().get((lecture or rows[0]).get("course_id"), ""),
-                      video=video, video_state=ctx.videos.status(lecture)["state"] if lecture else "gone",
+                      video=video, video_state=download["state"], download=download,
                       progress=pipeline.status(lecture) if lecture else None, rows=rows, row=row,
                       hours=bool(row and (row["duration_s"] or 0) >= 3600),
                       segments=transcripts.segments(row) if row else [], exportable=lecture is not None,
@@ -704,9 +705,10 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
             return back(here, session, "success", "That transcript is now the one read for this lecture.")
         if lecture is None:
             raise _Refused(404, "No synced lecture video has this item_id.")
-        if action == "download":  # an explicit request to the content server
-            ctx.videos.start(lecture)
-            return back(here, session, "success", "The video is being downloaded.")
+        if action == "download":  # an explicit request to the content server; a failed download is tried again
+            state = ctx.videos.start(lecture, retry=True)["state"]
+            return back(here, session, "success", "The video is here." if state == "ready"
+                        else "The video is in the download queue.")
         if action == "slides":  # explicit too: downloads the video first when it isn't here
             try:
                 state = pipeline.request_slides(lecture)

@@ -582,7 +582,11 @@ def test_cache_actions(ui):
     cache.pin("video", "asset7001")
     assert ui.submit("/admin/cache/video/asset7001/redownload").status_code == 303  # asked for: the content server is used
     assert cache.get("video", "asset7001").pinned  # the copy and its pin stay until the new one has arrived
-    assert ui.app.state.videos.jobs["asset7001"].state in ("queued", "downloading")
+    for _ in range(200):  # the download runs in the server's queue: nothing has to ask for it again
+        if ui.app.state.commons.downloads == ["asset7001"]:
+            break
+        time.sleep(0.02)
+    assert ui.app.state.commons.downloads == ["asset7001"]
     assert ui.submit("/admin/cache/attachment/701/redownload").status_code == 404  # not something attachments offer
     assert ui.submit("/admin/cache/attachment/701/delete").status_code == 303
     assert cache.get("attachment", "701") is None and ui.get("/admin/attachment/701").status_code == 404
@@ -611,6 +615,28 @@ async def test_lecture_actions(ui):
 
 
 # --- shipping --------------------------------------------------------------------------------------
+
+def test_a_download_that_failed_is_shown_and_the_button_tries_again(ui):
+    videos, commons = ui.app.state.videos, ui.app.state.commons
+
+    def wait(done) -> None:
+        for _ in range(200):
+            if done():
+                return
+            time.sleep(0.02)
+        pytest.fail("the download queue did not get there")
+    commons.fail = [404]
+    assert ui.submit("/admin/lecture/7002/download").status_code == 303
+    assert "download queue" in flash(ui, "/admin/lecture/7002")
+    wait(lambda: videos.summary()["failed"] == 1)
+    page = visible(ui.get("/admin/lecture/7002"))
+    assert "its download failed" in page and "The download failed: Commons refused the download (HTTP 404)" in page
+    assert "Video downloads: 0 downloading · 0 queued · 1 failed (last: Commons refused" in visible(ui.get("/admin/"))
+    assert ui.submit("/admin/lecture/7002/download").status_code == 303  # pressing the button is asking to retry
+    wait(lambda: videos.summary()["ready"] == 2)
+    assert commons.downloads == ["asset7002"] and "Video downloads" not in visible(ui.get("/admin/"))
+    assert "isn't on this server" not in visible(ui.get("/admin/lecture/7002"))
+
 
 def test_templates_and_static_files_are_part_of_the_package():
     here = Path(admin.__file__).parent

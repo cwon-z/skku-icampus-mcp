@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from types import SimpleNamespace
 
@@ -34,6 +35,11 @@ FileId = Annotated[str, Path(pattern=r"^\d+$")]
 ItemId = Annotated[str, Path(pattern=r"^\d+$", description="the lecture's item_id")]
 CacheKind = Literal["video", "audio", "attachment", "transcript", "frames"]
 CacheKey = Annotated[str, Path(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")]
+
+
+class ExportBatch(BaseModel):
+    item_ids: list[Annotated[str, Field(pattern=r"^\d+$")]] = Field(min_length=1, max_length=200)
+    retry: bool = False
 
 
 def create_app(settings: Settings | None = None, *, store: Store | None = None, background: bool = True) -> FastAPI:
@@ -80,6 +86,7 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
         if background:
             loops["scheduler"] = asyncio.create_task(syncer.scheduler())
             loops["upgrade"] = asyncio.create_task(syncer.upgrade_sync())  # at most one sync, after an upgrade
+            loops["videos"] = asyncio.create_task(video_cache.run())  # the video download queue's worker
             loops["pipeline"] = asyncio.create_task(pipeline.run())  # the transcription queue
             if env.kuma_push_url:
                 loops["kuma"] = asyncio.create_task(syncer.kuma_pusher())
@@ -92,6 +99,7 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
             t.cancel()
         loops.clear()
         await pipeline.stop()
+        await video_cache.stop()  # what is downloading goes back into the queue for the next start
 
     app = FastAPI(title="SKKU iCampus", version=VERSION, lifespan=lifespan,
                   description="Your iCampus tasks, assignments, announcements, lectures and grades, "
@@ -181,6 +189,8 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
             "datasets": {d: store.synced_at(d, expected.get(d)) for d in DATASETS},
             "transcription": {**pipeline.queue_summary(),
                               "search": "trigram index" if transcripts.fts else "substring scan (no FTS5 trigram)"},
+            # lecture video downloads (exports, and the ones a transcription asks for): the queue and its worker
+            "exports": video_cache.summary(),
             "runs": store.recent_runs(5),
         }
 
@@ -329,24 +339,50 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
 
     @app.get("/api/v1/videos", dependencies=api, tags=["videos"])
     async def video_cache_list() -> dict:
-        """Videos kept on this server, most recently used first, and how full the cache is."""
+        """Videos kept on this server, most recently used first, and how full the cache is. `queue` is every
+        download that hasn't finished, in the order they run: downloading, then queued, then failed."""
         items = [{k: m.get(k) for k in ("item_id", "course_id", "title", "format", "downloaded_at", "last_used")}
                  | {"size_mb": round((m.get("size") or 0) / 2**20)} for m in video_cache.cached()]
         return {"count": len(items), "used_gb": round(video_cache.used_bytes() / 2**30, 2),
-                "cap_gb": settings.video_cache_gb, "items": with_course(items)}
+                "cap_gb": settings.video_cache_gb, "items": with_course(items),
+                "queue": with_course(video_cache.queue())}
+
+    @app.post("/api/v1/videos", dependencies=api, tags=["videos"])
+    async def video_export_batch(batch: ExportBatch) -> JSONResponse:
+        """Export several lecture videos with one call: {"item_ids": [...], "retry": false}. They join the queue
+        in the order given, which calls sent side by side can't promise, and each answers like POST
+        /videos/{item_id}. Asking again reads where each stands. Ids that aren't hosted lecture videos come back
+        under `not_found`."""
+        found, missing = [], []
+        for item_id in dict.fromkeys(batch.item_ids):
+            lecture = videos.find(store, item_id)
+            if lecture is None:
+                missing.append(item_id)
+            else:
+                video_cache.start(lecture, retry=batch.retry)
+                found.append(lecture)
+        # read once all are in the queue, so the places in it are the final ones
+        body = {"count": len(found), "items": [video_cache.status(lecture) for lecture in found], "not_found": missing}
+        waiting = any(x["state"] in videos.OPEN for x in body["items"])
+        return JSONResponse(body, status_code=202 if waiting else 200)
 
     @app.get("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
     async def video_status(item_id: ItemId) -> dict:
-        """state: not_downloaded, queued, downloading, ready, outdated (a sync saw a newer version) or failed."""
+        """state: not_downloaded, queued (with `queue_position`, and `retry_at` after a failed try), downloading
+        (with `downloaded_mb`, `total_mb`, `speed_mbps` in megabytes per second, `eta_s`, `last_progress_at`,
+        and `stalled` while nothing arrives), ready, outdated (a sync saw a newer version) or failed (with `error`
+        and `attempts`). `last_error` is what the last failed try said."""
         return video_cache.status(lecture_video(item_id))
 
     @app.post("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
-    async def video_export(item_id: ItemId) -> JSONResponse:
+    async def video_export(item_id: ItemId, retry: bool = False) -> JSONResponse:
         """Download the lecture video to this server, unless it is cached and current. Returns at once (202 while
-        it downloads, 200 when ready). The download goes to SKKU's content server without your login, so it
+        it waits or downloads, 200 when ready); the server works through the queue by itself, in the order asked,
+        so asking again only reads the progress. A download that failed stays failed (200, with `error`) until
+        it is asked for with retry=true. The download goes to SKKU's content server without your login, so it
         records no viewing or attendance."""
-        body = video_cache.start(lecture_video(item_id))
-        return JSONResponse(body, status_code=200 if body["state"] == "ready" else 202)
+        body = video_cache.start(lecture_video(item_id), retry=retry)
+        return JSONResponse(body, status_code=202 if body["state"] in videos.OPEN else 200)
 
     @app.get("/api/v1/videos/{item_id}/content", dependencies=api, tags=["videos"])
     async def video_content(item_id: ItemId) -> FileResponse:
@@ -363,8 +399,10 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
 
     @app.delete("/api/v1/videos/{item_id}", dependencies=[Depends(admin)], tags=["videos"])
     async def video_delete(item_id: ItemId) -> dict:
-        """Remove the cached copy (a later export downloads it again). Needs an admin token."""
-        return {"deleted": video_cache.delete(lecture_video(item_id)["video"]["asset_id"])}
+        """Remove the cached copy (a later export downloads it again) and take its download, if there is one, out
+        of the queue. Needs an admin token."""
+        asset_id = lecture_video(item_id)["video"]["asset_id"]
+        return {"deleted": video_cache.delete(asset_id), "canceled": video_cache.cancel(asset_id)}
 
     # --- everything kept on disk -------------------------------------------
 

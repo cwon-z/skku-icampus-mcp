@@ -244,6 +244,24 @@ async def test_the_prefetch_limit_keeps_downloads_from_running_ahead(rig):
     assert all(j["state"] == "done" for j in rig.pipeline.jobs()) and len(rig.commons.downloads) == 5
 
 
+async def test_a_jobs_download_takes_its_turn_behind_an_export_and_says_where_it_stands(rig):
+    rig.commons.hold = asyncio.Event()
+    assert rig.videos.start(find(rig, "7002"))["state"] == "downloading"  # an export has the one download slot
+    rig.pipeline.request(find(rig, "7001"))
+    rig.pipeline.tick()
+    for _ in range(100):
+        if job_of(rig, "7001")["state"] == "downloading":
+            break
+        await asyncio.sleep(0.01)
+    job = job_of(rig, "7001")
+    assert job["state"] == "downloading" and job["progress"]["queue_position"] == 1  # waiting, and it says so
+    assert rig.videos.status(find(rig, "7001"))["state"] == "queued" and rig.commons.downloads == ["asset7002"]
+    rig.commons.hold.set()
+    await rig.pipeline.drain()
+    assert job_of(rig, "7001")["state"] == "done" and rig.commons.downloads == ["asset7002", "asset7001"]
+    assert rig.videos.status(find(rig, "7002"))["state"] == "ready" and rig.videos.queue() == []
+
+
 async def test_the_queue_survives_a_restart_and_reuses_finished_stages(rig):
     gate = asyncio.Event()
     started = asyncio.Event()

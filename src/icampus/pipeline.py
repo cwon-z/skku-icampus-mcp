@@ -11,6 +11,8 @@ What keeps a backlog far larger than the video cache from filling the disk:
 - a video is only held for a job until its audio exists (`in_use`, which the cache manager asks before evicting).
 
 Nothing here talks to canvas. The only request to SKKU is the video download in videos.py, which sends no cookies.
+A job's download goes through that module's queue like an export does, but fails at its first failure: retrying
+it is this queue's business (`download_retries`), so a job that waits for a retry doesn't hold a prefetch slot.
 """
 
 import asyncio
@@ -254,9 +256,8 @@ class Pipeline:
     def job_view(self, job: dict) -> dict:
         """A job for an API answer, with the live progress of the stage it is in."""
         progress = dict(self._progress.get(job["id"]) or json.loads(job["progress"] or "{}"))
-        if job["state"] == "downloading" and (download := self.videos.jobs.get(job["asset_id"])):
-            progress.update(downloaded_mb=round(download.done / 2**20),
-                            total_mb=round(download.total / 2**20) if download.total else None)
+        if job["state"] == "downloading" and (download := self.videos.progress(job["asset_id"])):
+            progress.update(download)  # where its video stands in the download queue
         out = {"id": job["id"], "item_id": job["item_id"], "title": job["title"], "course_id": job["course_id"],
                "state": job["state"], "model": job["model"] or "automatic", "provider": job["provider_id"],
                "chosen": job["reason"], "language": job["language"], "hours": job["hours"],
@@ -333,7 +334,7 @@ class Pipeline:
         hours = self.hours(lecture)
         out: dict[str, Any] = {"item_id": lecture["item_id"], "title": lecture.get("title"), "estimate_only": True,
                                "hours": round(hours, 2) or None, "language": language or "detected by the provider",
-                               "video_cached": self.videos.status(lecture)["state"] == "ready",
+                               "video_cached": self.videos.current(lecture),
                                "download_mb": round((lecture["video"].get("listed_size") or 0) / 2**20) or None}
         try:
             choices = self.registry.choose(model=model, course=course, language=language, hours=hours)
@@ -706,7 +707,7 @@ class Pipeline:
             self.cache.delete("audio", key)  # from an older version of the video
         if not audio.available():
             raise _Fail("ffmpeg is not installed on this server, so audio can't be extracted")
-        source = self.videos.path(asset_id) if self.videos.status(lecture)["state"] == "ready" else None
+        source = self.videos.path(asset_id) if self.videos.current(lecture) else None
         if source is None:
             other = next((e for e in self.cache.entries("audio") if e.meta.get("asset_id") == asset_id
                           and e.meta.get("version") == version), None)

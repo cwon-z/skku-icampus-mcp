@@ -33,6 +33,7 @@ dev = [
 [project.scripts]
 icampus = "icampus.cli:main"
 icampus-mcp = "icampus.mcp_server:run"
+icampus-fetcher = "icampus.fetcher:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/icampus"]

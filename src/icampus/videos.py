@@ -1,10 +1,10 @@
 """Lecture videos: downloaded from SKKU's content server (Commons, lcms.skku.edu) on request and kept in var/videos.
 
 The lecture list the sync reads names each hosted video's Commons asset. Commons describes the asset without a
-login (`/CommonsCore2/v2/contents/<id>`) and serves the original file from `services/download/<id>` when the
-request has an iCampus Referer. No cookies are sent, so none of this is tied to your account: no viewer or player
-opens, and no watch progress or attendance is recorded (see docs/icampus-notes.md). The download redirects to an
-address with a query string, which is never stored or logged.
+login and serves the original file to a request with an iCampus Referer. No cookies are sent, so none of this is
+tied to your account: no viewer or player opens, and no watch progress or attendance is recorded (see
+docs/icampus-notes.md). Everything that is said to the content server is in commons.py; this module is the queue,
+the cache and what turns a finished download into a cached video.
 
 Downloads are a queue in SQLite (table video_jobs): asking for a video adds a row and returns. One worker loop,
 started with the server, runs the queue in the order the videos were asked for, `download_concurrency` at a time,
@@ -18,43 +18,59 @@ whether or not anyone asks again:
 A finished video is reused until a sync sees a new version of it. The cache manager (cache.py) indexes the files
 and makes room: once the videos pass video_cache_gb, the ones used least recently are deleted first, except those
 you pinned and those a transcription job still needs.
+
+Another machine can do a download for the queue (a fetcher, fetcher.py; docs/fetchers.md): it takes the next due
+job on a lease, downloads the video where it is, and uploads the file here. Such a job is claimed with the same
+update and in the same order as a local one, so nothing is ever downloaded twice at once; the lease is renewed by
+the fetcher's heartbeats and taken back when they stop. A fetcher is told an asset id and a host, nothing else.
+The file it sends is checked (size, SHA-256, MP4) and then finished by the same code as a local download.
 """
 
 import asyncio
-import errno
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import time
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit
+from typing import Any, AsyncIterator
 
 import httpx
 
+from . import commons
 from .cache import Cache, CacheFull
-from .config import CANVAS, KST, Settings
+from .commons import MAX_DOWNLOAD_S, MB, SPEED_WINDOW_S, VideoError
+from .config import KST, Settings
 from .store import Store
 
 log = logging.getLogger(__name__)
-REFERER = f"{CANVAS}/"
-MB = 2**20
-MAX_DOWNLOAD_S = 6 * 3600  # one try (4 GB at 0.2 MB per second); a dead connection ends far sooner, see STALL_S
-STALL_S = 60.0  # a try ends when the content server sends nothing for this long
+STALL_S = commons.STALL_S  # a try ends when the content server sends nothing for this long
 STALL_SHOWN_S = 15.0  # from here on a status says `stalled`
 RETRY_AFTER_S = (30, 120, 300, 900, 1800, 3600)  # the pause before the nth retry of an export
 TICK_S = 5.0  # how often the worker looks at the queue when nothing wakes it
 PERSIST_S = 5.0  # how often a running download's progress goes into the database
-SPEED_WINDOW_S = 20.0  # the speed in a status is the average over this long
 DISK_MARGIN = 1 << 30  # leave this much free on the disk
 OPEN = ("queued", "downloading")
+_NO_LEASE = {"fetcher": None, "lease_id": None, "lease_expires_at": None, "lease_info": None}
+LEASE_TTL_S = 90.0  # a fetcher's job is taken back when nothing was heard from it for this long
+FETCHER_SEEN_S = 120.0  # local_downloads=fallback: the server downloads once no fetcher was heard from for this long
+FETCHER_SLOTS = 4  # the most jobs one fetcher may hold at a time
+FETCHERS_SAVE_S = 15.0  # how often a fetcher's "last seen" goes into the database
+FETCHER_KEPT_DAYS = 30  # a fetcher not heard from for this long leaves the list
+UPLOAD_PIECE_MAX = 64 * MB  # the most one upload request may carry
+UPLOADED_KEPT_S = 900.0  # how long a finished lease is remembered, for a fetcher that missed the answer
+# What the server keeps of its own description of a leased video: what finishing the upload needs. Never the
+# uploader's name or a download address.
+LEASE_INFO = ("extension", "type", "duration", "exists_caption", "exists_script", "original_file_length")
 _UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
-_CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+_ADDRESS = re.compile(r"\S*(?:://|\?\S*=)\S*")
 
 
 def _boot_id() -> str:
@@ -79,13 +95,22 @@ def _shown(stamp: str | None) -> str | None:
     return datetime.fromisoformat(stamp).isoformat(timespec="seconds") if stamp else None
 
 
-class VideoError(Exception):
-    """A message safe to show: no URLs with queries, no tokens. `transient` marks a failure that may pass by
-    itself (the network, a full cache), so the job tries again later."""
+class StaleLease(Exception):
+    """The lease a fetcher named is not that job's current one: it expired and was taken back, the job went to
+    someone else, or it is gone. The fetcher drops the job."""
 
-    def __init__(self, message: str, *, transient: bool = False):
-        super().__init__(message)
-        self.transient = transient
+
+class OutOfStep(Exception):
+    """An upload piece doesn't start where the file on the server ends. `received` is where it does."""
+
+    def __init__(self, received: int):
+        super().__init__(f"the server has {received} bytes of this file")
+        self.received = received
+
+
+class Refused(Exception):
+    """An upload failed the server's checks. The try is over (the queue decides about another) and the fetcher
+    drops the job. The message is safe to show."""
 
 
 def find(store: Store, item_id: str) -> dict | None:
@@ -97,20 +122,24 @@ def find(store: Store, item_id: str) -> dict | None:
     return None
 
 
-def _host_ok(url: str) -> bool:
-    parts = urlsplit(url)
-    return parts.scheme == "https" and (parts.hostname or "").endswith(".skku.edu")
-
-
 def _safe_name(title: str | None, fallback: str) -> str:
     name = " ".join(_UNSAFE_NAME.sub(" ", title or "").split()).strip(". ")
     return name[:150] or fallback
 
 
-def _validator(headers: httpx.Headers) -> str | None:
-    """What a later Range request can name to be sure the file is still the same: a strong ETag, else the date."""
-    etag = headers.get("etag") or ""
-    return etag if etag and not etag.startswith("W/") else headers.get("last-modified") or None
+def _safe_message(text: str) -> str:
+    """A fetcher's own words for a failure, made fit to store and show: one short line, and no address (a
+    download redirect's query must never be kept, wherever a message came from)."""
+    line = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    return _ADDRESS.sub("(address removed)", line)[:200] or "failed"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(MB):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _snapshot(lecture: dict) -> str:
@@ -122,45 +151,51 @@ def _snapshot(lecture: dict) -> str:
 
 
 @dataclass
-class Running:
+class Running(commons.Meter):
     """A download this process is working on: the live numbers behind its status."""
-    done: int = 0
-    total: int | None = None
     task: asyncio.Task | None = field(default=None, repr=False)
     removed: bool = False  # taken out of the queue by hand while it ran
     error: str | None = None  # how the try ended, for whoever waits on it: the message when it failed,
     transient: bool = False  # and whether that failure may pass
     note: str | None = None
     progress_at: str | None = None  # when bytes last arrived
-    seen: float = field(default_factory=time.monotonic)  # when the content server last answered or sent bytes
     persisted: float = 0.0
-    samples: deque = field(default_factory=deque, repr=False)  # (monotonic time, bytes) for the speed
-
-    def restart(self, done: int, total: int | None) -> None:
-        """The try (re)starts counting at `done` bytes."""
-        self.done, self.total = done, total
-        self.samples.clear()
-        self.samples.append((time.monotonic(), done))
 
     def arrived(self, n: int) -> bool:
-        """Counts n more bytes. True about once a second, when a sample for the speed was taken."""
-        self.done += n
-        self.seen = now = time.monotonic()
-        if self.samples and now - self.samples[-1][0] < 1:
-            return False
-        self.samples.append((now, self.done))
-        while now - self.samples[0][0] > SPEED_WINDOW_S:
-            self.samples.popleft()
-        self.progress_at = _now()
-        return True
+        sampled = super().arrived(n)
+        if sampled:
+            self.progress_at = _now()
+        return sampled
 
-    def speed(self) -> float | None:
-        """Bytes per second over the last seconds. It falls towards zero while nothing arrives."""
-        if not self.samples:
-            return None
-        since, had = self.samples[0]
-        elapsed = time.monotonic() - since
-        return max(0.0, (self.done - had) / elapsed) if elapsed >= 1 else None
+
+@dataclass
+class Lease:
+    """A download a fetcher is doing for this queue: what its heartbeats last said, and what the server found out
+    about the file when it gave the job away."""
+    job_id: int
+    asset_id: str
+    fetcher: str
+    lease_id: str
+    info: dict = field(default_factory=dict)  # the server's own description of the video (LEASE_INFO)
+    lecture: dict = field(default_factory=dict)  # the lecture as it was synced when the job was given away
+    exact: int | None = None  # the size the file must have, when Commons said
+    phase: str = "downloading"  # then "uploading"
+    done: int = 0  # bytes the fetcher has downloaded
+    total: int | None = None
+    speed: float | None = None  # bytes per second of the phase it is in, as the fetcher measures it
+    beat: float = field(default_factory=time.monotonic)  # when it was last heard from
+    renewed: float = 0.0  # when the lease's end last went into the database
+    progress_at: str | None = None  # when its numbers last moved
+    error: str | None = None  # how the try ended, for whoever waits on it
+    transient: bool = False
+    ended: bool = False  # finished, failed, taken back or taken out of the queue: a request still running stops
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # one upload request at a time
+    digest: Any = field(default_factory=hashlib.sha256, repr=False)  # of the uploaded bytes, while all went through it
+    hashed: int = 0
+
+    def live_speed(self) -> float | None:
+        """The speed it last reported, unless that is too long ago to still be true."""
+        return self.speed if time.monotonic() - self.beat < STALL_SHOWN_S else None
 
 
 class Videos:
@@ -170,6 +205,11 @@ class Videos:
         self.store: Store = cache.store
         self.dir = settings.data_dir / "videos"
         self.active: dict[str, Running] = {}  # asset id -> the download running now
+        self.leases: dict[str, Lease] = {}  # asset id -> the download a fetcher is doing
+        self.fetchers: dict[str, dict] = {}  # name -> platform, version, last_seen
+        self._fetchers_saved = 0.0
+        self._too_big: dict[str, dict[str, int]] = {}  # fetcher -> asset id -> the bytes it had no room for
+        self._uploaded: dict[str, tuple[float, int]] = {}  # lease id -> when its upload was finished, and its size
         self.heartbeat_at: str | None = None  # when the worker loop last looked at the queue
         self._working = False
         self._stopped = False  # after stop(), until something is asked for or the worker loop starts again
@@ -179,8 +219,9 @@ class Videos:
         self._wake = asyncio.Event()
         self._transport = transport
         self._recover()  # a restart: what was downloading goes on from the queue, nothing is dropped
+        self._restore_fetchers()  # and what a fetcher was downloading is still that fetcher's
         wanted = {f"{row['asset_id']}.part" for row in self.store.query(
-            "SELECT asset_id FROM video_jobs WHERE state='queued'")}
+            "SELECT asset_id FROM video_jobs WHERE state='queued'")} | {f"{asset}.part" for asset in self.leases}
         for leftover in self.dir.glob("*.part"):  # of a job that is gone: nothing would ever continue it
             if leftover.name not in wanted:
                 leftover.unlink(missing_ok=True)
@@ -278,6 +319,7 @@ class Videos:
         except CacheFull as exc:  # what is left is pinned or waiting for a transcription: room comes back later
             raise VideoError(str(exc), transient=True) from None
         coming = sum(max(0, size - self.active[asset].done) for asset, size in others.items() if asset in self.active)
+        coming += sum(max(0, size - self._on_disk(asset)) for asset, size in others.items() if asset in self.leases)
         if shutil.disk_usage(self.dir).free < needed - on_disk + coming + DISK_MARGIN:
             raise VideoError("not enough free disk space for this video", transient=True)
 
@@ -301,12 +343,21 @@ class Videos:
     def _recover(self) -> None:
         """A job marked downloading that nothing here is downloading was cut off (a restart, a crash). It goes
         back into the queue, in its old place, with what it has on disk."""
-        for row in self.store.query("SELECT id, asset_id FROM video_jobs WHERE state='downloading'"):
+        for row in self.store.query("SELECT id, asset_id FROM video_jobs WHERE state='downloading' "
+                                    "AND fetcher IS NULL"):  # a fetcher's job is the lease's business
             if row["asset_id"] not in self.active:
                 self._set(row["id"], state="queued", downloaded_bytes=self._on_disk(row["asset_id"]))
 
     def _slots(self) -> int:
         return max(1, int(self.settings.download_concurrency))
+
+    def _local(self) -> bool:
+        """Whether the server may start a download itself now (`local_downloads`): always, never, or only while
+        no fetcher has been heard from for FETCHER_SEEN_S seconds."""
+        mode = self.settings.local_downloads
+        if mode == "fallback":
+            return not any(self._online(entry) for entry in self.fetchers.values())
+        return mode != "off"
 
     # --- status ----------------------------------------------------------
 
@@ -338,8 +389,9 @@ class Videos:
     def _progress(self, job: dict) -> dict:
         """The part of a status that follows a waiting or running download."""
         live = self.active.get(job["asset_id"]) if job["state"] == "downloading" else None
-        done = live.done if live else job["downloaded_bytes"]
-        total = (live.total if live else None) or job["total_bytes"]
+        lease = self.leases.get(job["asset_id"]) if job["state"] == "downloading" and not live else None
+        done = live.done if live else lease.done if lease else job["downloaded_bytes"]
+        total = (live.total if live else lease.total if lease else None) or job["total_bytes"]
         out: dict[str, Any] = {"state": job["state"], "downloaded_mb": round(done / MB),
                                "total_mb": round(total / MB) if total else None,
                                "queued_at": _shown(job["queued_at"]),
@@ -352,8 +404,22 @@ class Videos:
             if job["not_before"] and job["not_before"] > now:
                 out["retry_at"] = _shown(job["not_before"])
         else:
+            # who downloads it (this server, or a fetcher by its name) and what that one is doing: fetching the
+            # file from the content server, or (a fetcher only) sending it here
+            out["by"] = job["fetcher"] or "server"
+            out["phase"] = lease.phase if lease else "downloading"
             out["started_at"] = _shown(job["started_at"])
-            out["last_progress_at"] = _shown((live.progress_at if live else None) or job["last_progress_at"])
+            out["last_progress_at"] = _shown((live.progress_at if live else lease.progress_at if lease else None)
+                                             or job["last_progress_at"])
+            if lease:  # the speed and the time left are those of the phase it is in
+                speed, left = lease.live_speed(), (total - done if total and total >= done else None)
+                if lease.phase == "uploading":
+                    here = self._on_disk(job["asset_id"])
+                    out["uploaded_mb"], left = round(here / MB), (total - here if total and total >= here else None)
+                out["speed_mbps"] = round(speed / MB, 2) if speed is not None else None
+                out["eta_s"] = round(left / speed) if speed and left is not None else None
+                if time.monotonic() - lease.beat >= STALL_SHOWN_S:
+                    out["stalled"] = True  # nothing heard from the fetcher; LEASE_TTL_S of that ends its lease
             if live:
                 speed = live.speed()
                 out["speed_mbps"] = round(speed / MB, 2) if speed is not None else None  # megabytes per second
@@ -372,7 +438,8 @@ class Videos:
         if job is None or job["state"] not in OPEN:
             return None
         return {k: v for k, v in self._progress(job).items()
-                if k in ("downloaded_mb", "total_mb", "queue_position", "speed_mbps", "eta_s", "stalled")}
+                if k in ("downloaded_mb", "total_mb", "queue_position", "speed_mbps", "eta_s", "stalled", "by",
+                         "phase", "uploaded_mb")}
 
     def queue(self) -> list[dict]:
         """Every job as its status, in the order they run: downloading, then waiting, then failed."""
@@ -393,8 +460,8 @@ class Videos:
 
         def named(row: dict) -> dict:
             return {"item_id": row["item_id"], "title": json.loads(row["lecture"]).get("title")}
-        shown = ("downloaded_mb", "total_mb", "speed_mbps", "eta_s", "last_progress_at", "attempts", "stalled",
-                 "last_error")
+        shown = ("by", "phase", "downloaded_mb", "total_mb", "uploaded_mb", "speed_mbps", "eta_s",
+                 "last_progress_at", "attempts", "stalled", "last_error")
         active = [named(row) | {k: v for k, v in self._progress(row).items() if k in shown and v is not None}
                   for row in rows if row["state"] == "downloading"]
         failed = [named(row) | {"error": row["error"], "failed_at": _shown(row["finished_at"])}
@@ -406,7 +473,8 @@ class Videos:
                 "ready": len(self.cache.entries("video")), "active": active, "next": waiting[:5],
                 "recently_failed": failed[-5:],
                 "worker": {"running": self._working, "heartbeat_at": _shown(self.heartbeat_at),
-                           "concurrency": self._slots()}}
+                           "concurrency": self._slots(), "local_downloads": self.settings.local_downloads},
+                "fetchers": self.fetcher_list()}
 
     # --- asking for a download ---------------------------------------------
 
@@ -445,7 +513,7 @@ class Videos:
         fresh = {"lecture": _snapshot(lecture), "item_id": lecture.get("item_id"), "state": "queued",
                  "keep_trying": int(keep_trying), "attempts": 0, "not_before": None, "error": None, "transient": 0,
                  "total_bytes": None, "downloaded_bytes": 0, "part_version": None, "validator": None, "boot": None,
-                 "queued_at": now, "started_at": None, "last_progress_at": None, "finished_at": None}
+                 "queued_at": now, "started_at": None, "last_progress_at": None, "finished_at": None, **_NO_LEASE}
         if job:  # asked for again after it failed: to the back of the queue
             self._set(job["id"], **fresh)
         else:
@@ -463,6 +531,9 @@ class Videos:
             return False
         self.store.execute("DELETE FROM video_jobs WHERE id=?", (job["id"],))
         self._part(asset_id).unlink(missing_ok=True)  # here, not in the task: one that hasn't run yet never would
+        if lease := self.leases.get(asset_id):  # a fetcher has it: its next heartbeat is told the job is gone
+            self._end_lease(lease)
+            self._wake.set()
         live = self.active.get(asset_id)
         if live and live.task and not live.task.done():
             live.removed = True
@@ -524,8 +595,9 @@ class Videos:
         if self._stopped:
             return
         self._recover()
+        self._expire()
         room = self._slots() - len(self.active)
-        if room <= 0:
+        if room <= 0 or not self._local():
             return
         loop = asyncio.get_running_loop()
         due = self.store.query("SELECT * FROM video_jobs WHERE state='queued' AND (not_before IS NULL OR not_before<=?)"
@@ -533,14 +605,20 @@ class Videos:
         for row in due:
             job = dict(row)
             now = _now()
-            claimed = self.store.execute(
-                "UPDATE video_jobs SET state='downloading', started_at=?, not_before=NULL, updated_at=? "
-                "WHERE id=? AND state='queued'", (now, now, job["id"])).rowcount
+            claimed = self._claim(job["id"], now)
             if not claimed or job["asset_id"] in self.active:
                 continue
             live = self.active[job["asset_id"]] = Running(done=job["downloaded_bytes"], total=job["total_bytes"])
             live.task = loop.create_task(self._attempt(job, live))
             live.task.add_done_callback(lambda task, job=job, live=live: self._finished(job["asset_id"], live, task))
+
+    def _claim(self, job_id: int, now: str, **lease: Any) -> bool:
+        """Takes a waiting job, for this server or (with the lease's columns) for a fetcher. One atomic update:
+        whoever's goes through has the job, and nobody else starts it."""
+        fields = {"started_at": now, "updated_at": now, **_NO_LEASE, **lease}
+        return bool(self.store.execute(
+            f"UPDATE video_jobs SET state='downloading', not_before=NULL, {', '.join(f'{k}=?' for k in fields)} "
+            "WHERE id=? AND state='queued'", (*fields.values(), job_id)).rowcount)
 
     def _kick(self) -> None:
         """Something changed in the queue: start what can start now, and let the worker loop know."""
@@ -621,26 +699,20 @@ class Videos:
                 self._set(job["id"], state="queued", downloaded_bytes=self._on_disk(asset_id),
                           last_progress_at=live.progress_at or job["last_progress_at"])
             raise
-        except VideoError as exc:
-            self._failed(job, live, str(exc), exc.transient)
-        except TimeoutError:
-            self._failed(job, live, f"the download took longer than {MAX_DOWNLOAD_S // 3600} hours", True)
-        except httpx.HTTPError as exc:  # the message can hold the redirect URL: keep only the type
-            self._failed(job, live, f"lcms.skku.edu: {type(exc).__name__}", True)
-        except OSError as exc:
-            name = errno.errorcode.get(exc.errno, "OSError")
-            self._failed(job, live, f"could not write the video to disk ({name})", True)
-        except Exception as exc:
-            log.warning("video %s: %s", asset_id, type(exc).__name__)
-            self._failed(job, live, type(exc).__name__, False)
+        except Exception as exc:  # what it says and whether it may pass: commons.failure, as for a fetcher's try
+            if not isinstance(exc, (VideoError, httpx.HTTPError, OSError)):
+                log.warning("video %s: %s", asset_id, type(exc).__name__)
+            self._failed(job, live, *commons.failure(exc))
         finally:
             # With the try, not in the done-callback a moment later: by then the file is in the cache index, and
             # another download making room meanwhile would count it twice.
             self._reserved.pop(asset_id, None)
 
-    def _failed(self, job: dict, live: Running, message: str, transient: bool) -> None:
+    def _failed(self, job: dict, live: Running | Lease, message: str, transient: bool, *,
+                keep_part: bool = True) -> None:
         """A try failed. One that may pass is made again after a pause, as often as export_retries allows (never
-        for a download whose caller retries by itself); anything else ends the job, visibly."""
+        for a download whose caller retries by itself); anything else ends the job, visibly. `keep_part` is off
+        for a fetcher's try: what it had uploaded is of no use to the next one."""
         asset_id = job["asset_id"]
         live.error, live.transient = message, transient
         current = self._job(asset_id)  # an export may have asked for it while it ran
@@ -649,42 +721,23 @@ class Videos:
             return  # taken out of the queue meanwhile
         attempts = job["attempts"] + 1
         retries = int(self.settings.export_retries) if current["keep_trying"] else 0
-        host = (json.loads(job["lecture"]).get("video") or {}).get("host", "lcms.skku.edu")
+        host = (json.loads(job["lecture"]).get("video") or {}).get("host", commons.HOST)
         if transient and attempts <= retries:
-            if host in self._no_resume:  # this server starts every download over: what arrived is of no use
+            if host in self._no_resume or not keep_part:  # every download starts over: what arrived is of no use
                 self._part(asset_id).unlink(missing_ok=True)
             pause = RETRY_AFTER_S[min(attempts, len(RETRY_AFTER_S)) - 1]
             again = datetime.now(KST) + timedelta(seconds=pause)
             self._set(job["id"], state="queued", attempts=attempts, error=message, transient=1,
-                      not_before=again.isoformat(timespec="microseconds"), downloaded_bytes=self._on_disk(asset_id))
+                      not_before=again.isoformat(timespec="microseconds"), downloaded_bytes=self._on_disk(asset_id),
+                      **_NO_LEASE)
             log.info("video %s: %s; trying again in %d s (retry %d of %d)", asset_id, message, pause, attempts, retries)
             return
         self._part(asset_id).unlink(missing_ok=True)
         if transient and retries:
             message = live.error = f"{message} (gave up after {attempts} tries)"
         self._set(job["id"], state="failed", attempts=attempts, error=message, transient=int(transient),
-                  not_before=None, downloaded_bytes=0, finished_at=_now())
+                  not_before=None, downloaded_bytes=0, finished_at=_now(), **_NO_LEASE)
         log.warning("video %s failed: %s", asset_id, message)
-
-    def _client(self) -> httpx.AsyncClient:
-        # No cookies, ever: these requests must not carry the iCampus session. The read timeout sits just behind
-        # the stall watchdog in _download, which notices first and says what happened.
-        return httpx.AsyncClient(transport=self._transport, follow_redirects=True, max_redirects=3,
-                                 timeout=httpx.Timeout(STALL_S + 15, connect=20),
-                                 headers={"User-Agent": "Mozilla/5.0", "Referer": REFERER})
-
-    async def _describe(self, client: httpx.AsyncClient, host: str, asset_id: str) -> dict:
-        r = await client.get(f"https://{host}/CommonsCore2/v2/contents/{asset_id}")
-        if r.status_code != 200:
-            raise VideoError(f"Commons did not describe this video (HTTP {r.status_code})",
-                             transient=r.status_code >= 500 or r.status_code == 429)
-        try:
-            result = r.json().get("result")
-        except (ValueError, AttributeError):
-            result = None
-        if not isinstance(result, dict):
-            raise VideoError("Commons answered with something unexpected")
-        return result
 
     def _kept(self, job: dict, version: str) -> int:
         """How much of an interrupted try can be continued: the .part's bytes, when they belong to this version of
@@ -694,120 +747,62 @@ class Videos:
             return 0
         return size
 
-    @staticmethod
-    def _continues(r: httpx.Response, offset: int, job: dict) -> bool:
-        """Whether a 206 answer really is the rest of the file the .part began: from our offset, of the same total
-        size, unencoded, and with the same validator when both sides have one."""
-        m = _CONTENT_RANGE.fullmatch((r.headers.get("content-range") or "").strip())
-        if not m or int(m.group(1)) != offset or int(m.group(3)) != job["total_bytes"]:
-            return False
-        if (r.headers.get("content-encoding") or "identity").lower() != "identity":
-            return False
-        validator = _validator(r.headers)
-        return not (job["validator"] and validator and validator != job["validator"])
-
     async def _download(self, lecture: dict, job: dict, live: Running) -> None:
+        """The server's own try: describe the video, make room, fetch it (commons.py), finish it."""
         video = lecture["video"]
-        asset_id, host = video["asset_id"], video.get("host", "lcms.skku.edu")
+        asset_id, host = video["asset_id"], video.get("host", commons.HOST)
         version = video.get("updated_at") or ""
         cap = int(self.settings.video_max_gb * 2**30)
         self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         part = self._part(asset_id)
-        loop = asyncio.get_running_loop()
-        exact: int | None = None  # the size the finished file must have, when the content server says
-        try:
-            async with asyncio.timeout(STALL_S) as watchdog, self._client() as client:
-                def alive() -> None:  # the content server answered or sent bytes: the stall clock starts over
-                    watchdog.reschedule(loop.time() + STALL_S)
-                    live.seen = time.monotonic()
 
-                info = await self._describe(client, host, asset_id)
-                alive()
-                if info.get("is_original_file_deleted"):
-                    raise VideoError("Commons no longer has this video's original file")
-                original = info.get("original_file_length") or 0
-                if original > cap:
-                    raise VideoError(f"the video is {original / 2**30:.1f} GB; only videos up to "
-                                     f"{self.settings.video_max_gb:g} GB are downloaded (ICAMPUS_VIDEO_MAX_GB)")
-                # Without a size from Commons, room is made for what iCampus lists, capped at the largest video
-                # allowed: the listing can be several times the file, so it never refuses a download by itself.
-                expected = original or min(video.get("listed_size") or 0, cap)
-                kept = self._kept(job, version)
-                live.restart(kept, original or job["total_bytes"])
-                self._reserved[asset_id] = expected
-                self._make_room(expected, keep=asset_id, on_disk=kept)
-                url = info.get("download_url")
-                if not (isinstance(url, str) and _host_ok(url)):
-                    url = f"https://{host}/CommonsCore2/v2/services/download/{asset_id}"
-                for offset in ((kept, 0) if kept else (0,)):  # the rest of the file first, when some of it is here
-                    headers = {}
-                    if offset:
-                        headers = {"Range": f"bytes={offset}-", "Accept-Encoding": "identity"}
-                        if job["validator"]:
-                            headers["If-Range"] = job["validator"]
-                    async with client.stream("GET", url, headers=headers) as r:
-                        alive()
-                        if not _host_ok(str(r.url)):
-                            raise VideoError("the download was redirected away from SKKU; stopped")
-                        resumed = bool(offset) and r.status_code == 206 and self._continues(r, offset, job)
-                        if offset and not resumed and r.status_code in (206, 416):
-                            continue  # not the rest of what is here: ask for the whole file
-                        if r.status_code != (206 if resumed else 200):
-                            raise VideoError(f"Commons refused the download (HTTP {r.status_code})",
-                                             transient=r.status_code >= 500 or r.status_code == 429)
-                        if "text/html" in (r.headers.get("content-type") or ""):
-                            raise VideoError("Commons sent a web page instead of the video")
-                        plain = (r.headers.get("content-encoding") or "identity").lower() == "identity"
-                        length = r.headers.get("content-length") or ""
-                        if resumed:
-                            exact = job["total_bytes"]
-                        elif plain and length.isdigit() and int(length):
-                            exact = int(length)
-                        total = exact or expected or None
-                        if total and total > cap:
-                            raise VideoError(f"the video is {total / 2**30:.1f} GB; only videos up to "
-                                             f"{self.settings.video_max_gb:g} GB are downloaded")
-                        if offset and not resumed:  # a Range request answered with the whole file
-                            self._no_resume.add(host)
-                        if kept and not resumed:  # the whole file again. Said, so that it isn't a silent reset.
-                            live.note = (f"the content server did not continue the interrupted download: this try "
-                                         f"started over from zero ({kept // MB} MB had arrived before)")
-                            log.info("video %s: the content server did not honour Range; starting over", asset_id)
-                        live.restart(offset if resumed else 0, total)
-                        fd = os.open(part, os.O_WRONLY | os.O_CREAT | (os.O_APPEND if resumed else os.O_TRUNC), 0o600)
-                        with os.fdopen(fd, "ab" if resumed else "wb") as f:
-                            # the file first, then what the row says about it: never a row describing other bytes
-                            self._set(job["id"], total_bytes=total, downloaded_bytes=live.done, part_version=version,
-                                      validator=_validator(r.headers) if plain else None, boot=_BOOT,
-                                      last_progress_at=_now())
-                            async for chunk in r.aiter_bytes():
-                                f.write(chunk)
-                                f.flush()  # into the kernel's cache, where it outlives this process
-                                alive()
-                                if live.arrived(len(chunk)) and time.monotonic() - live.persisted >= PERSIST_S:
-                                    live.persisted = time.monotonic()
-                                    self._set(job["id"], downloaded_bytes=live.done, last_progress_at=live.progress_at)
-                                if live.done > cap:
-                                    raise VideoError(f"the video is over {self.settings.video_max_gb:g} GB; stopped")
-                    break
-        except TimeoutError:
-            raise VideoError(f"the content server sent nothing for {STALL_S:g} seconds", transient=True) from None
-        # Complete? By the size the content server gave with the file; without one, at least not less than the
-        # size Commons describes (an answer with no length can end early without the connection saying so).
-        if live.done != exact if exact is not None else live.done < original:
-            raise VideoError("the download was cut short; try again", transient=True)
-        with open(part, "rb") as f:
-            head = f.read(16)
-        mp4 = head[4:8] == b"ftyp"
-        described = str(info.get("extension") or "").lower()
-        ext = ".mp4" if mp4 else (f".{described}" if re.fullmatch(r"[a-z0-9]{1,8}", described)
-                                  and described != "mp4" else ".bin")  # don't name a non-mp4 .mp4
+        def alive() -> None:  # the content server answered or sent bytes
+            live.seen = time.monotonic()
+
+        def opened(file: commons.Opened) -> None:
+            if file.range_ignored:  # a Range request answered with the whole file
+                self._no_resume.add(host)
+            if file.discarded:  # the whole file again. Said, so that it isn't a silent reset.
+                live.note = (f"the content server did not continue the interrupted download: this try "
+                             f"started over from zero ({file.discarded // MB} MB had arrived before)")
+                log.info("video %s: the content server did not honour Range; starting over", asset_id)
+            # the file first, then what the row says about it: never a row describing other bytes
+            self._set(job["id"], total_bytes=file.total, downloaded_bytes=live.done, part_version=version,
+                      validator=file.validator, boot=_BOOT, last_progress_at=_now())
+
+        def progress() -> None:
+            if time.monotonic() - live.persisted >= PERSIST_S:
+                live.persisted = time.monotonic()
+                self._set(job["id"], downloaded_bytes=live.done, last_progress_at=live.progress_at)
+
+        async with commons.attempt(self._transport, stall_s=STALL_S, on_alive=alive) as content:
+            info = await content.describe(host, asset_id, max_bytes=cap)
+            original = commons.original_size(info)
+            # Without a size from Commons, room is made for what iCampus lists, capped at the largest video
+            # allowed: the listing can be several times the file, so it never refuses a download by itself.
+            expected = original or min(video.get("listed_size") or 0, cap)
+            kept = self._kept(job, version)
+            live.restart(kept, original or job["total_bytes"])
+            self._reserved[asset_id] = expected
+            self._make_room(expected, keep=asset_id, on_disk=kept)
+            resume = commons.Resume(kept, job["total_bytes"], job["validator"]) if kept else None
+            got = await content.fetch(part, meter=live, expected=expected, resume=resume, opened=opened,
+                                      progress=progress)
+        self._finish(lecture, info, part, got.size, got.mp4)
+        log.info("video %s downloaded (%.0f MB)", asset_id, got.size / MB)
+
+    def _finish(self, lecture: dict, info: dict, part: Path, size: int, mp4: bool) -> None:
+        """A complete .part becomes the cached video: its final name, the sidecar beside it, the cache index. A
+        download by this server and a file a fetcher uploaded both end here. `info` is Commons' description."""
+        video = lecture["video"]
+        asset_id = video["asset_id"]
+        ext = commons.extension(info, mp4)
         final = self.dir / f"{asset_id}{ext}"
         previous = self.meta(asset_id)  # an outdated copy being replaced
         os.replace(part, final)
         now = datetime.now(KST).isoformat()
         meta = {
-            "asset_id": asset_id, "file": final.name, "size": live.done, "item_id": lecture.get("item_id"),
+            "asset_id": asset_id, "file": final.name, "size": size, "item_id": lecture.get("item_id"),
             "course_id": lecture.get("course_id"), "title": lecture.get("title"),
             "name": _safe_name(lecture.get("title"), asset_id) + ext,
             "format": "mp4" if mp4 else f"not mp4 (Commons type {info.get('type')})",
@@ -819,4 +814,350 @@ class Videos:
         self._index(asset_id, meta, final)
         if previous and previous["file"] != final.name:
             (self.dir / previous["file"]).unlink(missing_ok=True)
-        log.info("video %s downloaded (%.0f MB)", asset_id, live.done / MB)
+
+    # --- fetchers: downloads another machine does for the queue -------------------------------------------------
+
+    def _online(self, entry: dict) -> bool:
+        """Heard from within FETCHER_SEEN_S seconds."""
+        return datetime.now(KST) - datetime.fromisoformat(entry["last_seen"]) < timedelta(seconds=FETCHER_SEEN_S)
+
+    def _heard(self, name: str, *, platform: str | None = None, version: str | None = None) -> None:
+        """A fetcher called. Its "last seen" is kept in the database too (now and then), so a restart still knows
+        who was around: with local_downloads=fallback the server must not start downloading just because it
+        restarted."""
+        known = self.fetchers.get(name)
+        entry = {**(known or {}), "last_seen": _now()}
+        entry.update({k: v for k, v in (("platform", platform), ("version", version)) if v is not None})
+        self.fetchers[name] = entry
+        new = known is None or any(known.get(k) != entry.get(k) for k in ("platform", "version"))
+        if new or time.monotonic() - self._fetchers_saved >= FETCHERS_SAVE_S:
+            self._fetchers_saved = time.monotonic()
+            self.store.set_state("fetchers", self.fetchers)
+
+    def fetcher_list(self) -> list[dict]:
+        """The fetchers heard from lately: what each runs on, when it last called, how many downloads it holds and
+        how fast those are going together."""
+        out = []
+        for name, entry in sorted(self.fetchers.items()):
+            held = [lease for lease in self.leases.values() if lease.fetcher == name]
+            speeds = [speed for lease in held if (speed := lease.live_speed()) is not None]
+            out.append({"name": name, "platform": entry.get("platform") or None, "version": entry.get("version") or None,
+                        "last_seen": _shown(entry["last_seen"]), "online": self._online(entry),
+                        "active_jobs": len(held), "speed_mbps": round(sum(speeds) / MB, 2) if speeds else None})
+        return out
+
+    def _lease_until(self) -> str:
+        return (datetime.now(KST) + timedelta(seconds=LEASE_TTL_S)).isoformat(timespec="microseconds")
+
+    def _expected(self, lecture: dict, original: int) -> int:
+        """The bytes to keep room for: the size Commons gave, else what iCampus lists, capped at the largest video
+        allowed (the listing can be several times the file)."""
+        cap = int(self.settings.video_max_gb * 2**30)
+        return original or min(lecture["video"].get("listed_size") or 0, cap)
+
+    def _restore_fetchers(self) -> None:
+        """A start: who was around, and the downloads fetchers were doing. Those are still theirs, with what they
+        had uploaded, and each gets a full lease time from now, because no heartbeat could arrive while the server
+        was down. A job that was claimed but not yet described goes back into the queue."""
+        long_ago = (datetime.now(KST) - timedelta(days=FETCHER_KEPT_DAYS)).isoformat()
+        stored = self.store.get_state("fetchers") or {}
+        self.fetchers = {name: entry for name, entry in stored.items()
+                         if isinstance(entry, dict) and str(entry.get("last_seen") or "") > long_ago}
+        for row in self.store.query("SELECT * FROM video_jobs WHERE state='downloading' AND fetcher IS NOT NULL"):
+            job = dict(row)
+            try:
+                info = json.loads(job["lease_info"] or "null")
+            except ValueError:
+                info = None
+            if not job["lease_id"] or not isinstance(info, dict):  # nothing was uploaded for it yet
+                self._set(job["id"], state="queued", **_NO_LEASE)
+                continue
+            original, lecture = commons.original_size(info), json.loads(job["lecture"])
+            self.leases[job["asset_id"]] = Lease(
+                job_id=job["id"], asset_id=job["asset_id"], fetcher=job["fetcher"], lease_id=job["lease_id"],
+                info=info, lecture=lecture, exact=original or None, total=original or None,
+                done=job["downloaded_bytes"], progress_at=job["last_progress_at"],
+                hashed=-1)  # -1: its upload is hashed from the disk at the end
+            self._reserved[job["asset_id"]] = self._expected(lecture, original)
+            self._set(job["id"], lease_expires_at=self._lease_until())
+
+    def _end_lease(self, lease: Lease) -> None:
+        """The lease is over, however: its room is given back, and a request still running for it stops."""
+        lease.ended = True
+        if self.leases.get(lease.asset_id) is lease:
+            del self.leases[lease.asset_id]
+            self._reserved.pop(lease.asset_id, None)
+
+    def _lease_failed(self, job: dict, lease: Lease, message: str, transient: bool, *,
+                      keep_part: bool = False) -> None:
+        """A fetcher's try at a job ended without the file: the same pauses, retries and giving up as for a try of
+        the server's own (_failed), and whoever waits for the video hears how it ended. What it had uploaded goes
+        (`keep_part` is for a job that failed before it was the fetcher's: the .part is then still the server's)."""
+        self._end_lease(lease)
+        self._failed(job, lease, message, transient, keep_part=keep_part)
+        self._release(job["asset_id"], lease.error, lease.transient)
+        self._wake.set()
+
+    def _expire(self) -> None:
+        """Takes back the jobs of fetchers that went quiet (a closed lid, a lost network): each counts as a failed
+        try and goes back into the queue, for the server or another fetcher."""
+        rows = self.store.query("SELECT * FROM video_jobs WHERE state='downloading' AND fetcher IS NOT NULL "
+                                "AND (lease_expires_at IS NULL OR lease_expires_at<?)", (_now(),))
+        for row in rows:
+            job = dict(row)
+            lease = self.leases.get(job["asset_id"])
+            if lease is None or lease.job_id != job["id"]:
+                lease = Lease(job_id=job["id"], asset_id=job["asset_id"], fetcher=job["fetcher"], lease_id="")
+            self._lease_failed(job, lease, f"the fetcher {job['fetcher']} went quiet: nothing was heard from it "
+                                           f"for {LEASE_TTL_S:g} seconds", True)
+
+    def _leased(self, job_id: int, lease_id: str) -> tuple[dict, Lease] | None:
+        """The job and its lease, for a call that names both. None when there is no such job any more (it was
+        taken out of the queue, or it is finished); StaleLease when the job is no longer this lease's."""
+        row = self.store.one("SELECT * FROM video_jobs WHERE id=?", (job_id,))
+        if row is None:
+            return None
+        job = dict(row)
+        lease = self.leases.get(job["asset_id"])
+        current = job["lease_id"] if job["state"] == "downloading" else None
+        if (not current or lease is None or lease.ended or lease.lease_id != current
+                or not hmac.compare_digest(current.encode(), lease_id.encode())):
+            raise StaleLease()
+        return job, lease
+
+    def finished(self, lease_id: str) -> int | None:
+        """The size of the file a lease ended with, when its upload was taken and finished a short while ago; None
+        otherwise. A fetcher that lost the answer to its last piece asks again, and hears that it is done instead
+        of that its lease is stale."""
+        for old in [key for key, (when, _) in self._uploaded.items() if time.monotonic() - when > UPLOADED_KEPT_S]:
+            del self._uploaded[old]
+        found = next((size for key, (_, size) in self._uploaded.items()
+                      if hmac.compare_digest(key.encode(), lease_id.encode())), None)
+        return found
+
+    def _renew(self, job: dict, lease: Lease, **fields: Any) -> None:
+        """The fetcher is there: its lease runs LEASE_TTL_S seconds from now."""
+        lease.beat = lease.renewed = time.monotonic()
+        self._heard(lease.fetcher)
+        self._set(job["id"], lease_expires_at=self._lease_until(), **fields)
+
+    async def lease(self, fetcher: str, *, platform: str = "", version: str = "", slots_free: int = 1,
+                    free_bytes: int | None = None) -> dict | None:
+        """Gives the next due job to a fetcher, or None when there is none for it. The job is claimed first, with
+        the same update and in the same order as tick() claims one for this server. Then the server describes the
+        video itself (no cookies), so the size the upload must have and the largest video allowed are the
+        server's own knowledge, and makes room for it. A job the content server refuses to describe has failed a
+        try, as it would have here, and the next one is looked at."""
+        if slots_free <= 0 or self._stopped:
+            return None  # only asking whether its token works, or the server is on its way out
+        self._heard(fetcher, platform=platform, version=version)
+        self._expire()
+        if sum(1 for held in self.leases.values() if held.fetcher == fetcher) >= FETCHER_SLOTS:
+            return None
+        cap = int(self.settings.video_max_gb * 2**30)
+        self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        too_big = self._too_big.setdefault(fetcher, {})
+        passed: set[str] = set()
+        for _ in range(5):  # a job that can't be given away must not hide the ones behind it for long
+            due = self.store.query("SELECT * FROM video_jobs WHERE state='queued' AND (not_before IS NULL OR "
+                                   "not_before<=?) ORDER BY queued_at, id LIMIT 50", (_now(),))
+            job = next((dict(row) for row in due if row["asset_id"] not in passed
+                        and row["asset_id"] not in self.active and row["asset_id"] not in self.leases
+                        and commons.SAFE_ID.fullmatch(row["asset_id"])
+                        and not (free_bytes is not None and too_big.get(row["asset_id"], 0) > free_bytes)), None)
+            if job is None:
+                return None
+            asset_id = job["asset_id"]
+            passed.add(asset_id)
+            lecture = self._lecture(job)
+            host = lecture["video"].get("host", commons.HOST)
+            lease = Lease(job_id=job["id"], asset_id=asset_id, fetcher=fetcher, lease_id=secrets.token_urlsafe(24),
+                          lecture=lecture)
+            if not self._claim(job["id"], _now(), fetcher=fetcher, lease_id=lease.lease_id,
+                               lease_expires_at=self._lease_until()):
+                continue  # this server took it in the meantime
+            self.leases[asset_id] = lease
+            try:
+                async with commons.attempt(self._transport, stall_s=STALL_S) as content:
+                    info = await content.describe(host, asset_id, max_bytes=cap)
+                if lease.ended:
+                    continue  # taken out of the queue while Commons was asked
+                original = commons.original_size(info)
+                expected = self._expected(lecture, original)
+                if free_bytes is not None and expected > free_bytes:
+                    # Not for this machine: back into its place for the server or another fetcher, and no failed
+                    # try. Remembered, so this fetcher isn't handed it again at every call.
+                    too_big[asset_id] = expected
+                    self._end_lease(lease)
+                    self._set(job["id"], state="queued", started_at=job["started_at"], **_NO_LEASE)
+                    self._wake.set()
+                    continue
+                self._reserved[asset_id] = expected
+                self._make_room(expected, keep=asset_id)
+            except asyncio.CancelledError:  # the request was dropped: nobody has the job, and nothing failed
+                if not lease.ended:
+                    self._end_lease(lease)
+                    self._set(job["id"], state="queued", started_at=job["started_at"], **_NO_LEASE)
+                raise
+            except Exception as exc:
+                if not isinstance(exc, (VideoError, httpx.HTTPError, OSError)):
+                    log.warning("video %s: %s", asset_id, type(exc).__name__)
+                if not lease.ended:  # as a try of the server's own would have failed, with what that one keeps
+                    self._lease_failed(job, lease, *commons.failure(exc), keep_part=True)
+                continue
+            # The job is the fetcher's now. What a try of the server's own left on disk is not what the upload
+            # continues: the upload starts a file of its own.
+            self._part(asset_id).unlink(missing_ok=True)
+            lease.info = {k: info.get(k) for k in LEASE_INFO}
+            lease.exact = lease.total = original or None
+            self._renew(job, lease, total_bytes=original or None, lease_info=json.dumps(lease.info),
+                        downloaded_bytes=0, part_version=None, validator=None, boot=None, last_progress_at=_now())
+            log.info("video %s: leased to the fetcher %s", asset_id, fetcher)
+            return {"job_id": job["id"], "lease_id": lease.lease_id, "asset_id": asset_id, "host": host,
+                    "title": lecture.get("title"), "expected_bytes": original or None, "max_bytes": cap,
+                    "lease_ttl_s": int(LEASE_TTL_S)}
+        return None
+
+    def heartbeat(self, job_id: int, lease_id: str, *, phase: str, done: int, total: int | None = None,
+                  speed: float | None = None) -> bool:
+        """A fetcher says where its job stands, which renews its lease. False when the job is gone (it was taken
+        out of the queue): the fetcher stops and deletes its file. Raises StaleLease."""
+        found = self._leased(job_id, lease_id)
+        if found is None:
+            return False
+        job, lease = found
+        if phase == "uploading":  # the download is complete there; `done` counts what it has sent
+            downloaded = lease.exact or total or lease.done
+        else:
+            downloaded = done
+        if (phase, downloaded) != (lease.phase, lease.done) or phase == "uploading":
+            lease.progress_at = _now()
+        lease.phase, lease.done, lease.speed = phase, downloaded, speed
+        lease.total = lease.exact or total or lease.total
+        self._renew(job, lease, downloaded_bytes=downloaded, last_progress_at=lease.progress_at)
+        return True
+
+    def received(self, job_id: int, lease_id: str) -> int:
+        """How many bytes of a fetcher's upload are here, so it can go on from there. Raises StaleLease."""
+        found = self._leased(job_id, lease_id)
+        if found is None:
+            raise StaleLease()
+        job, lease = found
+        self._renew(job, lease)
+        return self._on_disk(job["asset_id"])
+
+    def fail_lease(self, job_id: int, lease_id: str, message: str, transient: bool) -> dict:
+        """A fetcher reports that its try failed. The message is the fetcher's (cleaned here), the pauses and the
+        number of tries are this queue's. Raises StaleLease."""
+        found = self._leased(job_id, lease_id)
+        if found is None:
+            raise StaleLease()
+        job, lease = found
+        self._heard(lease.fetcher)
+        self._lease_failed(job, lease, f"{lease.fetcher}: {_safe_message(message)}", bool(transient))
+        after = self._job(job["asset_id"]) or {}
+        return {"state": after.get("state"), "attempts": after.get("attempts"),
+                "retry_at": _shown(after.get("not_before"))}
+
+    async def receive(self, job_id: int, lease_id: str, *, start: int, length: int, total: int,
+                      sha256: str | None, body: AsyncIterator[bytes]) -> dict:
+        """Takes a piece of a fetcher's upload: `length` bytes that start at byte `start` of a file of `total`.
+        The piece must start where the file here ends (OutOfStep says where that is), so an upload cut off by
+        the network goes on from what arrived. With the last piece the file is checked against what this server
+        knows of it: the size Commons gave when the job was leased, the SHA-256 the fetcher sends against the
+        bytes here, and the first bytes of an MP4. Then it is finished like a download of the server's own.
+        A failed check fails the try (Refused). Raises StaleLease."""
+        found = self._leased(job_id, lease_id)
+        if found is None:
+            raise StaleLease()
+        async with found[1].lock:
+            found = self._leased(job_id, lease_id)  # it may have ended while this waited for its turn
+            if found is None:
+                raise StaleLease()
+            job, lease = found
+            asset_id = job["asset_id"]
+            self._renew(job, lease)
+            cap = int(self.settings.video_max_gb * 2**30)
+            if lease.exact is not None and total != lease.exact:
+                self._refuse(job, lease, f"the upload is {total} bytes, but Commons described a file of "
+                                         f"{lease.exact}", True)
+            if total > cap:
+                self._refuse(job, lease, f"the video is {total / 2**30:.1f} GB; only videos up to "
+                                         f"{cap / 2**30:g} GB are downloaded (ICAMPUS_VIDEO_MAX_GB)", False)
+            have = self._on_disk(asset_id)
+            if start != have:
+                raise OutOfStep(have)
+            if total > self._reserved.get(asset_id, 0):  # Commons gave no size when it was leased: now it is known
+                self._reserved[asset_id] = total
+                try:
+                    self._make_room(total, keep=asset_id, on_disk=have)
+                except VideoError as exc:
+                    self._refuse(job, lease, str(exc), exc.transient)
+            self.dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            part = self._part(asset_id)
+            wrote, too_long = 0, False
+            with os.fdopen(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as f:
+                async for chunk in body:
+                    if lease.ended:
+                        break  # taken back or out of the queue while the piece was arriving
+                    if wrote + len(chunk) > length:
+                        too_long = True
+                        break
+                    f.write(chunk)
+                    f.flush()
+                    wrote += len(chunk)
+                    if lease.hashed == have + wrote - len(chunk):
+                        lease.digest.update(chunk)
+                        lease.hashed += len(chunk)
+                    if time.monotonic() - lease.renewed >= PERSIST_S:
+                        self._renew(job, lease)
+                if too_long:  # more than the piece was said to hold: none of it is kept
+                    f.truncate(have)
+            if lease.ended:
+                raise StaleLease()
+            if too_long:
+                lease.hashed = -1
+                raise ValueError("the request carried more bytes than its Content-Range names")
+            here = have + wrote
+            if here < total:
+                return {"received_bytes": here, "complete": False}
+            # all of it is here: is it the file?
+            if lease.hashed != here:  # some of it arrived before a restart: read it back
+                own = await asyncio.to_thread(_sha256, part)
+                if lease.ended:
+                    raise StaleLease()
+            else:
+                own = lease.digest.hexdigest()
+            if not sha256 or not hmac.compare_digest(own, sha256.strip().lower()):
+                self._refuse(job, lease, "the uploaded file is not the one the fetcher downloaded (SHA-256 "
+                                         "mismatch)" if sha256 else "the upload came without its SHA-256", True)
+            if not commons.is_mp4(part):
+                self._refuse(job, lease, "the uploaded file is not an MP4", True)
+            try:
+                self._finish(lease.lecture or self._lecture(job), lease.info, part, here, True)
+            except OSError as exc:
+                self._refuse(job, lease, commons.failure(exc)[0], True)
+            self.store.execute("DELETE FROM video_jobs WHERE id=?", (job["id"],))  # done: the cache has it now
+            self._end_lease(lease)
+            self._uploaded[lease.lease_id] = (time.monotonic(), here)
+            self._release(asset_id, None, False)
+            self._wake.set()
+            log.info("video %s uploaded by the fetcher %s (%.0f MB)", asset_id, lease.fetcher, here / MB)
+            return {"received_bytes": here, "complete": True}
+
+    def _refuse(self, job: dict, lease: Lease, message: str, transient: bool) -> None:
+        """An upload failed a check: the try has failed, and the fetcher is told why."""
+        self._lease_failed(job, lease, f"{lease.fetcher}: {message}", transient)
+        raise Refused(message)
+
+    def bench_targets(self, count: int = 4) -> list[dict]:
+        """A few hosted videos to measure download speed with (`bench`): asset id and host, the biggest first, so
+        a measurement doesn't run out of file. Read from the synced lecture list: nothing is asked of anyone."""
+        seen: dict[str, dict] = {}
+        for row in self.store.records("lectures"):
+            video = row.get("video") or {}
+            asset_id, host = str(video.get("asset_id") or ""), video.get("host", commons.HOST)
+            if commons.SAFE_ID.fullmatch(asset_id) and commons.host_ok(f"https://{host}/"):
+                seen.setdefault(asset_id, {"asset_id": asset_id, "host": host, "size": video.get("listed_size") or 0})
+        biggest = sorted(seen.values(), key=lambda t: t["size"], reverse=True)[:count]
+        return [{"asset_id": t["asset_id"], "host": t["host"]} for t in biggest]

@@ -385,6 +385,8 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         changes, errors, typed = {}, {}, {}
         for key in keys:
             spec = SPECS[key]
+            if spec.kind == "enum" and key not in form:
+                continue  # a choice the post doesn't carry stays as it is (a browser always sends a select)
             raw: Any = (key in form) if spec.kind == "bool" else text_field(form, key)
             typed[key] = raw
             try:

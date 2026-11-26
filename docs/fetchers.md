@@ -317,8 +317,8 @@ with the system calls replaced by recorders. By hand, on each system:
 **Both**
 - `uv tool install git+https://…` succeeds and `icampus-fetcher --help` runs.
 - `icampus-fetcher check` is all `ok` with Tailscale connected, and says so plainly without it.
-- `run` picks up a queued export; the server ends with a `ready` video that plays; the work directory is empty
-  afterwards.
+- `run` picks up a queued export; the server ends with a `ready` video that plays; the work directory holds no
+  video afterwards (only `.icampus-fetcher`, the note that the directory is the fetcher's own).
 - Ctrl+C in the middle of a download: the job is `queued` again at once with "fetcher stopped".
 - A work directory that holds other files is refused; the default one is made and used without a word.
 - The status line with a Korean title, and after resizing the window.

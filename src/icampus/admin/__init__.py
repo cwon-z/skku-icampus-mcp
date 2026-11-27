@@ -385,6 +385,8 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         changes, errors, typed = {}, {}, {}
         for key in keys:
             spec = SPECS[key]
+            if spec.kind == "enum" and key not in form:
+                continue  # a choice the post doesn't carry stays as it is (a browser always sends a select)
             raw: Any = (key in form) if spec.kind == "bool" else text_field(form, key)
             typed[key] = raw
             try:
@@ -563,6 +565,12 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
 
     # --- jobs ----------------------------------------------------------------
 
+    def fetchers_data() -> dict:
+        """The Fetchers panel: who downloads for this server, and what is being downloaded now. Shown once a
+        fetcher token is configured (or a fetcher is still on record); without fetchers the page is as it was."""
+        downloads = ctx.videos.summary()
+        return {"downloads": downloads, "fetchers_shown": bool(ctx.fetcher_tokens or downloads["fetchers"])}
+
     def jobs_data(request: Request) -> dict:
         state = request.query_params.get("state") or ""
         states = ACTIVE if state == "active" else (state,) if state else None
@@ -570,7 +578,7 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
         jobs = pipeline.jobs(states=states, limit=300)
         for job in jobs:
             job["course"] = names.get(job["course_id"], job["course_id"])
-        return {"jobs": jobs, "queue": pipeline.queue_summary(), "state": state}
+        return {"jobs": jobs, "queue": pipeline.queue_summary(), "state": state, **fetchers_data()}
 
     @app.get("/admin/jobs", include_in_schema=False)
     async def jobs_get(request: Request, session: dict = Depends(signed_in)) -> Response:
@@ -580,6 +588,11 @@ def register(app: FastAPI, ctx: SimpleNamespace) -> None:
     @app.get("/admin/jobs/table", include_in_schema=False)
     async def jobs_table(request: Request, session: dict = Depends(signed_in)) -> Response:
         return render("_jobs_table.html", request, session, **jobs_data(request))
+
+    @app.get("/admin/jobs/fetchers", include_in_schema=False)
+    async def jobs_fetchers(request: Request, session: dict = Depends(signed_in)) -> Response:
+        """The Fetchers panel by itself, for its refresh. Reads the queue and what fetchers last reported."""
+        return render("_fetchers.html", request, session, **fetchers_data())
 
     @app.post("/admin/jobs/queue", include_in_schema=False)
     async def jobs_queue(request: Request, session: dict = Depends(changing)) -> Response:

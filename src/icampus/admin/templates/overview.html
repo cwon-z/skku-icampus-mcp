@@ -35,7 +35,7 @@
     <p class="empty">No lecture has been queued yet. Queue a course, or ask for one lecture from its page.</p>
     {% endif %}
     <p class="t2 num">{{ queue.done }} done · {{ queue.paused_budget }} paused for budget · {{ queue.failed }} failed</p>
-    {% if downloads.downloading or downloads.queued or downloads.failed %}<p class="t2 num">Video downloads: {{ downloads.downloading }} downloading{% for d in downloads.active %}{% if d.total_mb %} ({{ d.downloaded_mb }} of {{ d.total_mb }} MB){% endif %}{% endfor %} · {{ downloads.queued }} queued · {{ downloads.failed }} failed{% for f in downloads.recently_failed[-1:] %} (last: {{ f.error }}){% endfor %}</p>{% endif %}
+    {% if downloads.downloading or downloads.queued or downloads.failed %}<p class="t2 num">Video downloads: {{ downloads.downloading }} downloading{% for d in downloads.active %}{% set who = d.by if d.by and d.by != "server" else "" %}{% if d.total_mb or who %} ({% if d.total_mb %}{{ d.downloaded_mb }} of {{ d.total_mb }} MB{{ " " if who }}{% endif %}{% if who %}by {{ who }}{% endif %}){% endif %}{% endfor %} · {{ downloads.queued }} queued · {{ downloads.failed }} failed{% for f in downloads.recently_failed[-1:] %} (last: {{ f.error }}){% endfor %}</p>{% endif %}
     <a class="btn btn-primary btn-lg btn-block push" href="/admin/jobs">Open jobs{{ icon("arrow-right", 18, 1.8) }}</a>
   </section>
 

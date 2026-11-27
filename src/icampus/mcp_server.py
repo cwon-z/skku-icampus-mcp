@@ -91,9 +91,13 @@ async def _call(method: str, path: str, *, timeout: float = 30, body: Any = None
 async def sync_status() -> dict:
     """When the data was last refreshed (per dataset), whether the last runs worked, and any login problem.
     Call this first if answers look stale or empty. `exports` is the queue of lecture video downloads: how many
-    are queued, downloading, failed and ready, what is downloading now (`active`, with megabytes, speed and ETA),
-    which items are next, the last failures with their errors, and the worker's `heartbeat_at` (it looks at the
-    queue every few seconds; an old heartbeat or `running: false` means the queue is not being worked)."""
+    are queued, downloading, failed and ready, what is downloading now (`active`: who has it under `by`, the
+    `phase`, megabytes, speed and ETA), which items are next, the last failures with their errors, and the
+    worker's `heartbeat_at` (it looks at the queue every few seconds; an old heartbeat or `running: false` means
+    the queue is not being worked). `fetchers` lists the user's other machines that download for the server:
+    name, platform, version, `last_seen`, `online`, `active_jobs` and their current speed; `resting_until` means
+    its tries kept failing and it gets no work until then. With `worker.local_downloads` "off", or "fallback"
+    while a fetcher is online, the server leaves downloads to them."""
     return await _call("GET", "/api/v1/status")
 
 
@@ -246,15 +250,19 @@ def _video_link(item_id: str) -> str:
                                       open_world_hint=True))
 async def export_video(item_id: str, retry: bool = False) -> dict:
     """Save a lecture video to the server and get a link to it (an `item_id` from list_lectures with `exportable`).
-    The first call puts the download in the server's queue. The server works through the queue by itself, one
-    video at a time in the order they were asked for (about 1 MB per second, so a 1 GB lecture takes some 20
-    minutes), and keeps going through restarts: nothing needs to be called for it to advance. Calling again only
-    reads the progress:
+    The first call puts the download in the server's queue. The queue is worked through by itself, in the order
+    the videos were asked for, and keeps going through restarts: nothing needs to be called for it to advance.
+    How long a video takes depends on who downloads it and from where (a large lecture can take from minutes
+    to an hour): go by `speed_mbps` and `eta_s`, and don't promise the user a time. Calling again only reads
+    the progress:
     - `queued`: `queue_position` (1 = next). After a failed try also `attempts`, `last_error` and `retry_at`: the
-      server tries again by itself, with growing pauses.
-    - `downloading`: `downloaded_mb` of `total_mb`, `speed_mbps` (megabytes per second), `eta_s`,
-      `last_progress_at`, and `stalled` when nothing has arrived for a while (after a minute without data the
-      try is ended and made again). A `note` says so when a try had to start over from zero.
+      next try comes by itself, with growing pauses.
+    - `downloading`: `by` is who has it: `server`, or the name of a fetcher (another machine of the user's that
+      downloads for the server and then sends it the file). `phase` is `downloading`, or `uploading` while a
+      fetcher sends the file (`uploaded_mb`). `downloaded_mb` of `total_mb`; `speed_mbps` (megabytes per second)
+      and `eta_s` are those of the phase; `last_progress_at`; and `stalled` when nothing has arrived or been
+      heard for a while (a try that gets no data for a minute, or a fetcher silent for a minute and a half, is
+      ended and made again). A `note` says so when a try had to start over from zero.
     - `failed`: the server gave up, or the failure is one that retrying can't fix; `error` says why. It stays
       failed until you call again with retry=True. Tell the user the error rather than retrying in a loop.
     - `ready`: `link` opens the file, `size_mb` is its real size. The server keeps it, so later exports of the same
@@ -292,9 +300,9 @@ def _export(status: dict) -> dict:
                                       open_world_hint=True))
 async def export_videos(item_ids: list[str], retry: bool = False) -> dict:
     """Export several lecture videos with one call, or read where each of them stands. The videos join the server's
-    queue in the order of `item_ids` and download one after another in that order (calls to export_video sent side
-    by side reach the server in no particular order). Each item answers as export_video does: `state`,
-    `queue_position`, progress, `error`, and `link` once it is ready. The queue runs on the server by itself, for
+    queue in the order of `item_ids` and are started in that order (calls to export_video sent side by side reach
+    the server in no particular order). Each item answers as export_video does: `state`, `queue_position`,
+    progress with `by` and `phase`, `error`, and `link` once it is ready. The queue runs on the server by itself, for
     hours if need be, so there is nothing to keep calling: check back now and then with this tool (the same ids) or
     with sync_status (`exports`). Before exporting a whole course, tell the user how many videos and roughly how
     many GB that is (`video_mb_estimate` in list_lectures).
@@ -364,7 +372,8 @@ async def list_stt_models() -> dict:
 async def transcribe_lecture(item_id: str, model: str | None = None, language: str | None = None,
                              force: bool = False, estimate_only: bool = False) -> dict:
     """Make a timestamped transcript of a lecture video (an `item_id` from list_lectures with `exportable`).
-    The first call queues the work: the server downloads the video unless it has it (about a minute per 50 MB),
+    The first call queues the work: the video is downloaded unless the server has it (that can take a long while
+    for a large lecture; the job's progress shows megabytes, speed and who downloads it), then the server
     extracts the audio and sends it to a speech-to-text model. Follow `state` (queued, downloading, extracting,
     transcribing) with transcription_status, or by calling this again; once it is ready, read it with
     get_transcript. A lecture that already has a transcript of its current video answers ready at once and

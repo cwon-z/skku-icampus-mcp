@@ -6,9 +6,10 @@ lectures and attendance, grades, the files attached to announcements and assignm
 timestamped, searchable transcripts of those videos.
 
 ```
-icampus      (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite;
-                              transcribes lectures in the background; admin UI at /admin
-icampus-mcp  (:8724/mcp)      MCP tools; only talks to the API, never sees your password or any key
+icampus          (FastAPI :9013)  logs in by itself, syncs 4×/day, stores everything in SQLite;
+                                  transcribes lectures in the background; admin UI at /admin
+icampus-mcp      (:8724/mcp)      MCP tools; only talks to the API, never sees your password or any key
+icampus-fetcher  (optional)       on a laptop: downloads lecture videos for the server and uploads them
 ```
 
 Unofficial, not affiliated with Sungkyunkwan University. It only reads your own account; follow your
@@ -42,6 +43,7 @@ university's rules when you use it.
   again after 30 seconds, then with longer pauses (`export_retries`, 6), and after that the export is `failed`
   with the reason. A failed export is never started over unasked: asking again reports the failure until you
   ask with `retry`. `/api/v1/status` shows the queue and the worker's heartbeat.
+- **Other machines can do the downloading.** See [Remote fetchers](#remote-fetchers).
 - **Transcripts, on request or by the batch.** A job downloads the video (as above), cuts out the sound with
   ffmpeg and sends it to a speech-to-text provider: ElevenLabs Scribe, or any server with OpenAI's
   `/audio/transcriptions` route (OpenAI, Groq, a self-hosted Whisper). Several providers can be registered; a
@@ -80,6 +82,8 @@ uv run pytest
 
 Swagger UI: http://127.0.0.1:9013/docs. `icampus probe` is a one-off read-only check of what the
 iCampus pages load. It writes its report to `var/probe/`, which is gitignored and holds personal data.
+`icampus bench` measures how fast the content server sends videos to this machine, at 1, 2 and 3 connections,
+and keeps nothing ([docs/fetchers.md](docs/fetchers.md) says how to read it; it needs the server running).
 `icampus video-check` and `icampus material-check` are one-off read-only checks too: they print the shape of
 the lecture video and lecture material items (no titles, no IDs) and, with `--head N`, what SKKU's content server
 says about N of them. `material-check` never requests a file: whether lecture materials may be fetched at all is
@@ -90,11 +94,13 @@ an open question that its report is meant to answer.
 Send `Authorization: Bearer <token>` on every call. Tokens come from `ICAMPUS_API_TOKENS`
 (`label:token,...`). List responses look like `{synced_at, stale, count, items}`; when a list is cut
 short they add `total` and `truncated`. `course` accepts an ID, a course code or part of a name.
+The routes under `/api/v1/fetchers` take the tokens of `ICAMPUS_FETCHER_TOKENS` instead; those tokens get 403
+everywhere else.
 
 | Endpoint | Notes |
 |---|---|
 | `GET /health` | no auth |
-| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run; `exports`: the video download queue (queued, downloading, failed, ready, what is active, what failed last) and its worker's heartbeat |
+| `GET /api/v1/status` | last runs, freshness per dataset, login state, next run; `exports`: the video download queue (queued, downloading, failed, ready, what is active and who has it, what failed last), its worker's heartbeat, and `fetchers` (name, `token`, platform, version, `last_seen`, `online`, `active_jobs`, `speed_mbps`, `resting_until`) |
 | `POST /api/v1/sync` | Returns 202 started, 409 running, 429 cooldown or 423 blocked. `?retry_login=true` needs an `admin` token |
 | `GET /api/v1/courses` | codes, instructors, current grade |
 | `GET /api/v1/tasks` | merged to-do list: `course, kind, status, due_within_days=14, past_days=0, include_done, include_inactive, limit` |
@@ -106,7 +112,7 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `GET /api/v1/videos` | lecture videos kept on the server, and how full the cache is; `queue`: every download that hasn't finished, in the order they run |
 | `POST /api/v1/videos/{item_id}` | put a lecture video in the download queue unless it's cached (202 while it waits or downloads, 200 otherwise). Asking again only reads the status; `?retry=true` queues a failed one again |
 | `POST /api/v1/videos` | the same for several, `{"item_ids": [...], "retry": false}`: they join the queue in the order given |
-| `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued (`queue_position`; after a failed try `attempts`, `last_error`, `retry_at`), downloading (`downloaded_mb`, `total_mb`, `speed_mbps` in MB per second, `eta_s`, `last_progress_at`, `stalled`), ready (`size_mb`), outdated or failed (`error`, `attempts`, `retryable`) |
+| `GET /api/v1/videos/{item_id}` | `state`: not_downloaded, queued (`queue_position`; after a failed try `attempts`, `last_error`, `retry_at`), downloading (`by`: `server` or a fetcher's name, `phase`: downloading or uploading, `downloaded_mb`, `total_mb`, `uploaded_mb`, `speed_mbps` in MB per second and `eta_s` for that phase, `last_progress_at`, `stalled`), ready (`size_mb`), outdated or failed (`error`, `attempts`, `retryable`) |
 | `GET /api/v1/videos/{item_id}/content` | the video file; supports Range, so players can seek. `DELETE /api/v1/videos/{item_id}` drops the copy and takes its download out of the queue (admin token) |
 | `GET /api/v1/lectures/stats` | per course and in total: videos, hours, exportable hours and GB, transcribed hours, cost of the rest per provider |
 | `GET /api/v1/stt/models` | the speech-to-text providers: description, cost per hour, word timestamps, languages, health, cap left |
@@ -123,6 +129,11 @@ short they add `total` and `truncated`. `course` accepts an ID, a course code or
 | `/api/v1/stt/providers` | manage providers (admin token): `GET`, `POST`, `PUT /{id}`, `DELETE /{id}`, `PUT\|DELETE /{id}/key` (write-only), `POST /{id}/test` |
 | `GET /api/v1/grades` | `course` |
 | `GET /api/v1/export` | everything as one JSON document |
+| `POST /api/v1/fetchers/lease` | fetcher token. `{name, version, platform, slots_free, free_bytes}`: the next due download as `{job_id, lease_id, asset_id, host, title, expected_bytes, max_bytes, lease_ttl_s}`, or 204 |
+| `POST /api/v1/fetchers/jobs/{job_id}/progress` | fetcher token. `{lease_id, phase, done_bytes, total_bytes, speed_bps}` renews the lease; answers `{continue}` |
+| `PUT /api/v1/fetchers/jobs/{job_id}/file` | fetcher token. A piece of the upload (`Content-Range`, `X-Lease-Id`, `X-File-SHA256` on the last); `GET` says how many bytes the server has |
+| `POST /api/v1/fetchers/jobs/{job_id}/fail` | fetcher token. `{lease_id, message, transient}`: the queue's retry policy takes it from there |
+| `GET /api/v1/fetchers/bench-targets` | fetcher or API token. A few `{asset_id, host}` for `bench` |
 
 Any token may read, queue transcriptions and cancel jobs: queueing can cost money, but only inside each
 provider's cap. Changing settings or providers, testing a provider and deleting from the cache (including
@@ -148,7 +159,7 @@ are read-only except `refresh`, which asks for a sync; `read_attachment`, whose 
 from iCampus (so clients may ask before running it) and which returns text, or the picture itself for images; and
 `export_video`, which puts a lecture video (`exportable` in `list_lectures`) in the server's download queue. The
 server works through that queue by itself; calling the tool again only reads the progress (place in the queue,
-megabytes, speed, ETA, the last error) and never restarts anything: a failed export says why and stays failed until
+megabytes, speed, ETA, who is downloading it, the last error) and never restarts anything: a failed export says why and stays failed until
 `retry=True`. `export_videos` does the same for a list, which joins the queue in the order given, and `sync_status`
 shows the whole queue under `exports`. When a video is ready the tool returns a link,
 `<ICAMPUS_MCP_PUBLIC_URL>/videos/<item_id>`. The MCP server streams the file from the API behind the same auth as
@@ -192,11 +203,61 @@ The Access route is how claude.ai and the mobile apps reach it:
    - `ICAMPUS_MCP_ACCESS_EMAILS`, the emails allowed in;
    - `ICAMPUS_MCP_ALLOWED_HOSTS`, which must include the public hostname.
 
+## Remote fetchers
+
+Downloads from SKKU's content server are slow from some networks (about a megabyte a second from the author's
+homelab). A fetcher is a small program on another machine of yours, a MacBook or a Windows laptop, that takes
+jobs from the server's download queue, downloads each video where it is, and uploads the file. The server stays
+the only place where videos are kept, transcribed and served, and with no fetcher configured nothing changes.
+
+```bash
+# on the server: one token per machine, in .env, then docker compose up -d
+ICAMPUS_FETCHER_TOKENS=macbook:<token>
+```
+
+```bash
+# on the laptop, with Tailscale connected
+uv tool install git+https://github.com/cwon-z/skku-icampus-mcp
+```
+
+```bash
+icampus-fetcher check    # server, token, content server, disk, work directory
+```
+
+```bash
+icampus-fetcher bench    # is this machine faster than the server? (run `icampus bench` there to compare)
+```
+
+```bash
+icampus-fetcher run      # takes jobs until Ctrl+C
+```
+
+The fetcher reads `ICAMPUS_FETCHER_SERVER`, `ICAMPUS_FETCHER_TOKEN`, `ICAMPUS_FETCHER_NAME`,
+`ICAMPUS_FETCHER_SLOTS` (1 to 4), `ICAMPUS_FETCHER_DIR`, `ICAMPUS_FETCHER_MAX_DISK_GB` and
+`ICAMPUS_FETCHER_KEEP_AWAKE` from the environment, a `.env` beside where it runs, or flags.
+
+- A fetcher token opens the fetcher routes and nothing else, and a fetcher is who its token says it is. It gets
+  no SKKU login, no session, no speech-to-text key and no access to the data volume: an asset id and a host are
+  all it needs.
+- A video lies on the laptop only while it is downloaded and uploaded, in the per-user cache directory, named by
+  its asset id, never in a folder that iCloud, OneDrive or Dropbox copies.
+- A job is a lease that heartbeats keep. Closing the laptop puts the job back in the queue within about two
+  minutes; Ctrl+C does at once. The server checks an upload's size, SHA-256 and that it is an MP4 before it
+  becomes a cached video. A fetcher whose tries keep failing is given no work for a while, so it can't use up
+  the queue's retries.
+- `local_downloads` (Settings, Storage) says whether the server also downloads: `on`, `fallback` (only while no
+  fetcher is around) or `off`.
+- The API stays on its private address: a fetcher reaches it over your tailnet, and nothing public was added.
+
+[docs/fetchers.md](docs/fetchers.md) has the whole setup, how to read `bench`, starting it at login on macOS
+and Windows, and what hasn't been checked on a real Mac or Windows machine yet.
+
 ## Admin UI
 
 `http://<api address>:9013/admin` shows what the server has and lets you change how it runs: an overview (sync
 status, storage against caps, the queue, speech-to-text use this month), every runtime setting, the STT models
-(add, edit, test, routing), the job queue (retry, cancel, queue a course after a dry run), and one table of
+(add, edit, test, routing), the job queue (retry, cancel, queue a course after a dry run; with fetchers, who they
+are and what is being downloaded by whom), and one table of
 everything on disk (open, pin, delete, re-download, transcribe). A lecture's page plays the video beside its
 transcript; clicking a line seeks to it.
 
@@ -230,14 +291,14 @@ in the UI wins, and the page shows which is in force) or through `PUT /api/v1/se
 
 | Group | Settings |
 |---|---|
-| Storage | `video_cache_gb` (30), `video_max_gb` (4), `download_concurrency` (1), `export_retries` (6), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
+| Storage | `video_cache_gb` (30), `video_max_gb` (4), `download_concurrency` (1), `export_retries` (6), `local_downloads` (on), `attachment_cache_gb` (2), `attachment_reuse_hours` (12), `attachment_max_mb` (30), `audio_cache_gb` (5), `frames_cache_gb` (5), `cache_total_gb` (40) |
 | Sync | `sync_times`, `sync_jitter_min` (10), `manual_cooldown_min` (10), `stale_hours` (12) |
 | Transcription jobs | `prefetch_limit` (2), `keep_video_after_processing` (on), `download_retries` (3), `ffmpeg_threads` (1), `slides_enabled` (on), `slides_scene_threshold` (0.1), `slides_width` (960), `stt_auto_transcribe` (off), `stt_auto_courses`, `stt_auto_retranscribe` (off) |
 | Speech-to-text | `stt_default_provider`, `stt_fallback_order`, `stt_routing_rules`, `stt_default_language`, `stt_course_languages`, `stt_course_terms`, `stt_min_timestamps` (segment), `stt_chunk_minutes` (20), `stt_audio_bitrate_kbps` (24), `stt_fail_threshold` (3), `stt_skip_minutes` (15) |
 | Budget | `stt_monthly_usd_cap` (0 = none), `stt_budget_reset_day` (1); each provider has its own hour and USD caps |
 
-Tokens, the SKKU login, login limits, the listen address and the admin cookie settings stay in the environment
-and are only shown, never changed, from the UI.
+Tokens (`ICAMPUS_API_TOKENS`, `ICAMPUS_FETCHER_TOKENS`), the SKKU login, login limits, the listen address and the
+admin cookie settings stay in the environment and are only shown, never changed, from the UI.
 
 ## Deploy with Docker
 
@@ -249,7 +310,7 @@ docker compose up -d --build              # ports on 127.0.0.1 only
 To expose the ports on a server, copy `compose.homelab.example.yaml` to `compose.homelab.yaml`
 (gitignored), put in your addresses, and add `COMPOSE_FILE=compose.yaml:compose.homelab.yaml` to
 `.env`. Keep the API off the public internet, and put only the MCP port behind Cloudflare Access.
-The MCP container never gets your SSO password, a speech-to-text key or the data volume.
+The MCP container never gets your SSO password, a speech-to-text key, a fetcher token or the data volume.
 
 Upgrading an existing install needs nothing by hand: the database migrates in place, videos and attachments
 already on disk are indexed instead of downloaded again, and if the stored lecture rows come from an older
@@ -257,7 +318,8 @@ version one sync runs at start (through the usual cooldown and login guard). The
 Video downloads that were waiting when an older version stopped are not carried over (it kept them in memory):
 export them once more, and from then on the queue survives restarts.
 For transcripts, put `ELEVENLABS_API_KEY=...` in `.env` (or register another provider), then open `/admin/stt`
-and press *Test*.
+and press *Test*. Fetchers are off until `ICAMPUS_FETCHER_TOKENS` is set; until then the server downloads every
+video itself, as before.
 
 ## License
 
@@ -267,10 +329,12 @@ MIT — see [LICENSE](LICENSE).
 
 | Path | What |
 |---|---|
-| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `videos.py` lecture videos and their download queue, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
+| `src/icampus/` | the program (`browser.py` login + allowlist, `collect.py`, `sync.py`, `views.py` task status, `files.py` + `extract.py` attachments, `commons.py` the one client for SKKU's content server, `videos.py` lecture videos and their download queue, `video_check.py` the check behind them, `api.py`, `mcp_server.py`) |
+| `src/icampus/` (fetchers) | `fetcher.py` the `icampus-fetcher` command, `machine.py` what differs per operating system, `bench.py`, `api_fetchers.py` the routes a fetcher calls |
 | `src/icampus/` (transcripts) | `cache.py` the cache manager, `runtime.py` the settings registry, `audio.py` ffmpeg, `frames.py` slide frames, `stt/` providers and their registry, `pipeline.py` the job queue, `transcripts.py` storage and search, `api_transcripts.py` |
 | `src/icampus/admin/` | the admin UI: `__init__.py` (sessions, CSRF, pages), `templates/`, `static/` (theme, htmx, fonts) |
 | `docs/icampus-notes.md` | how iCampus behaves: login flow, endpoints, side effects |
+| `docs/fetchers.md` | remote fetchers: setup, `bench`, running at login, the protocol, what is still unmeasured |
 | `docs/transcripts.md` | the design of the transcript pipeline, cache and admin UI, the schema versions, and what the brief got wrong |
 | `docs/stt-providers.md` | provider configs: ElevenLabs, OpenAI, Groq, a self-hosted Whisper server |
 | `tests/` | offline tests with made-up data and fake servers; one runs a local Chromium against a fake login page, a few run ffmpeg on generated audio (skipped without it) |

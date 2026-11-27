@@ -1,4 +1,6 @@
-"""REST API over the cached iCampus data. Every /api/v1 route needs a bearer token."""
+"""REST API over the cached iCampus data. Every /api/v1 route needs a bearer token: one of ICAMPUS_API_TOKENS,
+except the routes under /api/v1/fetchers (api_fetchers.py), which take the tokens of ICAMPUS_FETCHER_TOKENS and
+nothing else. A fetcher's token opens no other route."""
 
 import asyncio
 import hmac
@@ -15,7 +17,7 @@ from pydantic import BaseModel, Field
 from types import SimpleNamespace
 
 from . import admin as admin_ui
-from . import api_transcripts, files, videos, views
+from . import api_fetchers, api_transcripts, files, videos, views
 from .browser import NotLoggedIn, clean_error
 from .cache import CAPS, GB, Cache
 from .config import KST, Settings, parse_tokens
@@ -48,6 +50,10 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     settings = Runtime(env, store)  # the environment with the values changed in the admin UI on top
     syncer = Syncer(settings, store)
     tokens = parse_tokens(env.api_tokens)
+    fetcher_tokens = parse_tokens(env.fetcher_tokens)  # token -> the fetcher's name
+    if tokens.keys() & fetcher_tokens.keys():
+        raise ValueError("a token can't be both an API token and a fetcher token: give each fetcher its own "
+                         "(ICAMPUS_FETCHER_TOKENS)")
     admins = {x.strip() for x in env.admin_labels.split(",") if x.strip()}
     cache = Cache(settings, store)
     video_cache = videos.Videos(settings, cache)
@@ -108,14 +114,40 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     app.state.cache, app.state.settings = cache, settings
     app.state.registry, app.state.transcripts, app.state.pipeline = registry, transcripts, pipeline
 
+    def bearer(request: Request, known: dict[str, str]) -> str | None:
+        """The label of the request's bearer token among `known`, if it is one of them."""
+        header = request.headers.get("authorization", "")
+        given = header[7:].strip().encode() if header.startswith("Bearer ") else b""
+        for token, label in known.items():
+            if given and hmac.compare_digest(given, token.encode()):
+                return label
+        return None
+
     def auth(request: Request) -> str:
         if not tokens:
             raise HTTPException(503, "no API tokens configured (ICAMPUS_API_TOKENS)")
-        header = request.headers.get("authorization", "")
-        given = header[7:].strip().encode() if header.startswith("Bearer ") else b""
-        for token, label in tokens.items():
-            if given and hmac.compare_digest(given, token.encode()):
-                return label
+        if label := bearer(request, tokens):
+            return label
+        if bearer(request, fetcher_tokens):  # a fetcher's token downloads and uploads videos, and reads nothing
+            raise HTTPException(403, "a fetcher token only works on /api/v1/fetchers")
+        raise HTTPException(401, "missing or wrong bearer token", headers={"WWW-Authenticate": "Bearer"})
+
+    def fetcher_auth(request: Request) -> str:
+        """For the routes a fetcher calls: a token of ICAMPUS_FETCHER_TOKENS, and no other."""
+        if not fetcher_tokens:
+            raise HTTPException(503, "no fetcher tokens configured (ICAMPUS_FETCHER_TOKENS)")
+        if label := bearer(request, fetcher_tokens):
+            return label
+        if bearer(request, tokens):
+            raise HTTPException(403, "this route takes a fetcher token (ICAMPUS_FETCHER_TOKENS), not an API token")
+        raise HTTPException(401, "missing or wrong bearer token", headers={"WWW-Authenticate": "Bearer"})
+
+    def any_auth(request: Request) -> str:
+        """An API token or a fetcher token (only what a fetcher's `bench` reads)."""
+        if label := bearer(request, tokens) or bearer(request, fetcher_tokens):
+            return label
+        if not tokens and not fetcher_tokens:
+            raise HTTPException(503, "no API tokens configured (ICAMPUS_API_TOKENS)")
         raise HTTPException(401, "missing or wrong bearer token", headers={"WWW-Authenticate": "Bearer"})
 
     def admin(label: str = Depends(auth)) -> str:
@@ -369,9 +401,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     @app.get("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
     async def video_status(item_id: ItemId) -> dict:
         """state: not_downloaded, queued (with `queue_position`, and `retry_at` after a failed try), downloading
-        (with `downloaded_mb`, `total_mb`, `speed_mbps` in megabytes per second, `eta_s`, `last_progress_at`,
-        and `stalled` while nothing arrives), ready, outdated (a sync saw a newer version) or failed (with `error`
-        and `attempts`). `last_error` is what the last failed try said."""
+        (with `by`: "server" or the name of the fetcher that has it, `phase`: downloading or, when a fetcher is
+        sending the file here, uploading, `downloaded_mb`, `total_mb`, `uploaded_mb`, `speed_mbps` in megabytes
+        per second and `eta_s` for that phase, `last_progress_at`, and `stalled` while nothing arrives), ready,
+        outdated (a sync saw a newer version) or failed (with `error` and `attempts`). `last_error` is what the
+        last failed try said."""
         return video_cache.status(lecture_video(item_id))
 
     @app.post("/api/v1/videos/{item_id}", dependencies=api, tags=["videos"])
@@ -485,9 +519,11 @@ def create_app(settings: Settings | None = None, *, store: Store | None = None, 
     ctx = SimpleNamespace(settings=settings, store=store, cache=cache, videos=video_cache, registry=registry,
                           transcripts=transcripts, pipeline=pipeline, syncer=syncer, api=api, auth=auth, admin=admin,
                           admins=admins, tokens=tokens, course_ids=course_ids, with_course=with_course,
-                          synced=synced, courses=courses)
+                          synced=synced, courses=courses, fetcher_tokens=fetcher_tokens,
+                          fetcher_auth=fetcher_auth, any_auth=any_auth)
     app.state.ctx = ctx
     api_transcripts.register(app, ctx)
+    api_fetchers.register(app, ctx)  # the routes a fetcher calls; they refuse everything while none is configured
     admin_ui.register(app, ctx)  # the web UI at /admin, unless ICAMPUS_ADMIN_UI=false
 
     @app.get("/api/v1/grades", dependencies=api, tags=["data"])

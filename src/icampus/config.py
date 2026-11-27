@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import SecretStr
@@ -42,6 +43,9 @@ class Settings(BaseSettings):
     password: SecretStr = SecretStr("")
     api_tokens: str = ""
     admin_labels: str = "admin"  # token labels allowed to clear a login block (retry_login)
+    # name:token pairs for fetchers: other machines that download lecture videos for the queue and upload them
+    # here (docs/fetchers.md). Such a token works on /api/v1/fetchers only. Empty: there are no fetchers.
+    fetcher_tokens: str = ""
     host: str = "127.0.0.1"
     port: int = 9013
     data_dir: Path = Path("var")
@@ -64,6 +68,9 @@ class Settings(BaseSettings):
     # way that may pass (the network, a stall, a full cache) is tried again by itself before it is given up.
     download_concurrency: int = 1
     export_retries: int = 6
+    # Whether the server downloads videos itself when fetchers can: on (it does, and fetchers share the queue),
+    # fallback (only while no fetcher has been heard from for two minutes) or off (never).
+    local_downloads: Literal["on", "fallback", "off"] = "on"
     # The other kinds of file under var/ (cache.py). Each kind has a cap; cache_total_gb caps them all together.
     attachment_cache_gb: float = 2
     attachment_reuse_hours: int = 12  # a download whose version iCampus didn't give is reused this long

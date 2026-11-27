@@ -94,10 +94,28 @@ CREATE TABLE IF NOT EXISTS video_jobs (
 CREATE INDEX IF NOT EXISTS video_jobs_queue ON video_jobs(state, queued_at, id);
 """
 
-# One script per schema version, applied in order; PRAGMA user_version records how far a file has come. Every
-# statement is safe to repeat (IF NOT EXISTS) and nothing is ever dropped: version 1 of this program set
-# user_version back to 1 at each start, so after a downgrade and a second upgrade the scripts run again.
-MIGRATIONS = [SCHEMA, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4]
+# Version 5: a download can be done by another machine (a fetcher) and uploaded. `fetcher` names who has the job
+# (NULL: this server), `lease_id` and `lease_expires_at` are its lease, renewed by heartbeats, and `lease_info` is
+# what the server itself learned about the file when it gave the job away (size, extension, flags: what finishing
+# the upload needs). SQLite has no ADD COLUMN IF NOT EXISTS, so this version is a function that looks first.
+COLUMNS_V5 = {"video_jobs": {"fetcher": "TEXT", "lease_id": "TEXT", "lease_expires_at": "TEXT", "lease_info": "TEXT"}}
+
+
+def _add_columns(columns: dict[str, dict[str, str]]):
+    def migrate(db: sqlite3.Connection) -> None:
+        for table, wanted in columns.items():
+            have = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            for name, kind in wanted.items():
+                if name not in have:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    return migrate
+
+
+# One step per schema version, applied in order; PRAGMA user_version records how far a file has come. A step is a
+# script, or a function when SQL alone can't say it. Every step is safe to repeat (IF NOT EXISTS, or a look at
+# what is there) and nothing is ever dropped: version 1 of this program set user_version back to 1 at each start,
+# so after a downgrade and a second upgrade the steps run again.
+MIGRATIONS = [SCHEMA, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, _add_columns(COLUMNS_V5)]
 
 
 @dataclass(frozen=True)
@@ -123,9 +141,9 @@ class Store:
         had = self._db.execute("PRAGMA user_version").fetchone()[0]
         if had >= len(MIGRATIONS):
             return None
-        for version, script in enumerate(MIGRATIONS, 1):
+        for version, step in enumerate(MIGRATIONS, 1):
             if version > had or version == 1:
-                self._db.executescript(script)
+                step(self._db) if callable(step) else self._db.executescript(step)
         self._db.execute(f"PRAGMA user_version = {len(MIGRATIONS)}")
         return had
 

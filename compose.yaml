@@ -1,6 +1,6 @@
 # Two services from one image. Ports publish on loopback only; a compose.homelab.yaml override
 # (see compose.homelab.example.yaml) adds server binds. Each service gets an explicit environment
-# list: the MCP container must never receive the SKKU password.
+# list: the MCP container must never receive the SKKU password or a fetcher token.
 name: skku-icampus
 
 services:
@@ -13,6 +13,8 @@ services:
       ICAMPUS_PASSWORD: ${ICAMPUS_PASSWORD:-}
       ICAMPUS_API_TOKENS: ${ICAMPUS_API_TOKENS:?set ICAMPUS_API_TOKENS in .env}
       ICAMPUS_ADMIN_LABELS: ${ICAMPUS_ADMIN_LABELS:-admin}
+      # Tokens of remote fetchers (docs/fetchers.md). Empty: no fetchers, and the server downloads everything itself.
+      ICAMPUS_FETCHER_TOKENS: ${ICAMPUS_FETCHER_TOKENS:-}
       ICAMPUS_TERM: ${ICAMPUS_TERM:-}
       ICAMPUS_SYNC_TIMES: ${ICAMPUS_SYNC_TIMES-07:30,12:30,18:00,22:30}  # set empty to turn the schedule off
       ICAMPUS_KUMA_PUSH_URL: ${ICAMPUS_KUMA_PUSH_URL:-}

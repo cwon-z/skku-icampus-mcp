@@ -1,0 +1,39 @@
+{% from "_ui.html" import badge, bar with context %}
+{# Other machines that download videos for the queue (docs/fetchers.md), and what is being downloaded now, by whom. #}
+<section class="card sec" id="fetchers" aria-labelledby="h-fetchers" hx-get="/admin/jobs/fetchers" hx-trigger="every 4s" hx-swap="outerHTML">
+  <div class="head head--top">
+    <div class="stack stack--sm"><h2 class="h2" id="h-fetchers">Fetchers</h2><p class="intro">Other machines of yours that download lecture videos for this server's queue and upload them here. Downloads by this server itself: <span class="mono">{{ downloads.worker.local_downloads }}</span> (<span class="mono">local_downloads</span>, under <a class="link" href="/admin/settings">Settings</a>).</p></div>
+    <span class="t2 num">{{ downloads.queued }} waiting · {{ downloads.downloading }} downloading</span>
+  </div>
+  <div class="table-wrap"><table class="tbl">
+    <thead><tr><th>Name</th><th>Platform</th><th>Version</th><th>Last seen</th><th class="r">Active jobs</th><th class="r">MB/s</th></tr></thead>
+    <tbody>
+    {% for f in downloads.fetchers %}
+    <tr>
+      <td><span class="row"><span class="mono t1">{{ f.name }}</span>{% if f.resting_until %}{{ badge("failing", "resting") }}{% elif f.online %}{{ badge("ok", "online") }}{% else %}{{ badge("canceled", "not heard from") }}{% endif %}</span>{% if f.token != f.name %}<div class="t2">token <span class="mono">{{ f.token }}</span></div>{% endif %}{% if f.resting_until %}<div class="t2">{{ f.failed_in_a_row }} failed tries in a row: no work for it until {{ f.resting_until | when }}</div>{% endif %}</td>
+      <td class="t2">{{ f.platform or "–" }}</td>
+      <td class="mono t2">{{ f.version or "–" }}</td>
+      <td class="when">{{ f.last_seen | when }}</td>
+      <td class="r num">{{ f.active_jobs }}</td>
+      <td class="r num">{{ "%.2f" | format(f.speed_mbps) if f.speed_mbps is not none else "–" }}</td>
+    </tr>
+    {% else %}<tr><td colspan="6" class="empty">No fetcher has called yet. Install one on a laptop with a token from ICAMPUS_FETCHER_TOKENS; docs/fetchers.md has the steps.</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% if downloads.active %}
+  <div class="table-wrap"><table class="tbl">
+    <thead><tr><th>Downloading now</th><th>By</th><th>Phase</th><th>Progress</th><th class="r">MB/s</th></tr></thead>
+    <tbody>
+    {% for d in downloads.active %}
+    <tr>
+      <td class="wide"><a class="t1" href="/admin/lecture/{{ d.item_id }}">{{ d.title or d.item_id }}</a></td>
+      <td class="mono">{{ d.by }}</td>
+      <td>{{ badge("downloading", d.phase) }}{% if d.stalled %} <span class="t2">nothing heard lately</span>{% endif %}</td>
+      <td>{% set had = d.uploaded_mb if d.phase == "uploading" else d.downloaded_mb %}{% if d.total_mb %}<span class="share"><span class="t2 num">{{ had }} / {{ d.total_mb }} MB</span>{{ bar(had, d.total_mb, "Uploaded" if d.phase == "uploading" else "Downloaded") }}</span>{% else %}<span class="t2 num">{{ had }} MB</span>{% endif %}</td>
+      <td class="r num">{{ "%.2f" | format(d.speed_mbps) if d.speed_mbps is not none else "–" }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>

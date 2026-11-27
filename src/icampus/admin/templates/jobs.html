@@ -47,6 +47,8 @@
   </form>
 </section>
 
+{% if fetchers_shown %}{% include "_fetchers.html" %}{% endif %}
+
 <nav class="tabs" aria-label="Filter by state">
   {% for value, label, n in (("", "All", total), ("active", "Active", running + queue.paused_budget), ("paused_budget", "Paused for budget", queue.paused_budget), ("failed", "Failed", queue.failed), ("done", "Done", queue.done)) %}
   <a{% if state == value %} class="on" aria-current="true"{% endif %} href="/admin/jobs{% if value %}?state={{ value }}{% endif %}">{{ label }} <span class="count">{{ n }}</span></a>

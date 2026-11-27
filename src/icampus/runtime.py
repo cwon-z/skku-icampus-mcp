@@ -50,6 +50,11 @@ register(
     Spec("export_retries", "int", "Storage", "How often an exported video's download is tried again by itself "
          "after a failure that may pass (the network, a stall, a full cache), with pauses growing from 30 seconds "
          "to an hour. After that the export is failed and says why.", 0, 20),
+    Spec("local_downloads", "enum", "Storage", "Whether this server downloads lecture videos itself when fetchers "
+         "(other machines of yours, docs/fetchers.md) can. on: it does, download_concurrency at a time, and "
+         "fetchers take what waits behind. fallback: only while no fetcher has been heard from for two minutes. "
+         "off: never, so the queue waits for a fetcher. Without fetchers, leave it on.",
+         choices=("on", "fallback", "off")),
     Spec("attachment_cache_gb", "float", "Storage", "Announcement and assignment attachments kept on the server. "
          "An evicted file is downloaded again on its next read, which iCampus records as another open.",
          0.01, 500, unit="GB"),
@@ -129,6 +134,7 @@ ENV_ONLY: list[tuple[str, str, bool]] = [
     ("password", "SKKU password", True),
     ("api_tokens", "API bearer tokens (label:token)", True),
     ("admin_labels", "Token labels with admin rights", False),
+    ("fetcher_tokens", "Fetcher tokens (name:token), for /api/v1/fetchers only", True),
     ("max_logins_per_day", "Password logins allowed per day", False),
     ("host", "Address the API listens on", False),
     ("port", "Port the API listens on", False),
@@ -294,7 +300,7 @@ class Runtime:
         out = []
         for key, label, secret in ENV_ONLY:
             value = getattr(self._settings, key, None)
-            if key == "api_tokens":  # the labels are useful, the tokens never leave
+            if key in ("api_tokens", "fetcher_tokens"):  # the labels are useful, the tokens never leave
                 shown = ", ".join(sorted({p.partition(":")[0].strip() for p in str(value).split(",") if ":" in p})) \
                     or "not set"
             elif secret:

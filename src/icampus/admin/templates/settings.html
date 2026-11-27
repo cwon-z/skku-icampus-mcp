@@ -34,7 +34,7 @@
         {% if s.type == "bool" %}
         {{ switch(s.key, s.key, s.shown, hide_label=True) }}
         {% elif s.type == "enum" %}
-        <label class="field"><span class="ctl"><select name="{{ s.key }}" aria-label="{{ s.key }}">{% for c in s.choices %}<option value="{{ c }}"{% if c == s.shown %} selected{% endif %}>{{ c }}</option>{% endfor %}</select>{{ icon("chevron", 16, 1.8) }}</span></label>
+        <label class="field{% if s.error %} bad{% endif %}"><span class="ctl"><select name="{{ s.key }}" aria-label="{{ s.key }}"{% if s.error %} aria-invalid="true"{% endif %}>{% for c in s.choices %}<option value="{{ c }}"{% if c == s.value %} selected{% endif %}>{{ c }}</option>{% endfor %}</select>{{ icon("chevron", 16, 1.8) }}</span>{% if s.error %}<span class="hint">{{ s.error }}</span>{% endif %}</label>
         {% elif s.type in ("map", "rules") %}
         <label class="field{% if s.error %} bad{% endif %}"><span class="ctl ctl--area"><textarea name="{{ s.key }}" rows="4" spellcheck="false" aria-label="{{ s.key }}"{% if s.error %} aria-invalid="true"{% endif %}>{{ s.shown }}</textarea></span>{% if s.error %}<span class="hint">{{ s.error }}</span>{% endif %}</label>
         {% else %}

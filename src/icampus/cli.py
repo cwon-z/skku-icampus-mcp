@@ -45,11 +45,17 @@ def main() -> None:
                           help="also ask the content server to describe N materials (no cookies, no download)")
     material.add_argument("--login", choices=["saved", "manual"], default="saved",
                           help="manual: sign in yourself in a browser window if the saved login has expired")
+    measure = sub.add_parser("bench", help="measure download speed from this machine to the content server "
+                                           "(nothing is kept); needs the server running")
+    measure.add_argument("--seconds", type=float, default=45, help="how long each step downloads (default 45)")
+    measure.add_argument("--streams", default="1,2,3", help="connections per step (default 1,2,3)")
+    measure.add_argument("--server", help="the API to ask for videos to try (default: this machine's)")
     args = parser.parse_args()
 
     settings = Settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # its INFO lines would print the Kuma push token
+    for noisy in ("httpx", "httpcore"):  # their INFO lines would print the Kuma push token, and at DEBUG the
+        logging.getLogger(noisy).setLevel(logging.WARNING)  # content server's redirect address and every header
 
     if args.cmd == "serve":
         import uvicorn
@@ -78,6 +84,18 @@ def main() -> None:
     elif args.cmd == "material-check":
         from .video_check import check_materials
         print(asyncio.run(check_materials(settings, args.course, args.head, args.login == "manual")))
+    elif args.cmd == "bench":
+        from . import bench
+        from .config import parse_tokens
+        try:
+            streams = bench.parse_streams(args.streams)
+        except ValueError as exc:
+            raise SystemExit(f"icampus bench: {exc}") from None
+        token = next(iter(parse_tokens(settings.api_tokens)), "")  # asks its own API, as any client would
+        if not token:
+            raise SystemExit("icampus bench: no API token configured (ICAMPUS_API_TOKENS)")
+        server = args.server or f"http://127.0.0.1:{settings.port}"
+        raise SystemExit(asyncio.run(bench.main(server, token, seconds=max(1.0, args.seconds), streams=streams)))
 
 
 if __name__ == "__main__":
